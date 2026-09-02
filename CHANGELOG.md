@@ -1,5 +1,52 @@
 # Changelog
 
+## v6.31.3 (2026-09-02)
+
+### Option A — thinking hiển thị xen kẽ trong parts (thứ tự realtime) (FIXED ✅)
+
+> Mục tiêu: trước đây thinking là block cố định trên cùng (Khối 1), tách khỏi mảng parts (chỉ text/tool) → position realtime của thinking không giữ với text/tool, gây "thinking sau content" khi thinking tới muộn. Đưa thinking vào parts để render in-order với text/tool.
+
+- **server.ts** (L868): type union parts thêm `'thinking'` (`type: 'text' | 'tool' | 'thinking'`).
+- **server.ts** (L945): `parts.push({ type: 'thinking', content: rt })` ngay sau khi tích lũy `evThinking` → broadcast realtime msg.parts giữ thinking parts; persisted snapshot (L1061-1062) vẫn filter tool/text (thinking lưu qua `msg.thinking` cho rehydrate, không regression).
+- **web/src/App.tsx** (L311-334): handler `chat:thinking` PUSH `{type:'thinking', content}` vào msg.parts + gộp consecutive thinking (concat `\n`), giữ `msg.thinking` accumulation.
+- **web/src/components/ChatPanel.tsx**: L29 union thêm `'thinking'`; L2609-2618 case `part.type === 'thinking'` render ThinkingBlock inline đúng vị trí; L2539 Khối 1 fixed-top chỉ render khi `!hasThinkingInParts` (helper L2374) → không in trùng.
+- Verifier stream-verify PASS (3 file + build pass).
+
+### Outbox — content-dedup worker↔worker: hết báo cáo lặp 3-4 lần (FIXED ✅)
+
+> Root cause: outbox delivery worker↔worker KHÔNG content-dedup. 7 call-site nest route cùng nội dung → enqueue uuidv4 MỚI nhiều lần → target nhận cùng talk 3-4 lần → trả lời lặp. Bằng chứng: outbox burst 4×/115ms + 3×/47ms byte-identical, uuid khác nhau.
+
+- **server.ts** (L762-763): module-level `OUTBOX_DELIVER_TALK_DEDUP_MS=2000` + `deliverTalkDedup: Map`.
+- **server.ts** (L3271-3297): guard đầu `deliverTalk` — `applyDedup = !existingReportId && msg.to khác orchestrator/user/broadcast && cả 2 role không phải orchestrator`; dedupKey = `${fromAgent.id}->${targetAgent.id}::${normCmdSigPart(msg.message)}`; skip enqueue nếu trong cửa sổ 2s; cleanup khi map >1000. KHÔNG chặn replay hợp lệ (applyDedup=false khi existingReportId).
+
+### Outbox — synthesisTriggered.delete: hết vòng lặp retry 15s (FIXED ✅)
+
+> Root cause: `synthesisTriggered.add(batchKey)` không xóa khi synthesis xong → agent hoàn thành turn MỚI vẫn bị `has(batchKey)` chặn → "[Synthesize] Already triggered" lặp vô hạn → không tổng hợp → outbox report ứ → "[Outbox] Replaying N" retry 15s vô hạn.
+
+- **server.ts** (L1718-1726): sau khi `handleOrchestratorResponse` hoàn tất, gọi `synthesisPendingBatches.delete(batchKey)` + `synthesisTriggered.delete(batchKey)` — turn mới tổng hợp bình thường, hết ứ/replay.
+
+### Fix mất talk/spawn dài — chỉ dispatch khi talk XML hoàn chỉnh (FIXED ✅)
+
+> Root cause (trace-dispatch, reconstruct faithful): nhánh "Unclosed XML tag fallback" trong `extractXmlCommand` (L2198-2214) khiến `scanStreamForDispatch` dispatch talk PARTIAL sớm (message cụt) + `split(fullMatch).join('')` xóa SẠCH buffer → nuốt talk thứ 2 trong cùng response. LONG talk mất, SHORT talk nhận.
+
+- **server.ts** (L812-821): guard trong `scanStreamForDispatch` — chỉ dispatch talk XML khi hoàn chỉnh: self-closing (`/>`) HOẶC có closing tag (`</talk>`); unclosed partial → SKIP, chờ buffer đủ (không dispatch vội, không nuốt talk kế).
+- **server.ts** (L857-861): buffer removal dùng `remaining.replace(cmd.fullMatch, '')` (xóa 1 occurrence đầu) thay `split().join('')` toàn cục → không xóa sạch buffer khi fullMatch partial/trùng.
+
+### Fix UX path file mobile — kéo ngang đọc đầy đủ (FIXED ✅)
+
+> Path file dài bị cắt trên mobile → thêm overflow-x scroll để kéo ngang đọc đầy đủ.
+
+- **web/src/components/ChatPanel.tsx** renderToolBadge (L1622-1766) + pathStyle (L1632-1634).
+- final-verify nghiệm thu PASS 6/6 + build pass.
+
+### Build & Release
+- Version bumped 6.31.2 → 6.31.3.
+- Gộp toàn bộ fix: Option A + outbox content-dedup + synthesisTriggered.delete + fix mất talk + fix mobile UX.
+- Build exe: `agentforge-web-v6.31.3.exe` (kích thước/MD5 theo srv-fix + verifier).
+- Git commit + push lên repo private agentforge-v6.27.
+
+---
+
 ## v6.31.2 (2026-09-02)
 
 ### Dispatch sớm trong stream — parse lệnh <talk> ngay khi streaming (FIXED ✅)

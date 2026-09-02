@@ -754,6 +754,13 @@ const dispatchTextBuf: Record<string, string> = {};
 // stream song song, (b) xoá đúng sig của agent khi turn kết thúc → không chặn nhầm talk trùng lặp
 // ở turn SAU (cùng agent gửi lại nội dung giống hệt), tránh mất delivery.
 const dispatchedCmdSigs: Map<string, Set<string>> = new Map();
+
+// ============ OUTBOX CONTENT DEDUP WORKER↔WORKER ============
+// Chặn duplicate message trong outbox khi deliverTalk worker↔worker (root cause report lặp 3-4 lần).
+// 7 call-site nest route cùng nội dung → có thể enqueue uuidv4 MỚI nhiều lần. Guard ngay đầu
+// deliverTalk chặn nếu cùng content gửi tới cùng agent trong cửa sổ ngắn.
+const OUTBOX_DELIVER_TALK_DEDUP_MS = 2000; // 2s
+const deliverTalkDedup = new Map<string, number>();
 // Chặn buffer phình vô hạn khi turn bị dừng giữa chừng (agent stopped → handleAgentResponse không
 // drain). Cắt từ ĐẦU giữ phần CUỐI (lệnh dispatch thường xuất hiện cuối output).
 const MAX_DISPATCH_BUF = 200_000;
@@ -802,6 +809,17 @@ function scanStreamForDispatch(agentId: string, accumulated: string): string {
     const parsed = parseTalkCommand(cmd);
     if (!parsed || !parsed.agentId) continue;
 
+    // ══ FIX 1: Chặn dispatch talk XML chưa hoàn chỉnh (partial/unclosed) ══
+    // nhánh "Unclosed XML tag fallback" trong extractXmlCommand (L2223-2238) có thể trả về talk
+    // PARTIAL (fullMatch kéo dài tới next command/EOF khi buffer chưa đủ <talk>...</talk>).
+    // Dispatch vội + xóa buffer (split(fullMatch).join('')) sẽ NUỐT talk thứ 2 phía sau.
+    // CHỈ dispatch khi tag XML ĐÃ hoàn chỉnh: self-closing (kết thúc "/>") HOẶC có closing tag
+    // ("</talk>"). Còn lại (unclosed kéo dài tới next cmd/EOF) = partial → chờ buffer đủ rồi mới dispatch.
+    if (cmd.syntax === 'xml' && !/\/>(\s*)$/.test(cmd.fullMatch || '') && !/<\/talk>\s*$/i.test(cmd.fullMatch || '')) {
+      console.log(`[StreamDispatch] SKIP partial talk target=${parsed.agentId || '?'} (chưa có closing tag) — chờ buffer đủ.`);
+      continue;
+    }
+
     const cleanTo = cleanTargetIdentifier(parsed.agentId);
     if (!cleanTo || cleanTo.toLowerCase() === 'orchestrator' || cleanTo.toLowerCase() === 'main' || cleanTo.toLowerCase() === 'user') {
       // talk→orchestrator / user / broadcast: KHÔNG dispatch sớm — giữ final pass.
@@ -837,8 +855,10 @@ function scanStreamForDispatch(agentId: string, accumulated: string): string {
     }
 
     // Loại lệnh đã dispatch khỏi buffer → không quét lại lần sau.
+    // ══ FIX 2: chỉ xóa 1 bản đầu (replace). KHÔNG dùng split(fullMatch).join('') toàn cục —
+    // nếu fullMatch xuất hiện lần nữa (talk thứ 2 trùng nội dung) sẽ bị xóa sạch → nuốt talk.
     if (cmd.fullMatch) {
-      remaining = remaining.split(cmd.fullMatch).join('');
+      remaining = remaining.replace(cmd.fullMatch, '');
       changed = true;
     }
   }
@@ -865,7 +885,7 @@ function broadcastOACEvent(agentId: string, ev: any) {
     let allowThinking = false;
     // Option C: parts giữ ĐÚNG THỨ TỰ opencode emit (text + tool xen kẽ) trong batch này.
     // Client render interleaved qua msg.parts; khi không cần xen kẽ (chỉ text / chỉ tool) → bỏ parts.
-    const parts: Array<{ type: 'text' | 'tool'; content?: string; tool?: string; input?: any; output?: any }> = [];
+    const parts: Array<{ type: 'text' | 'tool' | 'thinking'; content?: string; tool?: string; input?: any; output?: any }> = [];
     let partsHasText = false;
     let partsHasTool = false;
     const asText = (v: any): string | undefined => {
@@ -941,6 +961,8 @@ function broadcastOACEvent(agentId: string, ev: any) {
           const rt = e.part?.text || e.text || e.part?.thinking || e.thinking;
           if (typeof rt === 'string' && rt.trim()) {
             evThinking += (evThinking ? '\n' : '') + rt;
+            // Option A — push thinking vào parts để giữ thứ tự realtime (client render từ parts thay vì fixed-top)
+            parts.push({ type: 'thinking', content: rt });
             // REALTIME THINKING: broadcast NGAY từng khúc reasoning lên UI (fix debugroot —
             // trước đây chỉ gom vào evThinking rồi gửi trong snapshot CUỐI → user thấy text trước,
             // thinking sau, dù model emit reasoning trước). UI upsertStreamMsg cùng key với text
@@ -1693,10 +1715,14 @@ function checkAndSynthesize(completedAgentId: string) {
         }
       }
       await handleOrchestratorResponse(result.content, (result as any).thinking || '');
-      // FIX DUP ORCHESTRATOR (Option A): synthesis đã broadcast summary xong → xóa flag batch
-      // để agent cùng batch, turn MỚI sau này vẫn broadcast bình thường (không chặn nhầm).
+      // FIX DUP ORCHESTRATOR (Option A) + ROOT-CAUSE FIX (outbox loop):
+      // synthesis đã broadcast summary xong → xóa flag batch để agent cùng batch, turn MỚI sau này
+      // vẫn broadcast bình thường. Đồng thời xóa synthesisTriggered — nếu không, batch agent này
+      // hoàn thành turn MỚI vẫn bị L1629 has(batchKey) chặn → "[Synthesize] Already triggered"
+      // lặp vô hạn, không tổng hợp lại → outbox report ứ đọng → "[Outbox] Replaying N" retry vô hạn.
       if (currentSpawned.length > 0) {
         synthesisPendingBatches.delete(currentSpawned.map(a => a.id).sort().join(','));
+        synthesisTriggered.delete(currentSpawned.map(a => a.id).sort().join(','));
       }
     } catch (e: any) {
       console.log(`[Synthesize] Error: ${e.message}`);
@@ -3243,6 +3269,33 @@ Nội dung tin nhắn gửi về Orchestrator
 // Gửi tin nhắn TALK từ fromAgent → targetAgent, bền vững qua outbox.
 // existingReportId dùng khi replay để không sinh bản trùng.
 async function deliverTalk(targetAgent: Agent, fromAgent: Agent, msg: { to: string; message: string; task?: string }, existingReportId?: string) {
+  // === OUTBOX CONTENT DEDUP WORKER↔WORKER ===
+  // Prevent duplicate enqueue when same content sent to same agent within 2s window.
+  // Root cause report lặp 3-4 lần: 7 call-site nest route cùng nội dung → enqueue uuidv4 MỚI nhiều lần.
+  // Guard này CHỈ áp dụng cho giao worker↔worker (KHÔNG target orchestrator/user/broadcast) và
+  // KHÔNG áp dụng khi replay outbox (existingReportId) — replay là delivery chính đáng, không dedup.
+  const applyDedup = !existingReportId
+    && msg.to !== 'orchestrator' && msg.to !== 'user' && msg.to !== 'broadcast'
+    && fromAgent.role !== 'orchestrator' && targetAgent.role !== 'orchestrator';
+  if (applyDedup) {
+    const dedupKey = `${fromAgent.id}->${targetAgent.id}::${normCmdSigPart(msg.message)}`;
+    const now = Date.now();
+    const lastSent = deliverTalkDedup.get(dedupKey);
+    if (lastSent !== undefined && (now - lastSent) < OUTBOX_DELIVER_TALK_DEDUP_MS) {
+      console.log(`[OutboxDedup] Skip duplicate deliverTalk ${fromAgent.id}->${targetAgent.id} within ${OUTBOX_DELIVER_TALK_DEDUP_MS}ms: ${dedupKey.slice(0, 80)}`);
+      // Deduplicate: skip enqueue hoàn toàn (không gửi trùng). Không persist outbox record mới.
+      return;
+    }
+    deliverTalkDedup.set(dedupKey, now);
+    // Clean old entries periodically để map không phình vô hạn
+    if (deliverTalkDedup.size > 1000) {
+      const cutoff = now - OUTBOX_DELIVER_TALK_DEDUP_MS * 2;
+      for (const [k, t] of deliverTalkDedup) {
+        if (t < cutoff) deliverTalkDedup.delete(k);
+      }
+    }
+  }
+
   const reportId = existingReportId || uuidv4();
   if (!existingReportId) {
     storage.enqueueOutbox({

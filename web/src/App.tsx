@@ -308,9 +308,29 @@ export function App() {
     // Thinking realtime: chat:thinking { agentId?, from?, thinkingText } — hiện hộp thinking live
     // trong CÙNG message stream với text (cùng key) để thinking tới TRƯỚC khi text chạy, không
     // chờ snapshot cuối (fix: text tới trước, thinking tới sau dù model reasoning trước).
+    // Option A: push thinking vào parts xen kẽ đúng thứ tự emit (gộp consecutive thinking).
     if (msg.type === 'chat:thinking' && typeof msg.thinkingText === 'string' && msg.thinkingText.trim()) {
       const key = String(msg.agentId || msg.from || 'orchestrator');
-      upsertStreamMsg(key, m => ({ ...m, thinking: (m.thinking ? m.thinking + '\n' : '') + msg.thinkingText }), msg.teamId);
+      const thinkingDelta = msg.thinkingText;
+      upsertStreamMsg(key, m => {
+        const newParts = [...(m.parts || [])];
+        const lastPart = newParts.length > 0 ? newParts[newParts.length - 1] : null;
+        if (lastPart && (lastPart as any).type === 'thinking') {
+          // Merge consecutive thinking parts: concatenate content
+          newParts[newParts.length - 1] = {
+            ...lastPart,
+            content: ((lastPart as any).content || '') + '\n' + thinkingDelta
+          } as any;
+        } else {
+          // Push new thinking part
+          newParts.push({ type: 'thinking' as any, content: thinkingDelta });
+        }
+        return {
+          ...m,
+          thinking: (m.thinking ? m.thinking + '\n' : '') + thinkingDelta,
+          parts: newParts
+        };
+      }, msg.teamId);
     }
 
     // Tool call realtime: chat:tool_call { agentId?, toolCall? | tool/input/output }
