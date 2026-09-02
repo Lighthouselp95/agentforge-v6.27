@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-electron/
+release/
+data/
+.opencode/
+.stfolder/
+*.exe
+*.lnk
+*.bak*
+*.bak-workbench-*
+*.bak-202*
+mock_report_test.xml
+test_orch_write.md
+https
+10
