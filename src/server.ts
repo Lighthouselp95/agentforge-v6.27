@@ -1988,7 +1988,7 @@ function extractBracketCommand(text: string, startIndex: number): { tag: string;
  */
 function extractXmlCommand(text: string, startIndex: number, targetTag: string): BracketCommand | null {
   const normTag = targetTag.toLowerCase().replace(/[\s_-]+/g, '[-_\\s]?');
-  const openPattern = new RegExp(`^<(${normTag})(?:\\s+[^>]*)?(?:>|\\/>)`, 'i');
+  const openPattern = new RegExp(`^<(${normTag})(?:\\s+(?:[^>"']|"[^"]*"|'[^']*')*)?(?:>|\\/>)`, 'i');
   const match = text.substring(startIndex).match(openPattern);
   if (!match) return null;
 
@@ -3250,6 +3250,19 @@ Cú pháp đúng:
 <spawn role="coder" name="coder-1" task="Mô tả nhiệm vụ cụ thể tại đây" />`;
         forwardToOrchestrator('SPAWN_PARSE_FAIL', parseErrorContent);
       }
+    }
+  }
+
+  // TASK LENGTH WARNING + EMPTY TASK GUARDRAIL
+  for (const spawn of spawns) {
+    if (!spawn.task || !spawn.task.trim()) {
+      forwardToOrchestrator('SPAWN_EMPTY_TASK', `[ERROR] Agent "${spawn.name}" (role: ${spawn.role}) khong co task. Can cung cap task description.`);
+      spawns.splice(spawns.indexOf(spawn), 1);
+      continue;
+    }
+    const wordCount = spawn.task.trim().split(/\s+/).length;
+    if (wordCount > 20) {
+      forwardToOrchestrator('SPAWN_TASK_LONG', `[WARN] Task "${spawn.name}" co ${wordCount} tu (>20). Nen tom gon 20 tu.`);
     }
   }
 
