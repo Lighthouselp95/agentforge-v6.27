@@ -735,6 +735,126 @@ function stripAnsi(text: any): string {
   return text.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-NPRZcf-nqry=><]/g, '');
 }
 
+// ============ EARLY DISPATCH IN STREAM (server-dedup / ui-render-dup design) ============
+// Mục tiêu: dispatch lệnh <talk>/<spawn> NGAY trong luồng streaming thay vì chờ process close.
+// Giảm độ trễ delivery: target agent bắt đầu làm việc sớm hơn (không chờ turn đầy đủ kết thúc).
+//
+// CẢNH BÁO DOUBLE-DISPATCH: cùng một lệnh vẫn xuất hiện trong full content mà final pass
+// (handleAgentResponse) parse lại → nếu dispatch sớm MÀ KHÔNG dedup → nhân đôi delivery.
+// Giải pháp: lưu `dispatchedCmdSigs` (signature chuẩn hoá của talk đã dispatch sớm), final pass
+// sẽ SKIP những talk đã có signature này. Signature dựa trên (from > target | task | message)
+// chuẩn hoá whitespace → KHỚP giữa stream buffer và full content bất kể chunk-boundary khác nhau.
+//
+// PHẠM VI dispatch sớm: CHỈ talk hướng tới AGENT KHÁC (non-orchestrator, non-user).
+// - talk→orchestrator / talk→user / broadcast: giữ nguyên final pass (triggerOrchestrator / user route).
+// - spawn: KHÔNG dispatch sớm (orchestrator-only, có role-limit/reuse logic phức tạp) → giữ final pass.
+// - stop/resume/delete/task_update: giữ final pass (parseAgentCommands).
+const dispatchTextBuf: Record<string, string> = {};
+// Signature theo TỪNG agent gửi (fromAgentId → Set<sig>): giúp (a) không nhầm lẫn giữa các agent
+// stream song song, (b) xoá đúng sig của agent khi turn kết thúc → không chặn nhầm talk trùng lặp
+// ở turn SAU (cùng agent gửi lại nội dung giống hệt), tránh mất delivery.
+const dispatchedCmdSigs: Map<string, Set<string>> = new Map();
+// Chặn buffer phình vô hạn khi turn bị dừng giữa chừng (agent stopped → handleAgentResponse không
+// drain). Cắt từ ĐẦU giữ phần CUỐI (lệnh dispatch thường xuất hiện cuối output).
+const MAX_DISPATCH_BUF = 200_000;
+
+// FIX 2 — DEDUP SPAWN theo signature (role+name+task normalized). Trong cùng 1 response của
+// orchestration, model có thể emit lệnh <spawn> đồng signature nhiều lần; Set này chặn xử lý
+// lệnh spawn trùng signature để tránh SPAWN lặp / SPAWN_ROLE_LIMIT spam. Được clear ở ĐẦU mỗi
+// lần handleOrchestratorResponse (mỗi response = 1 turn orchestration riêng) nên không chặn nhầm
+// spawn hợp lệ ở turn sau.
+const handledSpawnSigs: Set<string> = new Set();
+
+/** Signature chuẩn hoá của 1 lệnh spawn (role+name+task) — dedup trong phạm vi 1 response. */
+function spawnDispatchSig(role: string, name: string, task: string): string {
+  return `spawn|${normCmdSigPart(role)}|${normCmdSigPart(name)}|${normCmdSigPart(task)}`;
+}
+
+/** Chuẩn hoá whitespace cho signature dedup — khớp giữa stream buffer và full content. */
+function normCmdSigPart(v: string): string {
+  return (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Signature của 1 talk (fromAgent > target | task | message) — dùng cả 2 phía stream + final. */
+function talkDispatchSig(fromAgentId: string, to: string, task: string | undefined, message: string): string {
+  return `talk|${normCmdSigPart(fromAgentId)}>${normCmdSigPart(to)}|${normCmdSigPart(task || '')}|${normCmdSigPart(message)}`;
+}
+
+/**
+ * Quét buffer stream của agent, phát hiện lệnh <talk>/[TALK] HOÀN CHỈNH hướng tới agent khác
+ * và dispatch sớm qua deliverTalk. Trả về buffer còn lại (đã loại bỏ lệnh đã dispatch).
+ * Chỉ trả về phần text CHƯA phải lệnh hoàn chỉnh; lệnh hoàn chỉnh được dispatch + ghi signature.
+ */
+function scanStreamForDispatch(agentId: string, accumulated: string): string {
+  if (!accumulated || !accumulated.trim()) return accumulated;
+  const fromAgent = agents.get(agentId);
+  if (!fromAgent) return accumulated;
+
+  // 1. Trích lệnh TALK hoàn chỉnh (bracket + xml), bỏ qua tag trong code block/quoted.
+  // extractDualCommands CHỈ trả về lệnh cân bằng ngoặc / cặp thẻ đóng-mở đầy đủ → an toàn với buffer partial.
+  const talks = extractDualCommands(accumulated, ['TALK']);
+  let remaining = accumulated;
+  let changed = false;
+
+  for (const cmd of talks) {
+    if (cmd.tag.toUpperCase() !== 'TALK') continue;
+    // Bỏ qua TALK nằm trong code block giữa buffer (đề phòng inline) — extractDualCommands đã loại.
+    const parsed = parseTalkCommand(cmd);
+    if (!parsed || !parsed.agentId) continue;
+
+    const cleanTo = cleanTargetIdentifier(parsed.agentId);
+    if (!cleanTo || cleanTo.toLowerCase() === 'orchestrator' || cleanTo.toLowerCase() === 'main' || cleanTo.toLowerCase() === 'user') {
+      // talk→orchestrator / user / broadcast: KHÔNG dispatch sớm — giữ final pass.
+      continue;
+    }
+    const targetAgent = findAgentByIdNameOrRole(cleanTo);
+    if (!targetAgent) {
+      // Target chưa tồn tại → không dispatch sớm (final pass sẽ forward TALK_AGENT_NOT_FOUND).
+      continue;
+    }
+    if (targetAgent.type === 'orchestrator' || targetAgent.id === 'orchestrator') {
+      continue; // orchestrator không dispatch sớm — triggerOrchestrator ở final pass.
+    }
+    const task = parsed.task;
+    const message = parsed.message || '';
+    const sig = talkDispatchSig(fromAgent.id, targetAgent.id, task, message);
+    if (dispatchedCmdSigs.get(fromAgent.id)?.has(sig)) continue; // đã dispatch sớm rồi → tránh trùng lặp trong stream.
+
+    // Dispatch sớm: status working + broadcast + deliverTalk (giống final pass, NHƯNG sớm hơn).
+    try {
+      targetAgent.status = 'working';
+      targetAgent.workingSince = Date.now();
+      storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
+      broadcast('agent:updated', { agent: targetAgent });
+      deliverTalk(targetAgent, fromAgent, { to: targetAgent.id, message, task }).catch((err: any) => {
+        console.error(`[StreamDispatch] deliverTalk failed (${fromAgent.name}->${targetAgent.name}): ${err?.message || err}`);
+      });
+      if (!dispatchedCmdSigs.has(fromAgent.id)) dispatchedCmdSigs.set(fromAgent.id, new Set());
+      dispatchedCmdSigs.get(fromAgent.id)!.add(sig);
+      console.log(`[StreamDispatch] Early dispatched talk ${fromAgent.name} -> ${targetAgent.name} (during stream)`);
+    } catch (e: any) {
+      console.error(`[StreamDispatch] Early dispatch error: ${e?.message || e}`);
+    }
+
+    // Loại lệnh đã dispatch khỏi buffer → không quét lại lần sau.
+    if (cmd.fullMatch) {
+      remaining = remaining.split(cmd.fullMatch).join('');
+      changed = true;
+    }
+  }
+
+  // Dồn lại buffer để tránh phình vô hạn khi nhiều lệnh hoàn chỉnh đã bị loại.
+  return changed ? remaining : accumulated;
+}
+
+/** Reset buffer + signature của 1 agent — gọi khi final pass đã xử lý xong content (drain buffer).
+ *  Xoá CHỈ state của agent này; không đụng các agent stream song song khác.
+ */
+function drainDispatchState(agentId: string): void {
+  delete dispatchTextBuf[agentId];
+  dispatchedCmdSigs.delete(agentId);
+}
+
 function broadcastOACEvent(agentId: string, ev: any) {
   try {
     // Tách RỜI lời thoại và toolcall: content CHỈ chứa lời thoại,
@@ -778,6 +898,18 @@ function broadcastOACEvent(agentId: string, ev: any) {
           textLines.push(e.part.text);
           parts.push({ type: 'text', content: e.part.text });
           partsHasText = true;
+          // EARLY DISPATCH: tích luỹ text RAW vào buffer theo agent. Text chunk có thể nằm
+          // xen kẽ/tách rời giữa nhiều batch, nên buffer tích dần; scanStreamForDispatch chỉ
+          // dispatch lệnh HOÀN CHỈNH (<talk>...</talk> / [TALK ...]) và chỉ cho target khác.
+          // GHÉP BẰNG '\n' (giống parseJsonlEvents join parts) để signature body khớp chính xác
+          // với final content kể cả khi 1 lệnh trải nhiều text part.
+          const rawPart = String(e.part.text || '');
+          dispatchTextBuf[agentId] = dispatchTextBuf[agentId]
+            ? `${dispatchTextBuf[agentId]}\n${rawPart}`
+            : rawPart;
+          if (dispatchTextBuf[agentId].length > MAX_DISPATCH_BUF) {
+            dispatchTextBuf[agentId] = dispatchTextBuf[agentId].slice(-MAX_DISPATCH_BUF);
+          }
         } else if (isTool) {
           const p = e.part || {};
           const st: any = p.state || {};
@@ -836,6 +968,15 @@ function broadcastOACEvent(agentId: string, ev: any) {
           partsHasText = true;
         }
       }
+    }
+    // EARLY DISPATCH: quét buffer stream sau mỗi batch (chỉ khi agent tồn tại) — phát hiện
+    // lệnh <talk>/[TALK] hoàn chỉnh hướng tới agent khác và dispatch sớm qua deliverTalk.
+    try {
+      if (dispatchTextBuf[agentId]) {
+        dispatchTextBuf[agentId] = scanStreamForDispatch(agentId, dispatchTextBuf[agentId]);
+      }
+    } catch (e: any) {
+      console.error(`[StreamDispatch] scan error: ${e?.message || e}`);
     }
     if (textLines.length === 0 && toolCalls.length === 0 && !evThinking) return;
 
@@ -2350,10 +2491,17 @@ function parseTalkCommand(cmd: BracketCommand): { agentId: string; message: stri
 
     // Message can be body or message attribute
     let message = cmd.body || '';
-    if (!task && message) {
+    if (task && message) {
       const taskTagMatch = message.match(/<task>([\s\S]*?)<\/task>/i);
       if (taskTagMatch) {
         task = taskTagMatch[1].trim();
+        message = message.replace(/<task>[\s\S]*?<\/task>/i, '').trim();
+      }
+    }
+    if (!task && message) {
+      const taskTagMatch2 = message.match(/<task>([\s\S]*?)<\/task>/i);
+      if (taskTagMatch2) {
+        task = taskTagMatch2[1].trim();
         message = message.replace(/<task>[\s\S]*?<\/task>/i, '').trim();
       }
     }
@@ -2423,10 +2571,15 @@ function parseAgentOutput(content: string, defaultTo: string = 'orchestrator'): 
     }
     const cleanCandidate = cleanTargetIdentifier(m[1]);
     const rawTarget = (m[1] || '').trim();
-    if (INVALID_TARGET_PLACEHOLDERS.has(rawTarget.toLowerCase()) || /^<.*>$/.test(rawTarget) || !cleanCandidate) {
-      if (rawTarget.toLowerCase() !== 'orchestrator' && rawTarget.toLowerCase() !== 'user' && rawTarget.toLowerCase() !== 'main') {
-        continue; // Skip placeholder tag like [TO: <coder-id>]
-      }
+    const cleanLower = (cleanCandidate || '').toLowerCase();
+    // Special routing keywords cho phép bất kỳ format nào (orchestrator/user/main/all/broadcast)
+    const isSpecialRoute = cleanLower === 'orchestrator' || cleanLower === 'user' || cleanLower === 'main' || cleanLower === 'all' || cleanLower === 'broadcast';
+    // STRICT VALIDATION (fix mất tin): target phải là agent-id/name hợp lệ (chỉ chữ-số-underscore-dash).
+    // Chặn regex-fragment như '\s*([^' lọt vào làm target → sinh TALK_AGENT_NOT_FOUND sai + mất tin định tuyến.
+    const isValidId = /^[A-Za-z0-9_-]+$/.test(cleanCandidate);
+    const isPlaceholder = INVALID_TARGET_PLACEHOLDERS.has(cleanLower) || /^<.*>$/.test(rawTarget) || !cleanCandidate || !isValidId;
+    if (isPlaceholder && !isSpecialRoute) {
+      continue; // Skip placeholder/invalid/đoạn regex-fragment như [TO: '\s*([^' ]
     }
     tagMatches.push({
       index: m.index,
@@ -2534,13 +2687,20 @@ function parseSpawnCommand(cmd: BracketCommand): { role: string; name: string; t
     const role = cleanTargetIdentifier(roleMatch ? (roleMatch[1] || roleMatch[2] || roleMatch[3] || roleMatch[4]) : '').toLowerCase();
     const name = cleanTargetIdentifier(nameMatch ? (nameMatch[1] || nameMatch[2] || nameMatch[3] || nameMatch[4]) : '');
     let task = stripQuotes(taskMatch ? (taskMatch[1] || taskMatch[2] || taskMatch[3] || taskMatch[4]) : '');
-    if (!task && cmd.body) {
+    let bodyContent = '';
+    if (cmd.body) {
       const taskTagMatch = cmd.body.match(/<task>([\s\S]*?)<\/task>/i);
       if (taskTagMatch) {
-        task = taskTagMatch[1].trim();
+        if (!task) task = taskTagMatch[1].trim();
+        bodyContent = cmd.body.replace(/<task>[\s\S]*?<\/task>/i, '').trim();
       } else {
-        task = cmd.body.trim();
+        bodyContent = cmd.body.trim();
       }
+    }
+    if (task && bodyContent) {
+      task = `${task} — ${bodyContent}`;
+    } else if (!task && bodyContent) {
+      task = bodyContent;
     }
 
     if (role && name && task && !INVALID_PLACEHOLDERS.has(role) && !INVALID_PLACEHOLDERS.has(name.toLowerCase())) {
@@ -2764,8 +2924,11 @@ async function processOrchestratorTriggerQueue() {
     }
     
     try {
+      // ACK-based: đánh dấu in_flight TRƯỚC enqueue — nếu enqueue thất bại, record không bị
+      // markDelivered sớm → vòng quét định kỳ sẽ retry (không mất report).
+      for (const item of batch) storage.markOutboxInFlight(item.reportId);
       const result = await client.enqueue(prompt);
-      // Đánh dấu mọi report trong batch đã gửi thành công (xóa khỏi outbox)
+      // Đánh dấu mọi report trong batch đã gửi thành công — CHỈ sau khi enqueue resolve (client ACK)
       for (const item of batch) storage.markOutboxDelivered(item.reportId);
       const sid = client.getSessionId();
       if (orchAgent) {
@@ -3031,7 +3194,15 @@ if (messages.length === 0 && content && content.trim()) {
           targetAgent.workingSince = Date.now();
           storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
           broadcast('agent:updated', { agent: targetAgent });
-          deliverTalk(targetAgent, fromAgent, { to: resolvedTo, message: msg.message, task: msg.task });
+          // EARLY DISPATCH DEDUP: nếu talk này đã được dispatch SỚM trong luồng stream
+          // (cùng from>target|task|message signature), thì KHÔNG deliverTalk lại lần 2 —
+          // tránh nhân đôi delivery khi final pass chạy. UI bubble vẫn được broadcast ở trên.
+          const earlySig = talkDispatchSig(fromAgent.id, targetAgent.id, msg.task, msg.message);
+          if (dispatchedCmdSigs.get(fromAgent.id)?.has(earlySig)) {
+            console.log(`[StreamDispatch] Skip final deliverTalk (already early-dispatched): ${fromAgent.name} -> ${targetAgent.name}`);
+          } else {
+            deliverTalk(targetAgent, fromAgent, { to: resolvedTo, message: msg.message, task: msg.task });
+          }
         }
       } else {
         if (msg.to !== 'user' && msg.to !== 'orchestrator' && msg.to !== 'broadcast') {
@@ -3064,6 +3235,9 @@ Nội dung tin nhắn gửi về Orchestrator
       await triggerOrchestrator(fromAgent, rawReport);
     }
   }
+
+  // Drain buffer stream: turn của agent này đã kết thúc, xoá buffer đã tích luỹ để không phình bộ nhớ.
+  drainDispatchState(fromAgent.id);
 }
 
 // Gửi tin nhắn TALK từ fromAgent → targetAgent, bền vững qua outbox.
@@ -3123,6 +3297,9 @@ async function deliverTalk(targetAgent: Agent, fromAgent: Agent, msg: { to: stri
     targetAgent.workingSince = Date.now();
     storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
     broadcast('agent:updated', { agent: targetAgent });
+
+    // ACK-based: đánh dấu in_flight TRƯỚC enqueue — delivered CHỈ sau khi enqueue thành công (client ACK)
+    storage.markOutboxInFlight(reportId);
 
     const tr = await tc.enqueue(talkPrompt);
     const newSid = tc.getSessionId();
@@ -3198,7 +3375,8 @@ async function deliverTalk(targetAgent: Agent, fromAgent: Agent, msg: { to: stri
       storage.markOutboxDelivered(reportId);
     } else {
       storage.markOutboxFailed(reportId, e.message);
-      const rec = storage.getPendingOutbox().find(r => r.id === reportId);
+      // Dùng getOutboxRecord để tìm bất kể trạng thái (record đã bị set 'failed')
+      const rec = storage.getOutboxRecord?.(reportId) || storage.getPendingOutbox().find(r => r.id === reportId);
       if (rec && rec.attempts < ORCH_MAX_RETRY) {
         setTimeout(() => deliverTalk(targetAgent, fromAgent, msg, reportId).catch(() => {}), 2000 * rec.attempts);
       }
@@ -3212,6 +3390,9 @@ async function deliverTalk(targetAgent: Agent, fromAgent: Agent, msg: { to: stri
 }
 
 async function handleOrchestratorResponse(response: string, extraScanText = ''): Promise<string[]> {
+  // FIX 2 — Clear dedup-spawn-set ở ĐẦU mỗi lần xử lý 1 response: dedup CHỈ trong phạm vi 1 response
+  // (spawn lặp trong cùng 1 output), không chặn nhầm spawn hợp lệ ở turn/response khác.
+  handledSpawnSigs.clear();
   const commandResults: string[] = [];
   let cmdResults: string[] = [];
   try {
@@ -3221,14 +3402,32 @@ async function handleOrchestratorResponse(response: string, extraScanText = ''):
   }
   commandResults.push(...cmdResults);
 
-  // SPAWN scan gộp cả thinking/reasoning: tag có thể nằm trong phần model tự nói (không nằm
-  // ở final text của opencode) — trước đây chỉ parse response nên spawn im lặng thất bại.
+  // SPAWN scan: CHỈ scan trong RESPONSE THẬT (không scan thinking/extraScanText).
+  // FIX 3 — chặn parse spawn trong thinking: `extraScanText=thinking` trước đây tái kích hoạt lệnh
+  // spawn cũ nằm trong nội dung reasoning/model tự nói (gây SPAWN lặp / ROLE_LIMIT spam). Suy nghĩ
+  // của model (thinking/reasoning) KHÔNG phải lệnh điều phối — bỏ qua hoàn toàn, không spawn, không lỗi.
   // extractBracketCommands (gọi bởi parseSpawnTags) skip tag nằm trong fenced/inline code/report/
-  // quoted attrs qua getCodeSpanRanges + isInCodeSpan → dùng raw text an toàn, không cần sanitize.
+  // quoted attrs qua getCodeSpanRanges + isInCodeSpan → dùng raw response an toàn, không cần sanitize.
   // Tag trong blockquote mô tả (target/role placeholder) sẽ lọt parse nhưng bị bỏ qua im lặng vì
   // cleanTargetIdentifier không tìm thấy agent / parseSpawnCommand trả null — không thành lệnh thật.
-  const scanText = response + '\n' + (extraScanText || '');
+  const scanText = response; // FIX 3: không gộp extraScanText (thinking) vào scan spawn.
   const spawns = parseSpawnTags(scanText);
+
+  // FIX 2 — DEDUP SPAWN theo signature (role+name+task normalized). Trong cùng 1 response, model
+  // có thể emit nhiều <spawn> đồng signature (đặc biệt khi response lặp qua cả stream-dispatch lẫn
+  // full-parse) → loại bỏ lệnh trùng để ngăn SPAWN_ROLE_LIMIT/ROLE_LIMIT spam. Set được clear ở đầu
+  // hàm (mỗi response = 1 turn), nên chỉ dedup trong phạm vi response hiện tại, không chặn lệnh hợp lệ.
+  const dedupedSpawns: typeof spawns = [];
+  for (const spawn of spawns) {
+    const ssig = spawnDispatchSig(spawn.role, spawn.name, spawn.task);
+    if (handledSpawnSigs.has(ssig)) {
+      console.log(`[SpawnDedup] Skip duplicate spawn (role=${spawn.role} name=${spawn.name}) — đã xử lý trong turn này.`);
+      continue;
+    }
+    handledSpawnSigs.add(ssig);
+    dedupedSpawns.push(spawn);
+  }
+  const effectiveSpawns = dedupedSpawns;
   
   // Nếu có chuỗi [SPAWN role=...] nhưng parse thất bại (thiếu name hoặc task), chỉ cảnh báo nhẹ console,
   // tuyệt đối KHÔNG bắn tin nhắn lỗi spam về Orchestrator nếu chỉ là câu văn tự sự/ví dụ.
@@ -3253,11 +3452,11 @@ Cú pháp đúng:
     }
   }
 
-  // TASK LENGTH WARNING + EMPTY TASK GUARDRAIL
-  for (const spawn of spawns) {
+  // TASK LENGTH WARNING + EMPTY TASK GUARDRAIL (chỉ trên spawns đã dedup)
+  for (const spawn of effectiveSpawns) {
     if (!spawn.task || !spawn.task.trim()) {
       forwardToOrchestrator('SPAWN_EMPTY_TASK', `[ERROR] Agent "${spawn.name}" (role: ${spawn.role}) khong co task. Can cung cap task description.`);
-      spawns.splice(spawns.indexOf(spawn), 1);
+      effectiveSpawns.splice(effectiveSpawns.indexOf(spawn), 1);
       continue;
     }
     const wordCount = spawn.task.trim().split(/\s+/).length;
@@ -3266,7 +3465,7 @@ Cú pháp đúng:
     }
   }
 
-  for (const spawn of spawns) {
+  for (const spawn of effectiveSpawns) {
      const { role, name, task } = spawn;
      const existing = findAgentByName(name);
      if (existing) {
@@ -3497,6 +3696,14 @@ Nội dung phân công nhiệm vụ mới tại đây
       // Agent not found — likely a TALK example/placeholder in report text.
       // Skip silently to avoid error spam. Only log to console.
       console.warn(`[TALK] Skipped: agent "${agentId}" not found (likely example in report text)`);
+      continue;
+    }
+    // EARLY DISPATCH DEDUP (orchestrator path): nếu talk này đã được dispatch SỚM trong luồng
+    // stream (Orchestrator cũng stream qua broadcastOACEvent, scanStreamForDispatch bắt talk
+    // hướng agent khác) → SKIP toàn bộ block tái-dispatch để tránh nhân đôi delivery.
+    const earlySigOrch = talkDispatchSig('orchestrator', ta.id, task, message);
+    if (dispatchedCmdSigs.get('orchestrator')?.has(earlySigOrch)) {
+      console.log(`[StreamDispatch] Skip orchestrator final talk (already early-dispatched): -> ${ta.name}`);
       continue;
     }
     ta.status = 'working';
@@ -4227,6 +4434,8 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
       commandResults.push(...commandResultsParse);
     }
     const orchId = resolvedTargetId || 'orchestrator';
+    // Drain buffer stream của orchestrator — turn đã kết thúc.
+    drainDispatchState(orchId);
     updateOrchStateSafe(orchId, 'idle', 'Sẵn sàng');
   }
   return { response, sid, commands: commandResults };
@@ -4322,6 +4531,38 @@ function scheduleChatRetry() {
   if (chatRetryTimer) return;
   chatRetryTimer = setInterval(processChatRetryQueue, CHAT_RETRY_INTERVAL);
   chatRetryTimer.unref?.();
+}
+
+// ============ OUTBOX ACK-BASED RETRY QUEUE ============
+// Vòng quét định kỳ nhặt các record outbox status='pending'/'failed' (tới hạn nextAttemptAt)
+// hoặc 'in_flight' treo (quá timeout) để gửi lại. Không phụ thuộc restart server.
+const OUTBOX_RETRY_INTERVAL = 15000; // 15s
+let outboxRetryTimer: any = null;
+let outboxRetryRunning = false;
+// Anti-spam log: chỉ log lại khi bộ nhận dạng các record cần retry THAY ĐỔI so lần trước
+// (tránh log "[Outbox] Retry queue: N..." lặp vô nghĩa mỗi 15s khi record kẹt vĩnh viễn).
+let outboxLastLoggedSignature = '';
+
+async function processOutboxRetryQueue() {
+  if (outboxRetryRunning) return;
+  outboxRetryRunning = true;
+  try {
+    const pending = storage.getOutboxForRetry?.() || storage.getPendingOutbox();
+    if (!pending || pending.length === 0) return;
+    // Signature = danh sách id + trạng thái: chỉ log khi thay đổi
+    const sig = pending.map(r => `${r.id}:${r.status}:${r.attempts}`).join('|');
+    if (sig !== outboxLastLoggedSignature) {
+      console.log(`[Outbox] Retry queue: ${pending.length} pending/failed/in_flight record(s) to retry`);
+      outboxLastLoggedSignature = sig;
+    }
+    try { await replayPendingReports(); } catch (e: any) { console.error(`[Outbox] retry failed: ${e.message}`); }
+  } finally { outboxRetryRunning = false; }
+}
+
+function scheduleOutboxRetry() {
+  if (outboxRetryTimer) return;
+  outboxRetryTimer = setInterval(processOutboxRetryQueue, OUTBOX_RETRY_INTERVAL);
+  outboxRetryTimer.unref?.();
 }
 
 app.post('/api/chat', async (req, res) => {
@@ -5314,7 +5555,9 @@ async function autoResumeWorkingAgents() {
 }
 
 async function replayPendingReports() {
-  const pending = storage.getPendingOutbox();
+  // Sử dụng getOutboxForRetry() để bao gồm cả: pending (chưa gửi), failed (tới hạn retry),
+  // và in_flight treo (quá timeout) — hỗ trợ vòng quét định kỳ scheduleOutboxRetry().
+  const pending = storage.getOutboxForRetry?.() || storage.getPendingOutbox();
   if (pending.length === 0) return;
   // Idempotent Replay: loại bỏ các report đã được phát trong memory lifecycle hiện tại
   const unplayed = pending.filter(r => !deliveredReportIds.has(r.id));
@@ -5338,20 +5581,38 @@ async function replayPendingReports() {
   storage.resetOutboxAttempts(finalReplay.map(r => r.id));
   for (const r of finalReplay) {
     if (deliveredReportIds.has(r.id)) continue;
-    deliveredReportIds.add(r.id);
-    // Đánh dấu markOutboxDelivered(r.id) ngay khi bắt đầu tiến trình giao tin để tránh khoảng trống giao dịch nếu server sập đột ngột
-    storage.markOutboxDelivered(r.id);
+    // ACK-based: đánh dấu in_flight TRƯỚC khi bắt đầu giao tin. Delivered CHỈ đặt sau khi
+    // enqueue thành công — do chính triggerOrchestrator (processOrchestratorTriggerQueue) /
+    // deliverTalk xử lý (markOutboxDelivered sau ACK, markOutboxFailed khi lỗi). Việc mark
+    // delivered sớm tại đây (deliveredReportIds.add) sẽ LÀM MẤT report nếu enqueue thất bại
+    // giữa chừng → vòng quét định kỳ không nhặt lại được → log spam vô hạn.
+    // deliveredReportIds.add(r.id) CHỈ gọi SAU KHI record đã thực sự 'delivered'.
+    storage.markOutboxInFlight(r.id);
 
     const fromAgent = (agents.get(r.fromAgentId) || {
       id: r.fromAgentId, name: r.fromAgentName, role: r.fromAgentRole
     }) as Agent;
-    if (r.to === 'orchestrator') {
-      await triggerOrchestrator(fromAgent, r.message, r.id);
-    } else {
-      const target = agents.get(r.to) || findAgentByIdNameOrRole(r.to);
-      if (target) {
-        await deliverTalk(target, fromAgent, { to: r.to, message: r.message }, r.id);
+    try {
+      if (r.to === 'orchestrator') {
+        await triggerOrchestrator(fromAgent, r.message, r.id);
+      } else {
+        const target = agents.get(r.to) || findAgentByIdNameOrRole(r.to);
+        if (target) {
+          await deliverTalk(target, fromAgent, { to: r.to, message: r.message }, r.id);
+        } else {
+          // Target không tồn tại → không thể giao → đánh dấu delivered để tránh kẹt vĩnh viễn
+          console.log(`[Outbox] Target ${r.to} không tồn tại, đánh dấu delivered cho ${r.id}`);
+          storage.markOutboxDelivered(r.id);
+        }
       }
+      // Chỉ thêm vào deliveredReportIds khi record đã thực sự 'delivered' (ACK thành công)
+      const rec = storage.getOutboxRecord(r.id);
+      if (rec && rec.status === 'delivered') {
+        deliveredReportIds.add(r.id);
+      }
+    } catch (e: any) {
+      // Giao thất bại → KHÔNG thêm deliveredReportIds → vòng quét retry lại được
+      console.log(`[Outbox] Replay delivery failed for ${r.id}: ${e?.message || e}`);
     }
   }
   storage.pruneDeliveredOutbox();
@@ -5442,6 +5703,8 @@ function startServerWithPortFallback(port: number) {
       autoResumeWorkingAgents().catch(e => console.error(`[AutoContinue] Resume failed: ${e.message}`));
       processChatRetryQueue().catch(e => console.error(`[ChatQueue] Replay failed: ${e.message}`));
       scheduleChatRetry();
+      // ACK-based: vòng quét định kỳ retry các report failed/in_flight treo khi mạng khôi phục
+      scheduleOutboxRetry();
     }, 1000);
   });
 }

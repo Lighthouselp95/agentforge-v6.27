@@ -2363,7 +2363,11 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   // Guard bubble rỗng: message chỉ có thinking/toolCall (content rỗng) KHÔNG tạo bubble text rỗng (cục tròn)
   const hasBubbleContent = !!body && String(body).trim().length > 0;
 
-  if (isOrchestratorInternal && msg.from === 'orchestrator' && !msg.showOnUI) {
+  // Ẩn tin nội bộ: (1) orchestrator gửi lệnh nội bộ, (2) system broadcast nội bộ cho orchestrator
+  // (from:'system' + to:'orchestrator' + msgType:'internal' do forwardToOrchestrator tạo).
+  // GIỮ tin system hướng tới user (to:'user', msgType:'error', to:'all') — user cần thấy.
+  if ((isOrchestratorInternal && msg.from === 'orchestrator' && !msg.showOnUI) ||
+      (msg.from === 'system' && msg.to === 'orchestrator' && !msg.showOnUI)) {
     return null;
   }
 

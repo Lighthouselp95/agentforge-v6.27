@@ -770,6 +770,9 @@ export function App() {
     if (!m) return true;
     if (m.showOnUI) return false;
     const content = (m.content || '').trim();
+    // Tin hệ thống NỘI BỘ (from:'system') cho orchestrator (to:'orchestrator', msgType:'internal') → Ẩn khỏi UI.
+    // GIỮ tin lỗi hệ thống hướng tới user (msgType:'error' / to:'user') để user vẫn thấy.
+    if (m.from === 'system' && !(m.msgType === 'error') && m.to !== 'user') return true;
     return (
       m.msgType === 'transcript' ||
       m.msgType === 'heartbeat' ||
@@ -796,37 +799,52 @@ export function App() {
     // Tin agent báo cáo VỀ orchestrator (from=agent, to='orchestrator') PHẢI được hiển thị ở main view
     // để người dùng thấy agent phản hồi lại main.
     if (m.from === 'orchestrator' && m.msgType !== 'talk' && m.to && m.to !== 'user' && m.to !== 'broadcast') return true;
+    // Tin hệ thống NỘI BỘ hướng tới orchestrator (forwardToOrchestrator: to='orchestrator', msgType='internal')
+    // → không hiển thị trong main chat. Tin system hướng tới user (to:'user', msgType:'error') vẫn hiện.
+    if (m.from === 'system' && m.to === 'orchestrator') return true;
     return false;
   };
 
   // Fix interleave 6.44: dedup canonical reply khi snapshot opencode đã có text parts (interleave đầy đủ)
+  // Fix UI-dup 6.31.1: mở rộng điều kiện drop — nếu có snapshot opencode (msgType='opencode') cho cùng `from`
+  // với parts NON-EMPTY (text/tool), thì DROP talk reply không-opencode cùng `from` (snapshot làm canonical,
+  // đã render đầy đủ text+tool+thinking qua parts). Chạy 2 pass (pre-scan + filter) để dedup hoạt động
+  // KHÔNG phụ thuộc thứ tự snapshot/reply trong mảng. An toàn: chỉ drop theo key `from` trùng snapshot,
+  // không đụng tin user / agent khác.
   const applyOacDedup = (list: typeof allMessages) => {
     const stripTypePrefix = (s: string) => {
       if (/^[A-Z_]+:\s/u.test(s) && !/^✖|^◆/u.test(s)) return s.replace(/^[A-Z_]+:\s?/u, '');
       return s;
     };
-    const out: typeof list = [];
-    // from → toàn bộ text parts (strip TYPE prefix) của snapshot opencode cuối, nối lại — để so khớp
-    // với canonical reply (vốn là tổng hợp mọi text event, không chỉ segment cuối).
+    // Pass 1 — pre-scan: theo từng `from`, ghi nhận snapshot opencode canonical (có parts text/tool non-empty)
     const oacFullText = new Map<string, string>();
+    const oacHasParts = new Map<string, boolean>();
     for (const m of list) {
       const fkey = m.from || '';
       if (m.msgType === 'opencode' && Array.isArray((m as any).parts)) {
-        const textParts = (m as any).parts.filter((p: any) => p && p.type === 'text' && String(p.content || '').trim().length > 0);
+        const parts = (m as any).parts.filter((p: any) => p);
+        if (parts.some((p: any) => (p.type === 'tool') || (p.type === 'text' && String(p.content || '').trim().length > 0))) {
+          oacHasParts.set(fkey, true);
+        }
+        const textParts = parts.filter((p: any) => p.type === 'text' && String(p.content || '').trim().length > 0);
         if (textParts.length > 0) {
           oacFullText.set(fkey, textParts.map((p: any) => stripTypePrefix(String(p.content || ''))).join('\n').trim());
         }
-        out.push(m);
-      } else if (m.msgType !== 'opencode' && m.content && String(m.content).trim().length > 0) {
-        const fullText = oacFullText.get(fkey);
-        if (fullText !== undefined && String(m.content).trim() === fullText) {
-          // drop redundant canonical reply — interleaved parts already cover this text
-        } else {
-          out.push(m);
-        }
-      } else {
-        out.push(m);
       }
+    }
+    // Pass 2 — filter: giữ snapshot opencode, drop talk reply không-opencode trùng `from` snapshot.
+    const out: typeof list = [];
+    for (const m of list) {
+      const fkey = m.from || '';
+      if (m.msgType !== 'opencode' && m.content && String(m.content).trim().length > 0) {
+        const fullText = oacFullText.get(fkey);
+        const hasParts = oacHasParts.get(fkey) === true;
+        if ((fullText !== undefined && String(m.content).trim() === fullText) || hasParts) {
+          // drop redundant canonical reply — interleaved parts của snapshot đã đủ text+tool+thinking
+          continue;
+        }
+      }
+      out.push(m);
     }
     return out;
   };
