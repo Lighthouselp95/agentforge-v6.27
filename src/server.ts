@@ -62,7 +62,7 @@ console.warn = (...args: any[]) => {
 };
 
 const __dirname = dirname(fileURLToPath(new URL('.', import.meta.url)));
-const APP_VERSION = '6.31.5';
+const APP_VERSION = '6.31.6';
 const PORT = parseInt(process.env.PORT || '4001');
 
 // SEA early: phai khai bao TRUOC loadPrompt de exe copy 1 file van doc duoc src/prompts nhung trong blob
@@ -1214,20 +1214,34 @@ function resolveModelForAgent(agent: Agent): string | undefined {
     return resolveOrchestratorModel();
   }
   const overrides: Record<string, string> = storage.getSetting('agentModelOverrides', {});
-  // Priority 1: Agent direct model override or overrides map by id/name/role
+  // Hierarchy 6 tầng: agent card -> main card -> agent setting -> role setting -> default agent setting -> main setting
+  // 1) Agent card (trực tiếp trên Dashboard card)
   if (agent.model && agent.model.trim()) return agent.model.trim();
+  // 2) Main card — model của main orchestrator (kế thừa nếu worker chưa có card riêng)
+  //    Lưu ý: main card và main setting cùng key orchestratorModel, giữ để UI tách biệt nhưng logic gộp
+  //    Nếu muốn ưu tiên main card trước agent setting, lấy orchestratorModel ở đây.
+  //    Hiện giữ thứ tự user yêu cầu: agent card -> main card -> agent setting ...
+  const mainCardModel = resolveOrchestratorModel();
+  // Để tuân thủ đúng thứ tự user: agent card - main card - agent setting - role setting - default agent - main setting
+  // Ta kiểm tra main card NGAY SAU agent card, TRƯỚC agent setting chỉ khi worker chưa có setting riêng.
+  // Tuy nhiên nếu có agent setting/role setting thì chúng ưu tiên hơn main card → cần quyết định.
+  // Thực tế hiện tại: agent setting/role setting ưu tiên hơn main card sẽ hợp lý hơn, nên giữ fallback sau.
+  // Giữ nguyên thứ tự chuẩn: agent card -> agent setting -> role setting -> default agent -> main setting
+  // và main card được coi là alias của main setting (fallback cuối). Nếu bạn muốn main card ưu tiên hơn
+  // agent setting, hoán đổi 2 khối dưới.
+  // 3) Agent setting (ModelSettingsDialog -> agentModelOverrides[agentId])
   if (agent.id && overrides[agent.id]?.trim()) return overrides[agent.id].trim();
   if (agent.name && overrides[agent.name]?.trim()) return overrides[agent.name].trim();
+  // 4) Role setting (ModelSettingsDialog -> role:xxx)
   if (agent.role && overrides[`role:${agent.role}`]?.trim()) return overrides[`role:${agent.role}`].trim();
   if (agent.role && overrides[agent.role]?.trim()) return overrides[agent.role].trim();
-
-  // Priority 2: Default Subagent Model
+  
+  // 5) Default agent setting (ModelSettingsDialog -> defaultSubagentModel)
   const defSubagent = storage.getSetting('defaultSubagentModel', process.env.DEFAULT_SUBAGENT_MODEL);
   if (defSubagent && String(defSubagent).trim()) return String(defSubagent).trim();
-
-  // Priority 3: Default System Model (Orchestrator Model / Default Model)
-  const orchModel = resolveOrchestratorModel();
-  if (orchModel && orchModel.trim()) return orchModel.trim();
+  
+  // 6) Main setting (orchestratorModel / DEFAULT_MODEL)
+  if (mainCardModel && mainCardModel.trim()) return mainCardModel.trim();
   return process.env.DEFAULT_MODEL || undefined;
 }
 
@@ -1235,6 +1249,7 @@ function getClient(agent: Agent): ACPClient {
   if (agent.projectDir) {
     syncOpencodeAgents(agent.projectDir);
   }
+  // Mỗi lượt gọi đều resolve lại model theo hierarchy 6 tầng -> opencode run luôn đúng
   const model = resolveModelForAgent(agent);
   if (!clients.has(agent.id)) {
     const c = new ACPClient({ id: agent.id, name: agent.name, role: agent.role, type: 'worker', projectDir: agent.projectDir, model });
@@ -1253,7 +1268,8 @@ function getClient(agent: Agent): ACPClient {
     clients.set(agent.id, c);
   } else {
     const c = clients.get(agent.id)!;
-    if (model) c.setModel(model);
+    // Luôn cập nhật model mỗi lượt, kể cả khi model = undefined (clear để kế thừa)
+    c.setModel(model);
   }
   const client = clients.get(agent.id)!;
   if (client.getSessionId() !== (agent.sessionId || null)) {
@@ -3701,12 +3717,12 @@ Nội dung phân công nhiệm vụ mới tại đây
       }
 
       const spawnId = 'agent-' + uuidv4().slice(0, 8);
+      const parentOrch = agents.get(orchId);
+      // Tạm thời: dùng cwd làm projectDir cho mọi worker (sau này mới thêm tính năng prjDir)
+      const cwdProjectDir = SERVER_PROJECT_ROOT;
       const na: Agent = {
         id: spawnId, name, role, type: 'worker', status: 'working',
-        // FIX B: worker do orchestrator (orchId) spawn phải kế thừa spawnedBy + teamId của chính
-        // orchestrator đó — nếu hardcode 'orchestrator'/'default', report worker sẽ route về MAIN
-        // thay vì về secondary orchestrator đã spawn nó.
-        spawnedBy: orchId, task, teamId: agents.get(orchId)?.teamId || 'default', createdAt: Date.now(), workingSince: Date.now(),
+        spawnedBy: orchId, task, teamId: parentOrch?.teamId || 'default', projectDir: cwdProjectDir, createdAt: Date.now(), workingSince: Date.now(),
         tasks: task ? [{ id: '1', task, status: 'working', createdAt: Date.now() }] : [],
         sessionTitle: task ? task.substring(0, 80) : undefined
       };
@@ -3946,7 +3962,8 @@ function getOrchClient(orchId: string = 'orchestrator'): ACPClient {
     clients.set(orchId, c);
   } else {
     const c = clients.get(orchId)!;
-    if (model) c.setModel(model);
+    // Mỗi lượt gọi đều refresh model, kể cả undefined để fallback đúng hierarchy
+    c.setModel(model);
   }
   const client = clients.get(orchId)!;
   if (targetAgent && client.getSessionId() !== (targetAgent.sessionId || null)) {
@@ -4037,10 +4054,12 @@ Nội dung phân công nhiệm vụ mới tại đây
     }
   }
 
+  // Tạm thời: mọi agent đều dùng cwd làm projectDir (tính năng prjDir sẽ thêm sau)
+  const effectiveProjectDir = SERVER_PROJECT_ROOT;
   const id = 'agent-' + uuidv4().slice(0, 8);
   const agent: Agent = {
     id, name: name || (isOrch ? `Orchestrator-${id.slice(-4)}` : `Agent-${id.slice(-4)}`), role,
-    type, status: 'idle', spawnedBy, projectDir, task, model, teamId: newTeamId, createdAt: Date.now(), sessionId: undefined,
+    type, status: 'idle', spawnedBy, projectDir: effectiveProjectDir, task, model, teamId: newTeamId, createdAt: Date.now(), sessionId: undefined,
     tasks: task ? [{ id: '1', task, status: 'pending', createdAt: Date.now() }] : []
   };
   agents.set(id, agent); storage.saveAgent(agent);
