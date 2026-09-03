@@ -914,36 +914,34 @@ export function App() {
     : allMessages.filter(m => {
         if (isSystemMsg(m)) return false;
         if (isInternalMsg(m)) return false;
-        // Fix 6.36: MAIN view (orchestrator chính) chỉ hiển thị msg thuộc TEAM của chính nó.
-        // Realtime broadcast KHÔNG lọc team (server gửi toàn bộ ws/sse clients) — snapshot/thinking/chunk
-        // của sub-orch team khác hiện lẫn trên MAIN. History /api/history đã lọc team đúng, chỉ thiếu
-        // REALTIME. Server giờ gắn teamId vào 3 event (chat:thinking/chat:chunk/chat:message opencode),
-        // client lọc ở đây: msg mang teamId khác team MAIN → ẩn.
-        const mainOrch = agents.find(a => a.id === 'orchestrator');
-        const mainTeamId = mainOrch?.teamId || 'default';
+        // Fix 6.36: MAIN view chỉ hiển thị msg thuộc TEAM của Orchestrator đang active.
+        // Mọi Main Orchestrator đều ngang hàng, không hardcode id 'orchestrator'.
+        const defaultOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+        const mainTeamId = defaultOrch?.teamId || 'default';
         if (m.teamId && m.teamId !== mainTeamId) return false;
         // Tab Main: chỉ hiển thị snapshot 'opencode' của ORCHESTRATOR + agent mục tiêu người dùng chọn.
         // Ẩn hoàn toàn snapshots opencode của WORKER (msgType 'opencode', from=worker) — worker chỉ nên
         // thấy ở tab agent của chính nó, không hiện lên màn hình MAIN (orchestrator view). Không xóa dữ liệu.
-        const isWorkerOpen = (m.msgType === 'opencode') && (m.from !== 'user') && (m.from !== 'orchestrator') && (m.agentRole !== 'orchestrator');
+        const orchId = defaultOrch?.id || 'orchestrator';
+        const isWorkerOpen = (m.msgType === 'opencode') && (m.from !== 'user') && (m.from !== orchId) && (m.agentRole !== 'orchestrator');
         if (isWorkerOpen) {
           return false;
         }
         if (m.msgType === 'opencode') {
           return !!(m.content || m.thinking || (m.toolCalls && m.toolCalls.length > 0) || (m.parts && m.parts.length > 0));
         }
-        const isFromWorker = m.from !== 'user' && m.from !== 'orchestrator' && m.agentRole !== 'orchestrator' && m.from !== 'system' && m.from !== 'error';
+        const isFromWorker = m.from !== 'user' && m.from !== orchId && m.agentRole !== 'orchestrator' && m.from !== 'system' && m.from !== 'error';
         if (isFromWorker) {
           // ẨN 100% tin nhắn và báo cáo của worker trên màn hình chat Main
           return false;
         }
         return (
-          (m.from === 'user' && (m.to === 'orchestrator' || !m.to)) ||
-          ((m.from === 'orchestrator' || m.agentRole === 'orchestrator') && (m.to === 'user' || m.to === 'broadcast' || !m.to)) ||
+          (m.from === 'user' && (m.to === orchId || m.to === 'orchestrator' || !m.to)) ||
+          ((m.from === orchId || m.from === 'orchestrator' || m.agentRole === 'orchestrator') && (m.to === 'user' || m.to === 'broadcast' || !m.to)) ||
           // Lệnh giao task (spawn/talk) của Orchestrator → agent: HIỂN THỊ thành cục riêng trên main
-          ((m.from === 'orchestrator' || m.agentRole === 'orchestrator') && m.msgType === 'talk' && m.to && m.to !== 'user' && m.to !== 'broadcast') ||
-          (m.msgType === 'error' && (m.to === 'user' || m.from === 'orchestrator')) ||
-          (m.from === 'error' && (m.to === 'user' || m.to === 'orchestrator'))
+          ((m.from === orchId || m.from === 'orchestrator' || m.agentRole === 'orchestrator') && m.msgType === 'talk' && m.to && m.to !== 'user' && m.to !== 'broadcast') ||
+          (m.msgType === 'error' && (m.to === 'user' || m.from === orchId || m.from === 'orchestrator')) ||
+          (m.from === 'error' && (m.to === 'user' || m.to === orchId || m.to === 'orchestrator'))
         );
       })
   );
@@ -1051,6 +1049,23 @@ export function App() {
       }
     } catch (e) {
       console.error('Failed to delete agent:', e);
+      fetchAgents();
+    }
+  };
+
+  const deleteTask = async (agentId: string, taskId: string | number) => {
+    try {
+      const res = await fetch(`${API}/api/agents/${encodeURIComponent(agentId)}/tasks/${encodeURIComponent(String(taskId))}`, {
+        method: 'DELETE'
+      });
+      const data = await res.json();
+      if (data.ok && data.agent) {
+        setAgents(prev => prev.map(a => a.id === agentId ? { ...a, ...data.agent } : a));
+      } else {
+        fetchAgents();
+      }
+    } catch (e) {
+      console.error('Failed to delete task:', e);
       fetchAgents();
     }
   };
@@ -1218,6 +1233,7 @@ export function App() {
                 selectedAgentId={selectedAgentId}
                 onUpdateModel={updateAgentModel}
                 onDeleteAgent={deleteAgent}
+                onDeleteTask={deleteTask}
               />
             </div>
           )}
@@ -1420,13 +1436,13 @@ export function App() {
                   const a = agents.find(x => x.id === selectedAgentId);
                   return a ? `${a.name} (${a.id})${a.sessionTitle ? ` — ${a.sessionTitle}` : ''}` : 'Agent';
                 })() : (() => {
-                  const a = agents.find(x => x.id === 'orchestrator');
-                  return a && a.sessionTitle ? `Orchestrator (orchestrator) — ${a.sessionTitle}` : 'Orchestrator (orchestrator)';
+                  const a = agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator');
+                  return a ? `${a.name || 'Orchestrator'} (${a.id})${a.sessionTitle ? ` — ${a.sessionTitle}` : ''}` : 'Chưa có Orchestrator';
                 })()}
-                tokenUsage={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.tokenUsage : agents.find(x => x.id === 'orchestrator')?.tokenUsage}
-                contextLength={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.contextLength : agents.find(x => x.id === 'orchestrator')?.contextLength}
-                model={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.model : agents.find(x => x.id === 'orchestrator')?.model}
-                status={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.status : agents.find(x => x.id === 'orchestrator')?.status}
+                tokenUsage={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.tokenUsage : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.tokenUsage)}
+                contextLength={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.contextLength : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.contextLength)}
+                model={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.model : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.model)}
+                status={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.status : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.status || 'idle')}
                 formatMessage={formatMessage}
                 allMessages={filteredMessages}
                 agents={agents}
@@ -1651,7 +1667,10 @@ export function App() {
                                 overflowY: 'auto',
                                 paddingRight: 2
                               }}>
-                                {renderAgentTaskList(parsedTasks)}
+                                {renderAgentTaskList(parsedTasks, {
+                                  agentId: ag.id,
+                                  onDeleteTask: (tId) => deleteTask(ag.id, tId)
+                                })}
                               </div>
                             ) : (
                               <div style={{ fontSize: 11, color: 'var(--text-muted)', fontStyle: 'italic', paddingLeft: 4 }}>

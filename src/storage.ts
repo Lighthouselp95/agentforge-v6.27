@@ -374,7 +374,7 @@ export const storage = {
     schedulePersist();
   },
 
-  updateAgent(id: string, updates: { status?: string; sessionId?: string | null; sessionTitle?: string | null; model?: string | null; workingSince?: number | null; tokenUsage?: any; contextLength?: number | null; task?: string; tasks?: any[] }) {
+  updateAgent(id: string, updates: { status?: string; sessionId?: string | null; sessionTitle?: string | null; model?: string | null; workingSince?: number | null; tokenUsage?: any; contextLength?: number | null; task?: string; tasks?: any[]; teamId?: string; spawnedBy?: string }) {
     const existing = inMemoryAgents.get(id) || {};
     const updated = {
       ...existing,
@@ -386,7 +386,9 @@ export const storage = {
       token_usage: 'tokenUsage' in updates ? (updates.tokenUsage !== undefined ? updates.tokenUsage : null) : existing.token_usage,
       context_length: 'contextLength' in updates ? (updates.contextLength !== undefined ? updates.contextLength : null) : existing.context_length,
       task: 'task' in updates ? updates.task : existing.task,
-      tasks: 'tasks' in updates ? updates.tasks : existing.tasks
+      tasks: 'tasks' in updates ? updates.tasks : existing.tasks,
+      teamId: 'teamId' in updates ? updates.teamId : (existing.teamId || (id === 'orchestrator' ? 'default' : undefined)),
+      spawnedBy: 'spawnedBy' in updates ? updates.spawnedBy : existing.spawnedBy
     };
     inMemoryAgents.set(id, updated);
     schedulePersist();

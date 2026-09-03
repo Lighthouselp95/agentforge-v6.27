@@ -577,26 +577,31 @@ function loadState() {
       const agent: Agent = {
         id: row.id, name: row.name, role: row.role, type: row.type,
         status: keepWorking ? 'working' : (row.status === 'working' ? 'idle' : row.status),
-        spawnedBy: row.spawned_by, projectDir: row.project_dir, 
-        teamId: row.teamId || row.team_id || 'default',
+        spawnedBy: row.spawnedBy || row.spawned_by || undefined,
+        projectDir: row.projectDir || row.project_dir || SERVER_PROJECT_ROOT, 
+        teamId: row.teamId || row.team_id || (row.type === 'orchestrator' ? (row.id === 'orchestrator' ? 'default' : `team-${row.id.slice(-8)}`) : 'default'),
         model: row.model || undefined,
-        sessionId: row.session_id || undefined,
-        sessionTitle: row.session_title ? String(row.session_title).normalize('NFC') : undefined,
+        sessionId: row.session_id || row.sessionId || undefined,
+        sessionTitle: row.session_title ? String(row.session_title).normalize('NFC') : (row.sessionTitle ? String(row.sessionTitle).normalize('NFC') : undefined),
         task: row.task ? String(row.task).normalize('NFC') : undefined,
         tasks: rowTasks,
-        createdAt: row.created_at, workingSince: keepWorking ? (row.workingSince || row.working_since || Date.now()) : undefined,
-        tokenUsage: row.token_usage || undefined,
-        contextLength: row.context_length || undefined
+        createdAt: row.created_at || row.createdAt || Date.now(), workingSince: keepWorking ? (row.workingSince || row.working_since || Date.now()) : undefined,
+        tokenUsage: row.token_usage || row.tokenUsage || undefined,
+        contextLength: row.context_length || row.contextLength || undefined
       };
       agents.set(agent.id, agent);
       // Collect session entries for restoring agentSessions static map for all agents
-      if (row.session_id && row.id) {
-        sessionEntries.push({ agentId: row.id, sessionId: row.session_id });
+      const sid = row.session_id || row.sessionId;
+      if (sid && row.id) {
+        sessionEntries.push({ agentId: row.id, sessionId: sid });
       }
     }
     // Restore ACPClient.agentSessions map for all agents
     ACPClient.restoreAgentSessions(sessionEntries);
-    if (!agents.has('orchestrator')) {
+    
+    // Mọi Orchestrator đều ngang hàng: CHỈ tạo orchestrator khởi đầu nếu DB hoàn toàn chưa có bất kỳ agent nào
+    const hasAnyOrchestrator = Array.from(agents.values()).some(a => a.type === 'orchestrator' || a.role === 'orchestrator');
+    if (savedAgents.length === 0 && !hasAnyOrchestrator) {
       const storedOrch = storage.getAgent('orchestrator');
       const keepOrchWorking = autoContinue && storedOrch?.status === 'working';
       const savedOrchModel = storage.getSetting('orchestratorModel', process.env.ORCHESTRATOR_MODEL);
@@ -1548,23 +1553,16 @@ WHAT I DID: <summary>
 }
 
 async function deleteAgent(id: string): Promise<boolean> {
-  if (id === 'orchestrator') {
-    throw new Error('Cannot delete main orchestrator agent');
-  }
+  // Xóa bất kỳ agent nào (kể cả Orchestrator) chỉ xóa chính bản thân agent đó.
+  // Các worker trong team vẫn được bảo toàn và team chỉ bị xóa khi tất cả thành viên trong team đều bị xóa.
+  return await deleteSingleAgentOnly(id);
+}
 
+async function deleteSingleAgentOnly(id: string): Promise<boolean> {
   const a = agents.get(id) || (storage.getAgent(id) as any);
   const client = clients.get(id);
 
-  // 1. Reassign any children workers of this orchestrator back to main orchestrator
-  for (const [, child] of agents) {
-    if (child.spawnedBy === id) {
-      child.spawnedBy = 'orchestrator';
-      storage.updateAgent(child.id, { spawnedBy: 'orchestrator' } as any);
-      broadcast('agent:updated', { agent: child });
-    }
-  }
-
-  // 2. Abort tiến trình con nếu đang chạy
+  // 1. Abort tiến trình con nếu đang chạy
   if (client) {
     try {
       client.abort();
@@ -1573,10 +1571,10 @@ async function deleteAgent(id: string): Promise<boolean> {
     }
   }
 
-  // 3. Xóa session mapping trong ACPClient
+  // 2. Xóa session mapping trong ACPClient
   ACPClient.unregisterSession(id);
 
-  // 4. Xóa dọn session trong OpenCode storage
+  // 3. Xóa dọn session trong OpenCode storage
   const sid = a?.sessionId || a?.session_id || (client ? client.getSessionId() : null);
   if (client) {
     try {
@@ -1594,10 +1592,10 @@ async function deleteAgent(id: string): Promise<boolean> {
     }
   }
 
-  // 5. Xóa toàn bộ conversation và transcript khỏi Database storage
+  // 4. Xóa toàn bộ conversation và transcript khỏi Database storage
   storage.clearAgentConversation(id);
 
-  // 6. Xóa tin nhắn khỏi bộ nhớ RAM chatHistory
+  // 5. Xóa tin nhắn khỏi bộ nhớ RAM chatHistory
   const remainingChat = chatHistory.filter(m => m.from !== id && m.to !== id);
   chatHistory.length = 0;
   chatHistory.push(...remainingChat);
@@ -1611,11 +1609,11 @@ async function deleteAgent(id: string): Promise<boolean> {
   // 7. Xóa toàn bộ agent khỏi Database storage
   storage.deleteAgent(id);
 
-  // 9. Xóa khỏi memory map
+  // 8. Xóa khỏi memory map
   clients.delete(id);
   agents.delete(id);
 
-  // 10. Broadcast sự kiện agent:deleted — per-team
+  // 9. Broadcast sự kiện agent:deleted — per-team
   const deletedTeamId = a?.teamId || 'default';
   broadcast('agent:deleted', { id, agentId: id });
   notifyTeamChanged(deletedTeamId);
@@ -4155,9 +4153,6 @@ app.post('/api/agents/:id/abort', (req, res) => {
 
 app.delete('/api/agents/:id', async (req, res) => {
   const { id } = req.params;
-  if (id === 'orchestrator') {
-    return res.status(400).json({ ok: false, error: 'Cannot delete orchestrator agent' });
-  }
   const exists = agents.has(id) || storage.getAgent(id);
   if (!exists) {
     return res.status(404).json({ ok: false, error: 'Agent not found' });
@@ -4201,9 +4196,105 @@ app.patch('/api/agents/:id', (req, res) => {
     // KHÔNG notifyTeamChanged() ở đây — task content không phải member change
   }
   
-  broadcast('agent:updated', { agent });
-  res.json({ ok: true, agent });
-});
+    broadcast('agent:updated', { agent });
+    res.json({ ok: true, agent });
+  });
+
+  // Delete a specific task from an agent, persist to storage, and shift succeeding task IDs down by 1
+  function handleDeleteAgentTask(req: express.Request, res: express.Response) {
+    const agentId = req.params.id;
+    const rawTaskId = req.params.taskId;
+    const agent = agents.get(agentId) || (storage.getAgent(agentId) as any);
+    if (!agent) {
+      return res.status(404).json({ ok: false, error: 'Agent not found' });
+    }
+
+    // 1. Đồng bộ cấu trúc agent.tasks nếu mảng rỗng nhưng agent.task có nội dung
+    if (!Array.isArray(agent.tasks) || agent.tasks.length === 0) {
+      if (agent.task && typeof agent.task === 'string' && agent.task.trim()) {
+        const lines = agent.task.split(/\r?\n/).map((l: string) => l.trim()).filter(Boolean);
+        agent.tasks = lines.map((l: string, idx: number) => {
+          const clean = l.replace(/^[-*•\d+.)#]\s*/, '').replace(/^#\d+\s*/, '').trim();
+          return {
+            id: String(idx + 1),
+            task: clean || l,
+            status: (agent.status === 'working' && idx === 0) ? 'working' : 'pending',
+            createdAt: Date.now()
+          };
+        });
+      } else {
+        agent.tasks = [];
+      }
+    }
+
+    if (agent.tasks.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Agent has no tasks to delete' });
+    }
+
+    // 2. Tìm index của task cần xóa (khớp theo task.id hoặc số thứ tự 1-based)
+    const targetNum = parseInt(rawTaskId, 10);
+    const removeIndex = agent.tasks.findIndex((t: any, idx: number) =>
+      t.id === rawTaskId || (!isNaN(targetNum) && (t.id === String(targetNum) || idx + 1 === targetNum))
+    );
+
+    if (removeIndex === -1) {
+      return res.status(404).json({ ok: false, error: `Task #${rawTaskId} not found` });
+    }
+
+    // Xóa phần tử task khỏi mảng
+    const [removedTask] = agent.tasks.splice(removeIndex, 1);
+
+    // 3. QUAN TRỌNG: Các task sau đó sẽ LÙI SỐ ID VỀ 1 LẦN (re-index lại 1, 2, 3...)
+    agent.tasks.forEach((t: any, idx: number) => {
+      const newId = String(idx + 1);
+      t.id = newId;
+      // Nếu text của task có gắn tiền tố # cũ, cập nhật lại số mới
+      if (/^#\d+\b/.test(t.task)) {
+        t.task = t.task.replace(/^#\d+/, `#${newId}`);
+      }
+    });
+
+    // 4. Cập nhật lại agent.task và status
+    if (agent.tasks.length === 0) {
+      agent.task = '';
+      if (agent.status === 'working') {
+        agent.status = 'idle';
+        agent.workingSince = undefined;
+      }
+    } else {
+      // Ưu tiên task working -> pending -> task đầu tiên còn lại
+      const activeTask = agent.tasks.find((t: any) => t.status === 'working')
+        || agent.tasks.find((t: any) => t.status === 'pending')
+        || agent.tasks[0];
+      agent.task = activeTask.task;
+    }
+
+    // 5. Cập nhật vào database / storage
+    storage.updateAgent(agent.id, {
+      task: agent.task,
+      tasks: agent.tasks,
+      status: agent.status,
+      workingSince: agent.workingSince ?? null
+    } as any);
+
+    // Đảm bảo đồng bộ Map agents
+    agents.set(agent.id, agent);
+
+    // 6. Broadcast sự kiện cập nhật realtime qua WebSocket
+    broadcast('agent:updated', { agent });
+
+    console.log(`[Tasks] Deleted task #${rawTaskId} from agent ${agent.name} (${agent.id}). Remaining: ${agent.tasks.length} tasks (re-indexed 1..${agent.tasks.length}).`);
+
+    return res.json({
+      ok: true,
+      deleted: removedTask,
+      agent,
+      tasks: agent.tasks
+    });
+  }
+
+  app.delete('/api/agents/:id/tasks/:taskId', handleDeleteAgentTask);
+  app.post('/api/agents/:id/tasks/:taskId/delete', handleDeleteAgentTask);
 
 // Update agent model
 app.post('/api/agents/:id/model', (req, res) => {
