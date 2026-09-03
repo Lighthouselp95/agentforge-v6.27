@@ -505,7 +505,9 @@ export const storage = {
   },
 
   // ACK-based: trả về các record cần retry — status 'pending' HOẶC 'failed' đã tới hạn
-  // nextAttemptAt, HOẶC 'in_flight' quá lâu (timeout trong-memory tracker).
+  // nextAttemptAt, HOẶC 'in_flight' MẤT stamp (crash/restart giữa chừng → coi treo).
+  // KHÔNG reset 'in_flight' khi in-memory stamp `inFlightSince` còn tồn tại: turn agent có thể
+  // chạy >30s (enqueue chưa resolve) nhưng vẫn đang active — reset sai → retry vô hạn vòng lặp.
   getOutboxForRetry() {
     const now = Date.now();
     return inMemoryOutbox.filter(r => {
@@ -513,10 +515,12 @@ export const storage = {
       if (r.status === 'failed') return (r.nextAttemptAt === undefined || r.nextAttemptAt <= now);
       if (r.status === 'in_flight') {
         const inFlightSince = outboxInFlightAt.get(r.id);
-        // Không có stamp in-memory (vd: sau restart server, tracker rỗng) → record in_flight
-        // còn tồn tại trong DB là do crash giữa chừng → coi là treo, đưa về pending để retry.
-        if (inFlightSince === undefined || now - inFlightSince > OUTBOX_IN_FLIGHT_TIMEOUT_MS) {
-          // Hết hạn in_flight / mất stamp → quay lại pending để retry (enqueue treo/không resolve)
+        // CHỈ reset khi stamp in-memory MẤT (undefined) — do crash/restart server giữa chừng →
+        // record in_flight còn trong DB là treo, đưa về pending để retry.
+        // Nếu stamp CÒN (inFlightSince !== undefined) → process đang active dù quá 30s → KHÔNG
+        // reset, KHÔNG trả retry (tránh tái gửi/chạy lại turn đang xử lý cùng nội dung).
+        if (inFlightSince === undefined) {
+          // Mất stamp → quay lại pending để retry (enqueue treo/không resolve)
           r.status = 'pending';
           outboxInFlightAt.delete(r.id);
           return true;

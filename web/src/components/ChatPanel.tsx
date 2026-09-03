@@ -1626,12 +1626,12 @@ function renderToolBadge(tool: string, parsedInput: any, safeInput: string, isMo
   const filePath = (parsedInput && (typeof parsedInput.filePath === 'string' ? parsedInput.filePath : (typeof parsedInput.path === 'string' ? parsedInput.path : ''))) || '';
 
   // ══ FIX UX mobile: path file bị cắt cụt không đọc được trọn tên file ══
-  // Trên mobile: overflow-x auto (kéo ngang bằng tay), KHÔNG ellipsis/không truncate,
-  // kèm title đầy đủ để vẫn thấy tên file nguyên khi giữ/chạm.
-  // Trên desktop: giữ nguyên ellipsis gọn gàng + tooltip title.
+  // Mobile: inline-block + overflowX:auto + maxWidth → tạo BOX scroll ngang THẬT (span inline
+  // thuần KHÔNG tạo scroll được — overflow chỉ hiệu lực trên block/inline-block có box riêng).
+  // Desktop: inline-block + ellipsis + maxWidth 360px giữ gọn (ellipsis cũng chỉ chạy trên inline-block).
   const pathStyle: React.CSSProperties = isMobile
-    ? { overflowX: 'auto', overflowY: 'hidden', whiteSpace: 'nowrap', color: 'var(--text-primary)', fontWeight: 500, fontSize: 11.5, maxWidth: '100%', scrollbarWidth: 'thin' }
-    : { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-primary)', fontWeight: 500, fontSize: 11.5 };
+    ? { display: 'inline-block', overflowX: 'auto', overflowY: 'hidden', whiteSpace: 'nowrap', color: 'var(--text-primary)', fontWeight: 500, fontSize: 11.5, maxWidth: '100%', verticalAlign: 'bottom', scrollbarWidth: 'thin' }
+    : { display: 'inline-block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-primary)', fontWeight: 500, fontSize: 11.5, maxWidth: 360, verticalAlign: 'bottom' };
 
   if (norm === 'edit') {
     return (
@@ -1898,9 +1898,10 @@ function ToolCallBlock({ tool, input, output, isMobile }: ToolCallData & { isMob
           fontFamily: 'monospace',
           whiteSpace: 'nowrap',
           // FIX UX mobile: mobile → overflow-x auto (kéo ngang xem trọn path), không ellipsis.
+          //   Cần minWidth:0 để flex container thu nhỏ được, con inline-block scroll ngang.
           //   Desktop → giữ gọn: ellipsis + maxWidth 70%.
           ...(isMobile
-            ? { overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin', maxWidth: '100%' }
+            ? { overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'thin', maxWidth: '100%', minWidth: 0 }
             : { overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '70%' })
         }}>
           {renderToolBadge(safeTool, parsedInput, safeInput, isMobile)}

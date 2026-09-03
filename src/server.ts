@@ -615,7 +615,8 @@ function loadState() {
         tasks: orchTasks,
         sessionId: storedOrch?.sessionId,
         sessionTitle: storedOrch?.sessionTitle,
-        model: savedOrchModel ? String(savedOrchModel).trim() : undefined
+        model: savedOrchModel ? String(savedOrchModel).trim() : undefined,
+        teamId: storedOrch?.teamId || 'default'
       };
       agents.set('orchestrator', orch);
       storage.saveAgent(orch);
@@ -1046,7 +1047,9 @@ function broadcastOACEvent(agentId: string, ev: any) {
       // trong agent view. RELAXED: chi can co it nhat 1 segment la set parts.
       parts: (parts.length > 0) ? parts : undefined
     };
-    broadcast('chat:message', { msg });
+    // FIX #3 (bỏ render cuối): KHÔNG broadcast snapshot opencode ra UI nữa — đã live stream qua
+    // chat:chunk/chat:thinking/chat:tool_call ở trên. Snapshot chỉ còn dùng để PERSIST (restart recovery).
+    // Bubble cuối của agent vẫn hiện qua handleAgentResponse broadcast reply.
     // PERSIST snapshot opencode: trước đây chỉ broadcast (KHÔNG lưu) → restart bị mất thinking/toolCalls.
     // Client render thinking từ history (ChatPanel L2072-2083) nên phải lưu storage để phục hồi sau restart.
     // Giới hạn: UPSERT 1 bản mới nhất/agent (xóa bản opencode cũ cùng from) — không phình vô hạn
@@ -1410,7 +1413,8 @@ function stopAgent(id: string, stoppedBy: 'user' | 'orchestrator' | 'error' = 'u
     timestamp: Date.now(),
     agentName: a.name,
     agentRole: a.role,
-    msgType: msgType
+    msgType: msgType,
+    teamId: a.teamId || 'default'
   };
   chatHistory.push(stopMsg);
   storage.saveMessage(stopMsg);
@@ -1493,7 +1497,7 @@ WHAT I DID: <summary>
     agent.workingSince = undefined;
     storage.updateAgent(agent.id, { status: 'error', workingSince: null });
     broadcast('agent:updated', { agent });
-    const errMsg: ChatMsg = { id: uuidv4(), from: agent.id, to: 'orchestrator', content: `[ERROR] Agent ${agent.name} failed after resume: ${e.message}`, timestamp: Date.now(), agentName: agent.name, agentRole: agent.role };
+    const errMsg: ChatMsg = { id: uuidv4(), from: agent.id, to: 'orchestrator', content: `[ERROR] Agent ${agent.name} failed after resume: ${e.message}`, timestamp: Date.now(), agentName: agent.name, agentRole: agent.role, teamId: agent.teamId || 'default' };
     chatHistory.push(errMsg); storage.saveMessage(errMsg);
     addUnreadForOrchestrator(errMsg);
     broadcast('chat:message', { msg: errMsg });
@@ -1698,6 +1702,7 @@ function checkAndSynthesize(completedAgentId: string) {
           timestamp: Date.now(),
           agentName: 'Orchestrator',
           agentRole: 'orchestrator',
+          teamId: synthOrchAgent?.teamId || 'default',
           msgType: isInternal ? 'orchestrator_internal' : undefined,
           showOnUI: !isInternal,
           ...((result as any).thinking ? { thinking: (result as any).thinking } : {})
@@ -2931,7 +2936,7 @@ async function processOrchestratorTriggerQueue() {
 
     let orchAgent = agents.get(orchId);
     if (!orchAgent) {
-      orchAgent = { id: orchId, name: (orchId === 'orchestrator' ? 'Orchestrator' : `Orchestrator-${orchId.slice(-4)}`), role: 'orchestrator', type: 'orchestrator', status: 'idle', createdAt: Date.now() };
+      orchAgent = { id: orchId, name: (orchId === 'orchestrator' ? 'Orchestrator' : `Orchestrator-${orchId.slice(-4)}`), role: 'orchestrator', type: 'orchestrator', status: 'idle', createdAt: Date.now(), teamId: (orchId === 'orchestrator' ? 'default' : `team-${orchId.slice(-8)}`) };
       agents.set(orchId, orchAgent);
     }
     updateOrchStateSafe(orchId, 'working', 'Đang tổng hợp báo cáo & điều phối');
@@ -2994,6 +2999,7 @@ async function processOrchestratorTriggerQueue() {
           timestamp: Date.now(),
           agentName: orchAgent.name || 'Orchestrator',
           agentRole: 'orchestrator',
+          teamId: orchAgent.teamId || 'default',
           msgType: isInternal ? 'orchestrator_internal' : undefined,
           showOnUI: !isInternal,
           ...((result as any).thinking ? { thinking: (result as any).thinking } : {})
@@ -3012,7 +3018,7 @@ async function processOrchestratorTriggerQueue() {
         }
       }
       
-      await handleOrchestratorResponse(result.content, (result as any).thinking || '');
+      await handleOrchestratorResponse(result.content, (result as any).thinking || '', orchId);
     } catch (e: any) {
       console.log(`[Orchestrator Trigger] Error: ${e.message}`);
       // Lỗi Abort: xóa khỏi Outbox NGAY, không retry (chống vòng lặp spam lỗi aborted)
@@ -3163,6 +3169,7 @@ if (messages.length === 0 && content && content.trim()) {
       timestamp: Date.now(),
       agentName: fromAgent.name,
       agentRole: fromAgent.role,
+      teamId: fromAgent.teamId || 'default',
       // msgType phản ánh NGƯỜI GỬI, không phải đích (fix arch-dbg):
       // - orchestrator_internal CHỈ khi NGƯỜI GỬI là orchestrator (planning nội bộ, ẩn trong khung worker).
       // - worker gửi báo cáo cho orchestrator dùng 'talk' (hoặc undefined nếu to user/broadcast) —
@@ -3211,7 +3218,10 @@ if (messages.length === 0 && content && content.trim()) {
     } else {
       const targetAgent = agents.get(resolvedTo) || findAgentByIdNameOrRole(resolvedTo);
       if (targetAgent) {
-        if (targetAgent.type === 'orchestrator') {
+        // FIX A: cho phép secondary orchestrator (role='orchestrator', type có thể là 'worker').
+        // Nếu chỉ nhận type==='orchestrator', secondary được spawn với type:'worker' sẽ rơi vào
+        // nhánh deliverTalk → handleAgentResponse (KHÔNG parse spawn) → <spawn> bị loại im lặng.
+        if (targetAgent.type === 'orchestrator' || targetAgent.role === 'orchestrator') {
           hasOrchestratorMessage = true;
           updateOrchStateSafe(resolvedTo, 'working', `Đang tiếp nhận & tổng kết báo cáo từ ${fromAgent.name}`);
           await triggerOrchestrator(fromAgent, safeOutContent);
@@ -3442,7 +3452,7 @@ async function deliverTalk(targetAgent: Agent, fromAgent: Agent, msg: { to: stri
   }
 }
 
-async function handleOrchestratorResponse(response: string, extraScanText = ''): Promise<string[]> {
+async function handleOrchestratorResponse(response: string, extraScanText = '', orchId = 'orchestrator'): Promise<string[]> {
   // FIX 2 — Clear dedup-spawn-set ở ĐẦU mỗi lần xử lý 1 response: dedup CHỈ trong phạm vi 1 response
   // (spawn lặp trong cùng 1 output), không chặn nhầm spawn hợp lệ ở turn/response khác.
   handledSpawnSigs.clear();
@@ -3557,7 +3567,8 @@ Cú pháp đúng:
         timestamp: Date.now(),
         agentName: 'Orchestrator',
         agentRole: 'orchestrator',
-        msgType: 'talk'
+        msgType: 'talk',
+        teamId: existing.teamId || 'default'
       };
       chatHistory.push(reuseTaskMsg);
       storage.saveMessage(reuseTaskMsg);
@@ -3610,7 +3621,7 @@ Cú pháp đúng:
           existing.workingSince = undefined;
           storage.updateAgent(existing.id, { status: 'error', workingSince: null });
           broadcast('agent:updated', { agent: existing });
-          const errMsg: ChatMsg = { id: uuidv4(), from: existing.id, to: 'orchestrator', content: `[ERROR] Agent ${existing.name} failed on first turn: ${e.message}`, timestamp: Date.now(), agentName: existing.name, agentRole: existing.role };
+          const errMsg: ChatMsg = { id: uuidv4(), from: existing.id, to: 'orchestrator', content: `[ERROR] Agent ${existing.name} failed on first turn: ${e.message}`, timestamp: Date.now(), agentName: existing.name, agentRole: existing.role, teamId: existing.teamId || 'default' };
           chatHistory.push(errMsg); storage.saveMessage(errMsg);
           addUnreadForOrchestrator(errMsg);
           broadcast('chat:message', { msg: errMsg });
@@ -3646,7 +3657,8 @@ Nội dung phân công nhiệm vụ mới tại đây
           content: errorContent,
           timestamp: Date.now(),
           agentName: 'System',
-          agentRole: 'system'
+          agentRole: 'system',
+          teamId: agents.get(orchId)?.teamId || 'default'
         };
         chatHistory.push(limitErrMsgUser);
         storage.saveMessage(limitErrMsgUser);
@@ -3657,7 +3669,10 @@ Nội dung phân công nhiệm vụ mới tại đây
       const spawnId = 'agent-' + uuidv4().slice(0, 8);
       const na: Agent = {
         id: spawnId, name, role, type: 'worker', status: 'working',
-        spawnedBy: 'orchestrator', task, teamId: 'default', createdAt: Date.now(), workingSince: Date.now(),
+        // FIX B: worker do orchestrator (orchId) spawn phải kế thừa spawnedBy + teamId của chính
+        // orchestrator đó — nếu hardcode 'orchestrator'/'default', report worker sẽ route về MAIN
+        // thay vì về secondary orchestrator đã spawn nó.
+        spawnedBy: orchId, task, teamId: agents.get(orchId)?.teamId || 'default', createdAt: Date.now(), workingSince: Date.now(),
         tasks: task ? [{ id: '1', task, status: 'working', createdAt: Date.now() }] : [],
         sessionTitle: task ? task.substring(0, 80) : undefined
       };
@@ -3668,13 +3683,14 @@ Nội dung phân công nhiệm vụ mới tại đây
       
       const spawnTaskMsg: ChatMsg = {
         id: uuidv4(),
-        from: 'orchestrator',
+        from: orchId,
         to: spawnId,
         content: `[SPAWN] ${role} "${name}" assigned: ${task}`,
         timestamp: Date.now(),
-        agentName: 'Orchestrator',
+        agentName: orchId === 'orchestrator' ? 'Orchestrator' : (agents.get(orchId)?.name || orchId),
         agentRole: 'orchestrator',
-        msgType: 'talk'
+        msgType: 'talk',
+        teamId: na.teamId || 'default'
       };
       chatHistory.push(spawnTaskMsg);
       storage.saveMessage(spawnTaskMsg);
@@ -3727,7 +3743,7 @@ Nội dung phân công nhiệm vụ mới tại đây
           na.workingSince = undefined;
           storage.updateAgent(na.id, { status: 'error', workingSince: null });
           broadcast('agent:updated', { agent: na });
-          const errMsg: ChatMsg = { id: uuidv4(), from: na.id, to: 'orchestrator', content: `[ERROR] Agent ${na.name} failed on first turn: ${e.message}`, timestamp: Date.now(), agentName: name, agentRole: role };
+          const errMsg: ChatMsg = { id: uuidv4(), from: na.id, to: 'orchestrator', content: `[ERROR] Agent ${na.name} failed on first turn: ${e.message}`, timestamp: Date.now(), agentName: name, agentRole: role, teamId: na.teamId || 'default' };
           chatHistory.push(errMsg); storage.saveMessage(errMsg);
           addUnreadForOrchestrator(errMsg);
           broadcast('chat:message', { msg: errMsg });
@@ -3791,7 +3807,8 @@ Nội dung phân công nhiệm vụ mới tại đây
       timestamp: Date.now(),
       agentName: 'Orchestrator',
       agentRole: 'orchestrator',
-      msgType: 'talk'
+      msgType: 'talk',
+      teamId: ta.teamId || 'default'
     };
     chatHistory.push(talkMsg);
     storage.saveMessage(talkMsg);
@@ -3848,7 +3865,7 @@ Nội dung phân công nhiệm vụ mới tại đây
         broadcast('agent:updated', { agent: ta });
         // KHÔNG nuốt lỗi: báo về orchestrator để main được wake và biết agent gặp sự cố
         try {
-          const errMsg: ChatMsg = { id: uuidv4(), from: ta.id, to: 'orchestrator', content: `[ERROR] Agent ${ta.name} (${ta.role}) turn failed: ${e.message}`, timestamp: Date.now(), agentName: ta.name, agentRole: ta.role };
+          const errMsg: ChatMsg = { id: uuidv4(), from: ta.id, to: 'orchestrator', content: `[ERROR] Agent ${ta.name} (${ta.role}) turn failed: ${e.message}`, timestamp: Date.now(), agentName: ta.name, agentRole: ta.role, teamId: ta.teamId || 'default' };
           chatHistory.push(errMsg); storage.saveMessage(errMsg);
           addUnreadForOrchestrator(errMsg);
           broadcast('chat:message', { msg: errMsg });
@@ -3879,7 +3896,7 @@ function getOrchClient(orchId: string = 'orchestrator'): ACPClient {
     c.setOnStatusChange((busy) => {
       let orch = agents.get(orchId);
       if (!orch) {
-        orch = { id: orchId, name: (isMain ? 'Orchestrator' : `Orchestrator-${orchId.slice(-4)}`), role: 'orchestrator', type: 'orchestrator', status: 'idle', createdAt: Date.now() };
+        orch = { id: orchId, name: (isMain ? 'Orchestrator' : `Orchestrator-${orchId.slice(-4)}`), role: 'orchestrator', type: 'orchestrator', status: 'idle', createdAt: Date.now(), teamId: (isMain ? 'default' : `team-${orchId.slice(-8)}`) };
         agents.set(orchId, orch);
       }
       const newStatus = busy ? 'working' : 'idle';
@@ -4275,7 +4292,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         const orchId = resolvedTargetId || 'orchestrator';
         let orch = agents.get(orchId);
         if (!orch) {
-          orch = { id: orchId, name: (orchId === 'orchestrator' ? 'Orchestrator' : `Orchestrator-${orchId.slice(-4)}`), role: 'orchestrator', type: 'orchestrator', status: 'working', createdAt: Date.now() };
+          orch = { id: orchId, name: (orchId === 'orchestrator' ? 'Orchestrator' : `Orchestrator-${orchId.slice(-4)}`), role: 'orchestrator', type: 'orchestrator', status: 'working', createdAt: Date.now(), teamId: (orchId === 'orchestrator' ? 'default' : `team-${orchId.slice(-8)}`) };
           agents.set(orchId, orch);
         }
         orch.status = 'working';
@@ -4359,6 +4376,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         timestamp: Date.now(),
         agentName: targetAgent.name,
         agentRole: targetAgent.role,
+        teamId: targetAgent.teamId || 'default',
         ...(result.toolCalls && result.toolCalls.length ? { toolCalls: result.toolCalls } : {}),
         ...(result.thinking ? { thinking: result.thinking } : {})
       };
@@ -4408,6 +4426,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
           timestamp: Date.now(),
           agentName: targetAgent.name,
           agentRole: targetAgent.role,
+          teamId: targetAgent.teamId || 'default',
           ...(result.toolCalls && result.toolCalls.length ? { toolCalls: result.toolCalls } : {}),
           ...(result.thinking ? { thinking: result.thinking } : {})
         };
@@ -4455,7 +4474,8 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         agentRole: 'orchestrator',
         msgType: isInternal ? 'orchestrator_internal' : undefined,
         showOnUI: !isInternal,
-...(result.thinking ? { thinking: result.thinking } : {})
+        teamId: agents.get(resolvedTargetId || 'orchestrator')?.teamId || 'default',
+        ...(result.thinking ? { thinking: result.thinking } : {})
       };
       if (!isBroadcastDuplicate(broadcastDedupKey(aMsg))) {
         chatHistory.push(aMsg);
@@ -4475,6 +4495,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         timestamp: Date.now(), agentName, agentRole,
         msgType: isInternal ? 'orchestrator_internal' : undefined,
         showOnUI: !isInternal,
+        teamId: agents.get(resolvedTargetId || 'orchestrator')?.teamId || 'default',
         ...(result.toolCalls && result.toolCalls.length ? { toolCalls: result.toolCalls } : {}),
         ...(result.thinking ? { thinking: result.thinking } : {})
       };
@@ -4791,7 +4812,8 @@ app.post('/api/chat', async (req, res) => {
       timestamp: Date.now(),
       agentName: targetAgent ? targetAgent.name : 'Orchestrator',
       agentRole: targetAgent ? targetAgent.role : 'orchestrator',
-      msgType: 'error'
+      msgType: 'error',
+      teamId: targetAgent?.teamId || agents.get(fromId)?.teamId || 'default'
     };
     chatHistory.push(errorMsg);
     storage.saveMessage(errorMsg);
@@ -5560,7 +5582,7 @@ async function autoResumeWorkingAgents() {
             contextLength: orchAgent.contextLength
           });
           broadcast('agent:updated', { agent: orchAgent });
-          await handleOrchestratorResponse(result.content, (result as any).thinking || '');
+await handleOrchestratorResponse(result.content, (result as any).thinking || '');
         }).catch((err) => {
           console.error(`[AutoContinue] Failed to resume Orchestrator: ${err.message}`);
           orchAgent.status = 'idle';
