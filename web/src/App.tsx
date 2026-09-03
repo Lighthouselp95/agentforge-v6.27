@@ -358,6 +358,7 @@ export function App() {
        console.log('received chat:message content:', m.content);
       const fkey = String(m.from || '');
       let staleThinking: string | undefined;
+      let staleParts: any[] | undefined;
       // Snapshot opencode (msgType==='opencode') content cố ý rỗng — merge thinking/tool.
       // Final reply rỗng (msgType≠opencode, VD lệnh điều phối bị strip) → không merge, gỡ stream + thay tin rỗng.
       const isOpenEmptySnapshot = !m.content || !String(m.content).trim();
@@ -391,13 +392,32 @@ export function App() {
             }));
           }
         } else {
-          // Tin cuối (canonical final) có content đầy đủ -> gỡ bản stream tạm để không trùng nội dung
+          // Stream-First Finalization: Tin cuối (canonical final) có content đầy đủ
+          // TUYỆT ĐỐI KHÔNG xóa bản stream (không dùng prev.filter(x => x.id !== staleId))
+          // mà cập nhật trực tiếp tại chỗ bản stream đang chứa parts xen kẽ (thinking, tool, text)
           delete streamRef.current[fkey];
-          setAllMessages(prev => {
-            const staleMsg = prev.find(x => x.id === staleId);
-            if (staleMsg) staleThinking = staleMsg.thinking;
-            return prev.filter(x => x.id !== staleId);
-          });
+          mergedIntoStream = true;
+          setAllMessages(prev => prev.map(x => {
+            if (x.id !== staleId) return x;
+            return {
+              ...x,
+              id: m.id,
+              from: m.from || x.from,
+              to: m.to || x.to,
+              content: (m.content && m.content.trim()) ? m.content : x.content,
+              timestamp: m.timestamp || x.timestamp || Date.now(),
+              agentName: m.agentName || x.agentName,
+              agentRole: m.agentRole || x.agentRole,
+              msgType: m.msgType || x.msgType,
+              isStreaming: false,
+              toolCalls: (m.toolCalls && m.toolCalls.length) ? m.toolCalls : x.toolCalls,
+              thinking: m.thinking || x.thinking,
+              parts: (m.parts && m.parts.length) ? m.parts : x.parts,
+              teamId: m.teamId || x.teamId,
+              task: (m as any).task || (x as any).task,
+              showOnUI: (m as any).showOnUI !== undefined ? (m as any).showOnUI : (x as any).showOnUI
+            };
+          }));
         }
       }
       if (!mergedIntoStream) {
@@ -405,7 +425,7 @@ export function App() {
           if (prev.some(p => p.id === m.id)) return prev;
 
           if (m.from === 'user') {
-            const tempIdx = prev.findIndex(p => p.id.startsWith('temp-') && p.content === m.content && p.to === m.to);
+            const tempIdx = prev.findIndex(p => p.id.startsWith('temp-') && (p.content.trim() === (m.content || '').trim() || p.id === m.id));
             if (tempIdx !== -1) {
               const next = [...prev];
               next[tempIdx] = {
@@ -419,7 +439,7 @@ export function App() {
                 msgType: m.msgType,
                 toolCalls: m.toolCalls,
                 thinking: m.thinking || staleThinking,
-                parts: m.parts,
+                parts: m.parts || staleParts,
                 teamId: m.teamId,
                 task: (m as any).task,
                 showOnUI: (m as any).showOnUI
@@ -438,7 +458,7 @@ export function App() {
             msgType: m.msgType,
             toolCalls: m.toolCalls,
             thinking: m.thinking || staleThinking,
-            parts: m.parts,
+            parts: m.parts || staleParts,
             teamId: m.teamId,
             task: (m as any).task,
             showOnUI: (m as any).showOnUI
@@ -737,13 +757,19 @@ export function App() {
 
   // Send message
   const sendMessage = async (text: string) => {
+    const trimmedText = text.trim();
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const targetId = selectedAgentId || 'orchestrator';
+
+    // Reset stream cũ để không bao giờ bị merge lộn ngược vào turn trước
+    delete streamRef.current[targetId];
+    delete streamRef.current['orchestrator'];
+
     const userMsg: ChatMsg = {
       id: tempId,
       from: 'user',
       to: targetId,
-      content: text,
+      content: trimmedText,
       timestamp: Date.now()
     };
     

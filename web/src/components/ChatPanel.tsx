@@ -2241,14 +2241,15 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   const isIncomingToOrch = (isOrchView && !isOrchestrator && !isUser) || (msg.to === 'orchestrator' && !isOrchestrator && !isUser);
   const effectiveShowToolBlocks = showToolBlocks && !isIncomingToOrch;
 
-  // Căn lề hai chiều:
+  // Căn lề hai chiều cân bằng Chỉ Đạo (Phải) ⇄ Báo Cáo (Trái):
+  // Main view: User + Orchestrator + Card Giao Việc căn PHẢI; Worker + Báo Cáo + ToolCalls căn TRÁI
+  // Agent view: Tin gửi đến căn PHẢI; Tin do agent tự sinh căn TRÁI
   let isAlignRight = false;
   if (isOrchView) {
-    // Main & Sub-Orchestrator view: User và Orchestrator (outgoing) căn PHẢI; Worker báo cáo (incoming) căn TRÁI
-    isAlignRight = isUser || (msg.from === 'orchestrator' || isOrchestrator || (selectedAgentId && msg.from === selectedAgentId));
+    const isOrchDirective = isOrchestratorTask || isSpawnMsg || isDirectDirective;
+    const isFromOrchestrator = msg.from === 'orchestrator' || isOrchestrator || (selectedAgentId && msg.from === selectedAgentId);
+    isAlignRight = isUser || isFromOrchestrator || isOrchDirective;
   } else {
-    // Agent view: Tin do chính agent này sinh ra căn TRÁI.
-    // TẤT CẢ tin nhắn người khác (User, Orchestrator, tin spawn, tin giao việc, agent khác) căn PHẢI.
     const isGeneratedByThisAgent = !!selectedAgentId && (
       msg.from === selectedAgentId ||
       (srcAgent && srcAgent.id === selectedAgentId) ||
@@ -2518,23 +2519,26 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         scrollbarWidth: 'none'
       }}>
         {/* Sender Capsule Pill */}
-        <span style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 6,
-          padding: '3px 10px',
-          borderRadius: 9999,
-          fontSize: 11,
-          fontWeight: 700,
-          whiteSpace: 'nowrap',
-          background: '#0f172a',
-          border: isUser
-            ? '1px solid rgba(96, 165, 250, 0.6)'
-            : isOrchestrator
-            ? '1px solid rgba(129, 140, 248, 0.6)'
-            : '1px solid rgba(52, 211, 153, 0.6)',
-          color: isUser ? '#93c5fd' : isOrchestrator ? '#c7d2fe' : '#6ee7b7'
-        }}>
+        <span
+          className={`af-sender-pill ${isUser ? 'af-sender-user' : isOrchestrator ? 'af-sender-orch' : 'af-sender-worker'}`}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '3px 10px',
+            borderRadius: 9999,
+            fontSize: 11,
+            fontWeight: 700,
+            whiteSpace: 'nowrap',
+            background: '#0f172a',
+            border: isUser
+              ? '1px solid rgba(96, 165, 250, 0.6)'
+              : isOrchestrator
+              ? '1px solid rgba(129, 140, 248, 0.6)'
+              : '1px solid rgba(52, 211, 153, 0.6)',
+            color: isUser ? '#93c5fd' : isOrchestrator ? '#c7d2fe' : '#6ee7b7'
+          }}
+        >
           {isOrchestrator && <span>👑</span>}
           {isUser && <span>👤</span>}
           {!isOrchestrator && !isUser && <span>🤖</span>}
@@ -2547,20 +2551,23 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         {/* Direction Arrow & Receiver Capsule Pill */}
         {displayTo && (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <span style={{ color: '#818cf8', fontWeight: 800, fontSize: 13, lineHeight: 1 }}>➜</span>
-            <span style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 5,
-              padding: '3px 10px',
-              borderRadius: 9999,
-              fontSize: 11,
-              fontWeight: 700,
-              whiteSpace: 'nowrap',
-              background: '#0f172a',
-              border: '1px solid #334155',
-              color: '#f8fafc'
-            }}>
+            <span className="af-receiver-arrow" style={{ color: '#818cf8', fontWeight: 800, fontSize: 13, lineHeight: 1 }}>➜</span>
+            <span
+              className="af-receiver-pill"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                padding: '3px 10px',
+                borderRadius: 9999,
+                fontSize: 11,
+                fontWeight: 700,
+                whiteSpace: 'nowrap',
+                background: '#0f172a',
+                border: '1px solid #334155',
+                color: '#f8fafc'
+              }}
+            >
               {String(displayTo || '').toLowerCase() === 'you' || String(displayTo || '').toLowerCase() === 'user' ? <span>👤</span> : <span>🤖</span>}
               <span>{displayTo}</span>
             </span>
@@ -2623,7 +2630,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           display: 'flex',
           flexDirection: 'column',
           width: '100%',
-          maxWidth: isMobile ? '98%' : '100%',
+          maxWidth: '100%',
           alignSelf: isUser ? 'flex-end' : 'flex-start',
           marginBottom: 4,
           userSelect: 'text'
@@ -2637,9 +2644,10 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         <div style={{
           display: 'flex',
           flexDirection: 'column',
-          width: '100%',
-          maxWidth: isMobile ? '98%' : '100%',
-          alignSelf: isUser ? 'flex-end' : 'flex-start',
+          width: 'fit-content',
+          minWidth: isMobile ? '100%' : (isAlignRight ? 'auto' : '480px'),
+          maxWidth: isMobile ? '98%' : '85%',
+          alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
           marginBottom: 4,
           userSelect: 'text'
         }}>
@@ -2666,9 +2674,10 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         <div style={{
           display: 'flex',
           flexDirection: 'column',
-          width: '100%',
-          maxWidth: isMobile ? '98%' : '100%',
-          alignSelf: isUser ? 'flex-end' : 'flex-start',
+          width: 'fit-content',
+          minWidth: isMobile ? '100%' : (isAlignRight ? 'auto' : '480px'),
+          maxWidth: isMobile ? '98%' : '85%',
+          alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
           gap: 4,
           userSelect: 'text'
         }}>
@@ -2682,7 +2691,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 output: part.output === undefined || part.output === null ? undefined : String(part.output)
               };
               return (
-                <div key={'pt-' + i} style={{ width: '100%', maxWidth: isMobile ? '98%' : '100%' }}>
+                <div key={'pt-' + i} style={{ width: '100%', maxWidth: '100%' }}>
                   <ToolBlockSafe>
                     <ToolCallBlock tool={safeTool.tool} input={safeTool.input} output={safeTool.output} isMobile={isMobile} />
                   </ToolBlockSafe>
@@ -2694,7 +2703,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
               const thinkContent = String(part.content || '').trim();
               if (!thinkContent) return null;
               return (
-                <div key={'pt-' + i} style={{ width: '100%', maxWidth: isMobile ? '98%' : '100%' }}>
+                <div key={'pt-' + i} style={{ width: '100%', maxWidth: '100%' }}>
                   <ThinkingBlock thinking={thinkContent} />
                 </div>
               );
@@ -2729,9 +2738,9 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 background: bubbleBg,
                 color: textColor,
                 padding: '10px 14px',
-                borderRadius: 12,
+                borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
                 width: 'fit-content',
-                maxWidth: '100%',
+                maxWidth: isMobile ? '96%' : '82%',
                 minWidth: 0,
                 overflowWrap: 'anywhere',
                 boxSizing: 'border-box',
@@ -2788,9 +2797,9 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           background: bubbleBg,
           color: textColor,
           padding: '10px 14px',
-          borderRadius: 12,
+          borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
           width: 'fit-content',
-          maxWidth: isMobile ? '98%' : '100%',
+          maxWidth: isMobile ? '96%' : '82%',
           minWidth: 0,
           overflowWrap: 'anywhere',
           boxSizing: 'border-box',
@@ -2806,7 +2815,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         }}>
           {isOrchestratorTask ? (
             isSpawnMsg ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 320 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
                 {/* Header Card SPAWN AGENT */}
                 <div style={{
                   display: 'flex',
@@ -2842,11 +2851,14 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                         {spawnRole}
                       </span>
                     )}
-                    <span style={{
-                      fontSize: 11.5,
-                      fontWeight: 700,
-                      color: '#e9d5ff'
-                    }}>
+                    <span
+                      className="af-spawn-target-name"
+                      style={{
+                        fontSize: 11.5,
+                        fontWeight: 700,
+                        color: '#e9d5ff'
+                      }}
+                    >
                       {spawnAgentName || displayTo || 'New Agent'}
                     </span>
                   </div>
@@ -2867,7 +2879,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 </div>
               </div>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 300 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
                 {/* Header Card GIAO VIỆC */}
                 <div style={{
                   display: 'flex',
@@ -2890,23 +2902,29 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     </span>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 700 }}>
-                    <span style={{
-                      padding: '2px 8px',
-                      borderRadius: 6,
-                      background: '#0f172a',
-                      border: '1px solid rgba(129, 140, 248, 0.5)',
-                      color: '#c7d2fe'
-                    }}>
+                    <span
+                      className="af-directive-header-orch"
+                      style={{
+                        padding: '2px 8px',
+                        borderRadius: 6,
+                        background: '#0f172a',
+                        border: '1px solid rgba(129, 140, 248, 0.5)',
+                        color: '#c7d2fe'
+                      }}
+                    >
                       👑 {srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
                     </span>
                     <span style={{ color: '#818cf8', fontSize: 12 }}>➔</span>
-                    <span style={{
-                      padding: '2px 8px',
-                      borderRadius: 6,
-                      background: '#0f172a',
-                      border: '1px solid rgba(148, 163, 184, 0.4)',
-                      color: '#f8fafc'
-                    }}>
+                    <span
+                      className="af-directive-header-target"
+                      style={{
+                        padding: '2px 8px',
+                        borderRadius: 6,
+                        background: '#0f172a',
+                        border: '1px solid rgba(148, 163, 184, 0.4)',
+                        color: '#f8fafc'
+                      }}
+                    >
                       🤖 {displayTo || 'Agent'}
                     </span>
                   </div>

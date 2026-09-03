@@ -4,12 +4,25 @@
 
 ### Bản Phát Hành Đóng Gói Nhị Phân Binary Standalone Release v7.0.6
 - **Cập nhật Version v7.0.6**: Đồng bộ toàn bộ phiên bản trong `package.json`, `web/package.json` và hằng số `APP_VERSION` trong `src/server.ts` lên `7.0.6`.
-- **Tích hợp đầy đủ các bản vá v7.0.4**:
-  - Khắc phục triệt để lỗi nuốt text trong `getCodeSpanRanges` khi gặp thẻ report không đóng, đảm bảo các lệnh `<talk>` và `<spawn>` luôn được bóc tách và tạo card riêng.
-  - Làm sạch tag điều phối ở mọi tầng trên Frontend UI (`ChatPanel.tsx` Khối 2.5 và regex toàn cục).
-  - Tương thích Sub-Orchestrator toàn diện và mở khóa `ReportCard` trực quan cho luồng OpenCode.
+- **Hàng Rào Task Barrier Backend (`task` <= 25 từ)**:
+  - Tích hợp đồng bộ trên `src/server.ts`, `src/parser/command-parser.ts`, `src/core/command-parser.ts`.
+  - Tự động chặn và từ chối các lệnh `<talk>` / `<spawn>` có thuộc tính `task="..."` dài hơn 25 từ, gửi phản hồi `TASK_BARRIER_VIOLATION` (`[BARRIER REJECT]`) về cho Orchestrator, ép buộc đưa mô tả chi tiết vào thẻ body.
+- **Frontend Stream-First Finalization & Thứ Tự Bubble (`web/src/App.tsx`)**:
+  - Triển khai cập nhật in-place trực tiếp tại chỗ cho bản stream khi nhận canonical final message, loại bỏ hoàn toàn cơ chế xoá bằng `filter` giúp triệt tiêu hiện tượng giật màn hình (flicker).
+  - Bảo toàn 100% mảng `parts` xen kẽ (`thinking`, `tool`, `text`) theo đúng thứ tự emit thực tế từ OpenCode.
+  - Sửa dứt điểm lỗi bubble User bị tụt xuống dưới ToolCall bằng cách reset stream ref, chuẩn hoá văn bản và so khớp chính xác `tempIdx` ở đỉnh lượt chat.
+- **Mô Hình Đối Thoại Hai Chiều & Tối Ưu Độ Rộng ToolCall (`web/src/components/ChatPanel.tsx`)**:
+  - Main Orchestrator View: Luồng Chỉ Đạo (User, Orchestrator directives, Orchestrator replies) căn Phải; Luồng Báo Cáo (Worker chat, `ReportCard`, ToolCalls tra cứu) căn Trái. Ẩn toàn bộ toolcalls nội bộ của worker trên màn hình Main.
+  - Agent View: Luồng incoming directives căn Phải; Tiến trình thực thi của worker (thinking, toolcalls, terminal, code diff) căn Trái.
+  - Kích thước ToolCall: Căn trái, `minWidth: 480px`, `maxWidth: 85%`, chừa 15% khoảng trống với lề phải.
+- **Tối Ưu Độ Tương Phản Tên Agent Trên Nền Sáng (Light Theme Contrast)**:
+  - Bổ sung CSS tokens và class chuyên biệt (`.af-sender-pill`, `.af-receiver-pill`, `.af-tab-name`, `.af-card-agent-name`, `.af-directive-header-orch`, `.af-directive-header-target`, `.af-spawn-target-name`).
+  - Đổi màu tên tất cả Agent sang font màu tối sẫm (`#0f172a`, `#1e293b`, `#1e3a8a`), độ đậm `font-weight: 700`, triệt tiêu hoàn toàn tình trạng chữ trắng hoặc màu pastel nhạt trên nền sáng trong ChatPanel, Dashboard và TabBar.
+- **Dọn Dẹp & Đồng Bộ Repo Public (`C:\Users\Hai Dang\agentforge\`)**:
+  - Loại bỏ toàn bộ file markdown ngoài luồng, file log, database và file test tạm, chỉ giữ lại mã nguồn sạch và thư mục `release/` chứa standalone binary `agentforge-web.exe`.
+  - Đã commit và push đồng bộ lên cả hai remote repository Private (`9b69585`) và Public (`d9dc839`).
 - **Packaging Binary SEA v7.0.6**:
-  - Đóng gói và phát hành thành công binary standalone `release/agentforge-web-v7.0.6.exe` và `release/agentforge-web.exe`.
+  - Đóng gói và phát hành thành công binary standalone `release/agentforge-web-v7.0.6.exe` và `release/agentforge-web.exe` (105,998,848 bytes).
 
 ---
 

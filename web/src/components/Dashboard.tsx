@@ -470,7 +470,7 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: 6 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
                       <span style={{ fontSize: 16, flexShrink: 0 }}>{isCollapsed ? '📁' : '📂'}</span>
-                      <span style={{ fontWeight: 700, fontSize: 13.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span className="af-card-agent-name" style={{ fontWeight: 700, fontSize: 13.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         👑 {orch.name || 'Orchestrator'}
                       </span>
                       <span style={{
@@ -741,7 +741,7 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                                   alignItems: 'center',
                                   gap: 6
                                 }}>
-                                  <span>{agent.name}</span>
+                                  <span className="af-card-agent-name" style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{agent.name}</span>
                                   <span
                                     style={{
                                       fontSize: 11,
@@ -1028,7 +1028,7 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: 6 }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
                               <span style={{ fontSize: 16, flexShrink: 0 }}>{roleIcon}</span>
-                              <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              <span className="af-card-agent-name" style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                 {agent.name || agent.role}
                               </span>
                             </div>
