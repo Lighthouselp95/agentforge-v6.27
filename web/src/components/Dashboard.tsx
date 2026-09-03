@@ -92,7 +92,16 @@ const renderStatusBadge = (status: string) => {
 };
 
 export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId, onUpdateModel, onDeleteAgent }: Props) {
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('af-models-cache');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed?.models)) return parsed.models;
+      }
+    } catch {}
+    return [];
+  });
   const [modelLoading, setModelLoading] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [creatingOrch, setCreatingOrch] = useState(false);
@@ -160,11 +169,53 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
 
   useEffect(() => {
     const loadModels = async () => {
-      setModelLoading(true);
+      let isFresh = false;
+      try {
+        const raw = localStorage.getItem('af-models-cache');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed?.models) && parsed.models.length > 0) {
+            setModels(parsed.models);
+            if (typeof parsed.timestamp === 'number' && Date.now() - parsed.timestamp < 5 * 60 * 1000) {
+              isFresh = true;
+            }
+          }
+        }
+      } catch {}
+
+      // Nếu cache còn hạn < 5 phút thì không cần fetch lại, không hiện loading
+      if (isFresh) return;
+
+      // Chỉ hiện modelLoading nếu chưa có model nào trong state/cache
+      if (models.length === 0) {
+        setModelLoading(true);
+      }
       try {
         const res = await fetch('/api/models');
-        const data = await res.json();
-        if (Array.isArray(data.models)) setModels(data.models);
+        if (res.ok) {
+          const data = await res.json();
+          const modelList: string[] = [];
+          if (Array.isArray(data.models)) {
+            modelList.push(...data.models);
+          } else if (Array.isArray(data.providers)) {
+            for (const p of data.providers) {
+              if (p?.models && typeof p.models === 'object') {
+                for (const mId of Object.keys(p.models)) {
+                  modelList.push(`${p.id}/${mId}`);
+                }
+              }
+            }
+          }
+          if (modelList.length > 0) {
+            setModels(modelList);
+            try {
+              localStorage.setItem('af-models-cache', JSON.stringify({
+                models: modelList,
+                timestamp: Date.now()
+              }));
+            } catch {}
+          }
+        }
       } catch (e) {
         console.error('Failed to load models:', e);
       } finally {

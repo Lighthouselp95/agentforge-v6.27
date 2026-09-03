@@ -6,7 +6,7 @@ import { ModelSettingsDialog } from './components/ModelSettingsDialog';
 import { TabBar } from './components/TabBar';
 import { parseAgentTaskList, renderAgentTaskList, ParsedAgentTask } from './utils/taskUtils';
 
-const API = window.location.port === '5173' ? '' : (window.location.origin.startsWith('http') ? window.location.origin : 'http://localhost:3001');
+const API = window.location.port === '5173' ? '' : (window.location.origin.startsWith('http') ? window.location.origin : 'http://localhost:4001');
 
 interface ChatMsg {
   id: string;
@@ -544,7 +544,7 @@ export function App() {
     const connectWS = () => {
       if (isCleanedUp) return;
       try {
-        const wsHost = window.location.port === '5173' ? 'localhost:3001' : window.location.host;
+        const wsHost = window.location.port === '5173' ? 'localhost:4001' : window.location.host;
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${wsProtocol}//${wsHost}`;
         ws = new WebSocket(wsUrl);
