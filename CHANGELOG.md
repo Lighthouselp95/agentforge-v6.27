@@ -1,5 +1,20 @@
 # Changelog
 
+## v7.0.8 (2026-09-04)
+
+### Bản Vá Khẩn Cấp UI Runtime Crash & Phát Hành Binary v7.0.8
+- **Khắc phục lỗi runtime `ReferenceError: isDirectDirective is not defined`**:
+  - Khai báo rõ ràng biến `isDirectDirective` trong phạm vi component `MessageItem` (`web/src/components/ChatPanel.tsx`):
+    `const isDirectDirective = Boolean((msg as any).isDirective || msg.msgType === 'talk' || hasDirectiveInContent);`
+  - Triệt tiêu hoàn toàn lỗi crash trình duyệt `UI Error Encountered` khi render bong bóng chat chỉ thị và giao việc.
+- **Biên dịch & Kiểm chứng**:
+  - `npx tsc --noEmit` đạt 0 lỗi.
+  - Build production bundle `dist/assets/index-wYarbW5C.js` (308.70 kB).
+- **Đóng gói Binary SEA v7.0.8**:
+  - Phát hành bản nhị phân standalone `release/agentforge-web-v7.0.8.exe` và `release/agentforge-web.exe`.
+
+---
+
 ## v7.0.6 (2026-09-04)
 
 ### Bản Phát Hành Đóng Gói Nhị Phân Binary Standalone Release v7.0.6

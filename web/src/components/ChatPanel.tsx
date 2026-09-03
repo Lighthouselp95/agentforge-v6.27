@@ -2246,6 +2246,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   // Agent view: Tin gửi đến căn PHẢI; Tin do agent tự sinh căn TRÁI
   let isAlignRight = false;
   if (isOrchView) {
+    const isDirectDirective = Boolean((msg as any).isDirective || msg.msgType === 'talk' || hasDirectiveInContent);
     const isOrchDirective = isOrchestratorTask || isSpawnMsg || isDirectDirective;
     const isFromOrchestrator = msg.from === 'orchestrator' || isOrchestrator || (selectedAgentId && msg.from === selectedAgentId);
     isAlignRight = isUser || isFromOrchestrator || isOrchDirective;

@@ -64,7 +64,7 @@ console.warn = (...args: any[]) => {
 };
 
 const __dirname = dirname(fileURLToPath(new URL('.', import.meta.url)));
-const APP_VERSION = '7.0.6';
+const APP_VERSION = '7.0.8';
 const PORT = parseInt(process.env.PORT || '4001');
 
 // SEA early: phai khai bao TRUOC loadPrompt de exe copy 1 file van doc duoc src/prompts nhung trong blob
