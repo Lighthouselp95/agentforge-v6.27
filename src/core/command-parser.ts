@@ -302,6 +302,11 @@ export function extractXmlCommand(text: string, startIndex: number, targetTag: s
       syntax: 'xml'
     };
   } else {
+    // Unclosed XML tag fallback - extends to next valid command tag or EOF
+    // Thẻ <spawn> bắt buộc self-closing hoặc có thẻ đóng </spawn>, không fallback nuốt text
+    if (tagLower === 'spawn') {
+      return null;
+    }
     const nextTagIdx = afterOpen.search(/(?:<\s*(?:talk|spawn|stop|resume|create_role|create-role|stop_agent|resume_agent|delete_agent)\b|\[(?:TALK|SPAWN|STOP|RESUME|CREATE ROLE|STOP AGENT|RESUME AGENT|DELETE AGENT)\b)/i);
     const bodyLength = nextTagIdx !== -1 ? nextTagIdx : afterOpen.length;
     const body = afterOpen.substring(0, bodyLength);
@@ -318,10 +323,10 @@ export function extractXmlCommand(text: string, startIndex: number, targetTag: s
   }
 }
 
-export function extractDualCommands(text: string, targetTags: string[] = ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT']): BracketCommand[] {
+export function extractDualCommands(text: string, targetTags: string[] = ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT', 'DELETE_TASK', 'DELETE TASK', 'TASK_UPDATE', 'TASK UPDATE'], ignoreMarkdownDoc: boolean = false): BracketCommand[] {
   const commands: BracketCommand[] = [];
   if (!text) return commands;
-  const codeRanges = getCodeSpanRanges(text);
+  const codeRanges = ignoreMarkdownDoc ? getCodeFenceRanges(text) : getCodeSpanRanges(text);
 
   let pos = 0;
   while (pos < text.length) {
@@ -400,7 +405,7 @@ export function extractBracketCommands(text: string, targetTags: string[] = ['TA
 
 export function stripCommandTags(text: string): string {
   if (!text) return '';
-  const commands = extractDualCommands(text, ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT', 'TASK_UPDATE', 'TASK UPDATE']);
+  const commands = extractDualCommands(text, ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT', 'TASK_UPDATE', 'TASK UPDATE'], true);
   if (commands.length === 0) return text.trim();
   let result = '';
   let lastIndex = 0;
@@ -737,7 +742,8 @@ export function parseAgentOutput(
   const merged: typeof deduped = [];
   for (const matchItem of deduped) {
     const last = merged[merged.length - 1];
-    if (last && last.to === 'orchestrator' && matchItem.to === 'orchestrator') {
+    const isUnclosedOrContinuation = last && (last as any).unclosed === true;
+    if (isUnclosedOrContinuation && last.to === 'orchestrator' && matchItem.to === 'orchestrator') {
       last.message = `${last.message}\n\n${matchItem.message}`;
       if (matchItem.task) last.task = last.task || matchItem.task;
     } else {

@@ -132,6 +132,16 @@ export class QueueStorage {
     return (this.engine.inMemoryUnprocessedUserMessages[key] || []).slice();
   }
 
+  getAllUnprocessedMessages(): Record<string, string[]> {
+    const result: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(this.engine.inMemoryUnprocessedUserMessages || {})) {
+      if (Array.isArray(v) && v.length > 0) {
+        result[k] = v.slice();
+      }
+    }
+    return result;
+  }
+
   clearUnprocessedMessages(targetId: string): void {
     const key = targetId || 'orchestrator';
     if (this.engine.inMemoryUnprocessedUserMessages[key]) {

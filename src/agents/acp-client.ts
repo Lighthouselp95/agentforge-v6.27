@@ -572,7 +572,7 @@ export class ACPClient {
       }
     }
 
-    const reminder = `\n\n=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> or [TO: <target-id>] <message> for communications.\nFinish with <talk target="orchestrator">Task complete. === TASK REPORT === ...</talk> (or [TO: orchestrator] Task complete. === TASK REPORT ===)`;
+    const reminder = `\n\n=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> or [TO: <target-id>] <message> for communications.`;
     const combinedBody = messages.join('\n\n---\n\n');
     return `${contextPrefix ? contextPrefix + '\n\n' : ''}${header}\n${combinedBody}${reminder}`;
   }

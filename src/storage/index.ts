@@ -66,10 +66,6 @@ export class AppStorage {
     this.messages.saveMessage(msg);
   }
 
-  saveOpenCodeSnapshot(msg: any): void {
-    this.messages.saveOpenCodeSnapshot(msg);
-  }
-
   getHistory(limit?: number, teamId?: string): any[] {
     return this.messages.getHistory(limit, teamId);
   }
@@ -159,6 +155,10 @@ export class AppStorage {
     return this.queues.getUnprocessedMessages(targetId);
   }
 
+  getAllUnprocessedMessages(): Record<string, string[]> {
+    return this.queues.getAllUnprocessedMessages();
+  }
+
   clearUnprocessedMessages(targetId: string): void {
     this.queues.clearUnprocessedMessages(targetId);
   }
@@ -215,7 +215,39 @@ export class AppStorage {
   }
 }
 
-export const storage = new AppStorage();
+// Lazy initialization via Proxy: storage singleton is created only on FIRST actual property access,
+// NOT during module evaluation. This avoids TDZ when storage is accessed during bootstrap
+// (e.g., console.log override calls pushLogLine which accesses storage.saveLog).
+let _storageInstance: AppStorage | null = null;
+export function getStorageInstance(): AppStorage {
+    if (_storageInstance === null) {
+        _storageInstance = new AppStorage();
+    }
+    return _storageInstance;
+}
+export const storage = new Proxy({} as AppStorage, {
+    get(_target, prop) {
+        const inst = getStorageInstance();
+        return (inst as any)[prop];
+    },
+    set(_target, prop, value) {
+        const inst = getStorageInstance();
+        (inst as any)[prop] = value;
+        return true;
+    },
+    has(_target, prop) {
+        const inst = getStorageInstance();
+        return prop in inst;
+    },
+    ownKeys() {
+        const inst = getStorageInstance();
+        return Reflect.ownKeys(inst);
+    },
+    getOwnPropertyDescriptor(_target, prop) {
+        const inst = getStorageInstance();
+        return Reflect.getOwnPropertyDescriptor(inst, prop);
+    },
+});
 // Re-exports of granular stores and utilities
 export * from './types.js';
 export * from './constants.js';
@@ -239,14 +271,3 @@ export * from './settings-storage.js';
 export * from './log-storage.js';
 
 export default storage;
-
-
-export * from './types.js';
-export * from './constants.js';
-export * from './file-utils.js';
-export * from './engine.js';
-export * from './agent-storage.js';
-export * from './message-storage.js';
-export * from './queue-storage.js';
-export * from './settings-storage.js';
-export * from './log-storage.js';

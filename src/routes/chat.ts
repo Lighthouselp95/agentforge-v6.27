@@ -34,21 +34,27 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
   });
 
   // GET /api/messages
-  router.get('/messages', (_req, res) => {
+  router.get('/messages', (req, res) => {
+    const qTeamId = req.query.teamId as string | undefined;
+    if (qTeamId) {
+      const filtered = deps.chatHistory.filter(m => (m.teamId || 'default') === qTeamId);
+      return res.json(filtered);
+    }
     res.json(deps.chatHistory);
   });
 
   // POST /api/chat
   router.post('/chat', async (req, res) => {
     const { targetAgentId, message, teamId } = req.body || {};
-    if (!message || String(message).trim().length === 0) {
+    const normalizedMsg = (message || '').toString().trim().normalize('NFC');
+    if (!normalizedMsg) {
       return res.status(400).json({ ok: false, error: 'Message cannot be empty' });
     }
 
     try {
       const result = await deps.dispatchUserChat({
         targetAgentId: targetAgentId || 'orchestrator',
-        rawMsg: String(message),
+        rawMsg: normalizedMsg,
         teamId
       });
       res.json({ ok: true, result });

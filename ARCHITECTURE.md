@@ -301,6 +301,7 @@ agentforge/
 │   └── vite.config.ts                 # Cấu hình Vite build
 ├── docs/                              # Tài liệu kỹ thuật chi tiết
 │   ├── ARCHITECTURE.md                # Bản sao tài liệu kiến trúc dự án
+│   ├── API_ENDPOINTS.md               # Tài liệu chi tiết toàn bộ REST endpoints & lifecycle
 │   └── USER_GUIDE.md                  # Hướng dẫn sử dụng cho người dùng
 ├── data/                              # Dữ liệu hoạt động hệ thống (lưu trên đĩa)
 │   ├── agentforge-state.json          # Trạng thái tổng thể agent, outbox, settings
@@ -337,4 +338,19 @@ agentforge/
 
 ---
 
-*Tài liệu kiến trúc hệ thống AgentForge phiên bản 7.0.0 — Cập nhật ngày 03/09/2026.*
+## 7. Hệ Thống API & Điều Khiển Vòng Đời (REST Endpoints & Lifecycle)
+
+Xem tài liệu đặc tả chi tiết tại [`docs/API_ENDPOINTS.md`](docs/API_ENDPOINTS.md).
+
+- **Khởi Động Lại Hệ Thống (`POST /api/restart` & Slash Command `/restart`)**:
+  - Cho phép khởi động lại server tự động và tách rời (`detached child process`) gọi `start.bat` (Windows) hoặc `npm start` (Linux/macOS), giải phóng socket và khởi chạy lại ứng dụng an toàn.
+- **Hội Thoại & Điều Phối (`POST /api/chat`, `GET /api/history`)**:
+  - Tiếp nhận chỉ thị từ User, chuẩn hóa chuỗi Unicode NFC, hỗ trợ lệnh `/compact` thu gọn context agent.
+- **Quản Lý Vòng Đời Agent (`/api/agents`)**:
+  - Toàn diện các thao tác: Liệt kê, tạo mới, Start, Stop, Resume, Abort, Delete, Clear Chat, và cập nhật Model AI.
+- **Giám Sát Hệ Thống (`/logs`, `/terminal`, `/api/events`)**:
+  - Cung cấp ring buffer 2000 dòng log, giao diện HTML Terminal realtime, và luồng SSE phát sự kiện trực tiếp tới Web UI.
+
+---
+
+*Tài liệu kiến trúc hệ thống AgentForge phiên bản 7.0.8 — Cập nhật ngày 04/09/2026.*

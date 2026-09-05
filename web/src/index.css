@@ -406,6 +406,8 @@ html[data-theme='dark'] .af-bubble-user,
   color: #e8edf3 !important;
   width: fit-content !important;
   max-width: 85% !important;
+  margin-left: auto !important;
+  align-self: flex-end !important;
 }
 
 /* Light Theme: Bo góc 12px, viền mờ #e2e8f0, nền trắng #ffffff sạch sẽ, đổ bóng nhẹ */
@@ -429,6 +431,8 @@ html[data-theme='light'] .af-bubble-user {
   color: #1e3a8a !important;
   width: fit-content !important;
   max-width: 85% !important;
+  margin-left: auto !important;
+  align-self: flex-end !important;
 }
 
 /* ===== 3-LAYER SURFACE ELEVATION ===== */

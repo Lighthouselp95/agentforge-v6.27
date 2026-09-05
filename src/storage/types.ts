@@ -3,6 +3,7 @@ export interface OutboxReport {
   fromAgentId: string;
   fromAgentName: string;
   fromAgentRole: string;
+  teamId?: string; // teamId của agent gửi — dùng khi replay để không giao nhầm team
   to: string; // 'orchestrator' hoặc agent id
   message: string;
   createdAt: number;
