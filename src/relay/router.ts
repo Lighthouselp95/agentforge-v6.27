@@ -99,7 +99,7 @@ export class MessageRouter {
       if (!this.dedup.isBroadcastDuplicate(reply)) {
         this.options.chatHistory.push(reply);
         this.options.saveMessage(reply);
-        this.options.broadcast('chat:message', { msg: reply, teamId: reply.teamId || (fromAgent?.teamId) || 'default' });
+        this.options.broadcast('chat:message', { msg: reply }, reply.teamId || (fromAgent?.teamId) || 'default');
       } else {
         console.log(`[Route] Skip duplicate broadcast bubble from ${fromAgent.name} -> ${resolvedTo} (dedup window, content-based)`);
       }
@@ -128,7 +128,7 @@ export class MessageRouter {
           } else {
             targetAgent.status = 'working';
             targetAgent.workingSince = Date.now();
-            this.options.broadcast('agent:updated', { agent: targetAgent, teamId: targetAgent.teamId || (fromAgent?.teamId) || 'default' });
+            this.options.broadcast('agent:updated', { agent: targetAgent }, targetAgent.teamId || (fromAgent?.teamId) || 'default');
 
             const earlySig = `talk|${fromAgent.id.toLowerCase()}>${targetAgent.id.toLowerCase()}|${(msg.task || '').trim().toLowerCase()}|${msg.message.trim().toLowerCase()}`;
             if (this.options.dispatchedCmdSigs?.get(fromAgent.id)?.has(earlySig)) {
@@ -153,9 +153,9 @@ export class MessageRouter {
                 agentRole: 'orchestrator',
                 teamId: fromAgent.teamId || 'default'
               };
-              this.options.chatHistory.push(errChatMsg);
-              this.options.saveMessage(errChatMsg);
-               this.options.broadcast('chat:message', { msg: errChatMsg, teamId: fromAgent.teamId || 'default' });
+               this.options.chatHistory.push(errChatMsg);
+               this.options.saveMessage(errChatMsg);
+               this.options.broadcast('chat:message', { msg: errChatMsg }, fromAgent.teamId || 'default');
 
               const activeOrch = this.options.findExistingOrchestrator(fromAgent.teamId) || this.options.agents.get('orchestrator');
               const targetOrch = activeOrch?.id || 'orchestrator';

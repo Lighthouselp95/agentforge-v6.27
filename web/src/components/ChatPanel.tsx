@@ -2830,6 +2830,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                       textColor="#0f172a"
                       isAlignRight={isAlignRight}
                       isOpenCode={isOpenCode}
+                      defaultExpanded={defaultExpandToolcalls}
                     />
                   );
                 }
@@ -2847,16 +2848,17 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     title={curTaskTitle || (curBody ? (curBody.split('\n')[0].substring(0, 80) + '...') : '')}
                     targetName={curTarget}
                     senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
-                    content={fullTalkContent}
-                    isMobile={isMobile}
-                    bubbleBg="#ffffff"
-                    bubbleBorder="1px solid #e2e8f0"
-                    bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
-                    textColor="#0f172a"
-                    isAlignRight={isAlignRight}
-                    isOpenCode={isOpenCode}
-                  />
-                );
+content={fullTalkContent}
+                      isMobile={isMobile}
+                      bubbleBg="#ffffff"
+                      bubbleBorder="1px solid #e2e8f0"
+                      bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                      textColor="#0f172a"
+                      isAlignRight={isAlignRight}
+                      isOpenCode={isOpenCode}
+                      defaultExpanded={defaultExpandToolcalls}
+                    />
+                  );
               })}
             </div>
           ) : isOrchestratorTask ? (
@@ -2944,6 +2946,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     textColor="#0f172a"
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
+                    defaultExpanded={defaultExpandToolcalls}
                   />
                 ) : (
                   <UnifiedDirectiveCard
@@ -2959,6 +2962,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     textColor="#0f172a"
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
+                    defaultExpanded={defaultExpandToolcalls}
                   />
                 )
               )}

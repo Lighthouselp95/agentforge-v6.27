@@ -11,6 +11,8 @@ const __dirname = path.dirname(__filename);
 
 let mainWindow: BrowserWindow | null = null;
 let serverProcess: ChildProcess | null = null;
+let opencodeServeProcess: ChildProcess | null = null;
+let OPENCODE_SERVE_PORT = 4096;
 let SERVER_PORT = parseInt(process.env.PORT || '4001', 10);
 
 // ========== PATH HELPERS ==========
@@ -23,6 +25,70 @@ function getProjectRoot(): string {
     return path.resolve(__dirname, '..');
   }
   return path.join(process.resourcesPath, 'app');
+}
+
+// ========== OPENSECODE SERVE DYNAMIC SPAWN ==========
+function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(port));
+    });
+    srv.on('error', reject);
+  });
+}
+
+async function spawnOpenCodeServe(): Promise<number> {
+  const port = await findFreePort();
+  OPENCODE_SERVE_PORT = port;
+  process.env.OPENCODE_SERVE_PORT = String(port);
+  process.env.OPENCODE_SERVE_URL = `http://127.0.0.1:${port}`;
+
+  const projectRoot = getProjectRoot();
+  const isWin = process.platform === 'win32';
+
+  let cmd: string;
+  let args: string[];
+  if (isWin) {
+    cmd = 'cmd.exe';
+    args = ['/c', `opencode serve --hostname 0.0.0.0 --port ${port}`];
+  } else {
+    cmd = 'sh';
+    args = ['-c', `opencode serve --hostname 0.0.0.0 --port ${port}`];
+  }
+
+  console.log(`[Electron] Spawning opencode serve on port ${port}...`);
+  opencodeServeProcess = spawn(cmd, args, {
+    cwd: projectRoot,
+    env: { ...process.env, OPENCODE_SERVE_PORT: String(port) },
+    stdio: 'pipe',
+    windowsHide: true,
+    detached: !isWin
+  });
+
+  opencodeServeProcess.stdout?.on('data', (d) => console.log(`[OpenCode Serve] ${d.toString().trim()}`));
+  opencodeServeProcess.stderr?.on('data', (d) => console.error(`[OpenCode Serve] ${d.toString().trim()}`));
+
+  opencodeServeProcess.on('error', (err) => {
+    console.error('[Electron] OpenCode Serve spawn error:', err.message);
+    opencodeServeProcess = null;
+  });
+
+  opencodeServeProcess.on('exit', (code) => {
+    console.log(`[Electron] OpenCode Serve exited (code ${code})`);
+    opencodeServeProcess = null;
+  });
+
+  // Wait for opencode serve to be ready
+  const ready = await waitForServer(port, 15000);
+  if (!ready) {
+    console.warn('[Electron] OpenCode Serve not responding after 15s — continuing anyway.');
+  } else {
+    console.log(`[Electron] OpenCode Serve ready on port ${port}`);
+  }
+
+  return port;
 }
 
 // ========== PORT & SERVER CHECK ==========

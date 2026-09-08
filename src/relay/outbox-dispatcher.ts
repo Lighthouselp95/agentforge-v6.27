@@ -84,7 +84,8 @@ export class OutboxDispatcher {
           });
         }
         this.options.storage.updateAgent(targetAgent.id, { task: targetAgent.task, tasks: targetAgent.tasks });
-        this.options.broadcast('agent:updated', { agent: targetAgent });
+        const teamId = targetAgent.teamId || 'default';
+        this.options.broadcast('agent:updated', { agent: targetAgent }, teamId);
       }
 
       const teamPrompt = this.options.buildTeamPrompt(targetAgent.id);
