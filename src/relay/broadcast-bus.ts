@@ -22,6 +22,7 @@ export class BroadcastBus {
   }
 
   public broadcast(type: string, data: any): void {
+    const isLogMsg = type === 'terminal:line' || type === 'log:entry';
     let broadcastTeamId = data?.teamId;
     if (!broadcastTeamId && data?.msg?.teamId) {
       broadcastTeamId = data.msg.teamId;
@@ -30,13 +31,21 @@ export class BroadcastBus {
       broadcastTeamId = data.agent.teamId;
     }
 
+    // YÊU CẦU: broadcast bắt buộc có teamId, nếu không có → không phát (tránh leak team)
+    if (!broadcastTeamId) {
+      return;
+    }
+
     const payload = { type, ...(broadcastTeamId ? { teamId: broadcastTeamId } : {}), ...data };
     const msg = JSON.stringify(payload);
 
-    // WebSocket broadcast với team filter
+    // WebSocket broadcast với team filter & log subscriber filter
     this.wsClients.forEach(ws => {
       try {
         if (ws.readyState === 1) { // OPEN
+          if (isLogMsg && !(ws as any).isLogSubscriber) {
+            return;
+          }
           const wsTeam = (ws as any).teamId;
           if (wsTeam && broadcastTeamId && wsTeam !== broadcastTeamId) {
             return;
@@ -46,10 +55,13 @@ export class BroadcastBus {
       } catch {}
     });
 
-    // SSE broadcast với team filter
+    // SSE broadcast với team filter & log subscriber filter
     const sseData = `data: ${msg}\n\n`;
     this.sseClients.forEach(res => {
       try {
+        if (isLogMsg && !(res as any).isLogSubscriber) {
+          return;
+        }
         const sseTeam = (res as any).teamId;
         if (sseTeam && broadcastTeamId && sseTeam !== broadcastTeamId) {
           return;

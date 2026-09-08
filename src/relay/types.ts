@@ -1,5 +1,6 @@
 // ============ GRANULAR RELAY & MESSAGING TYPES ============
 import type { Agent } from '../core/agents.js';
+import type { MessagePart } from '../agents/types.js';
 
 export type SenderType = 'user' | 'orchestrator' | 'agent' | 'system';
 export type TargetScope = 'user' | 'orchestrator' | 'agent' | 'broadcast' | 'team';
@@ -34,6 +35,7 @@ export interface ChatMsg {
   content: string;
   task?: string;
   timestamp: number;
+  sourceCreatedAt?: number;
   agentName?: string;
   agentRole?: string;
   teamId?: string;
@@ -42,7 +44,7 @@ export interface ChatMsg {
   toolCalls?: Array<{ tool: string; input?: string; output?: string }>;
   thinking?: string;
   allowThinking?: boolean;
-  parts?: Array<{ type: 'text' | 'tool' | 'thinking'; content?: string; tool?: string; input?: any; output?: any }>;
+  parts?: MessagePart[];
 }
 
 export interface RelayContext {

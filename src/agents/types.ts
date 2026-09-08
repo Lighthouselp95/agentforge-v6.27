@@ -55,6 +55,15 @@ export interface ToolCallInfo {
   output?: string;
 }
 
+export interface MessagePart {
+  type: 'thinking' | 'text' | 'tool';
+  content?: string;
+  tool?: string;
+  input?: any;
+  output?: any;
+  callId?: string;
+}
+
 export interface AgentMessage {
   id: string;
   from: string; // agent id
@@ -68,6 +77,7 @@ export interface AgentMessage {
   contextLength?: number;
   toolCalls?: ToolCallInfo[]; // toolcall có cấu trúc từ event gốc — nguồn cho UI
   thinking?: string; // suy nghĩ nội bộ của model (reasoning/thinking), tách khỏi content
+  parts?: MessagePart[];
 }
 
 export interface Task {
@@ -75,7 +85,7 @@ export interface Task {
   description: string;
   assignedTo?: string;
   assignedBy?: string;
-  status: 'pending' | 'assigned' | 'working' | 'completed' | 'failed';
+  status: 'pending' | 'assigned' | 'working' | 'completed' | 'failed' | 'cancelled';
   result?: string;
 }
 

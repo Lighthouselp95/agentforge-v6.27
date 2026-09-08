@@ -30,6 +30,9 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
   const [orchestratorModel, setOrchestratorModel] = useState('');
   const [defaultSubagentModel, setDefaultSubagentModel] = useState('');
   const [agentModelOverrides, setAgentModelOverrides] = useState<Record<string, string>>({});
+  const [engineMode, setEngineMode] = useState<'run' | 'attach' | 'http'>('run');
+  const [serveUrl, setServeUrl] = useState('http://127.0.0.1:4096');
+  const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(false);
   const [models, setModels] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem('af-models-cache');
@@ -83,9 +86,19 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           .then(r => r.ok ? r.json() : null)
           .catch(() => null);
 
-        const [modelsData, settingsData] = await Promise.all([
+        const fetchEnginePromise = fetch(`${API}/api/settings/engineMode`)
+          .then(r => r.ok ? r.json() : null)
+          .catch(() => null);
+
+        const fetchExpandPromise = fetch(`${API}/api/settings/defaultExpandToolcalls`)
+          .then(r => r.ok ? r.json() : null)
+          .catch(() => null);
+
+        const [modelsData, settingsData, engineData, expandData] = await Promise.all([
           fetchModelsPromise,
-          fetchSettingsPromise
+          fetchSettingsPromise,
+          fetchEnginePromise,
+          fetchExpandPromise
         ]);
 
         if (modelsData) {
@@ -116,6 +129,17 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           setOrchestratorModel(settingsData.orchestratorModel || '');
           setDefaultSubagentModel(settingsData.defaultSubagentModel || '');
           setAgentModelOverrides(settingsData.agentModelOverrides || {});
+        }
+
+        if (engineData) {
+          const mode = engineData.engineMode;
+          if (mode === 'run' || mode === 'attach' || mode === 'http') setEngineMode(mode);
+          const url = engineData.opencodeServeUrl || engineData.serveUrl;
+          if (typeof url === 'string' && url.trim()) setServeUrl(url.trim());
+        }
+
+        if (expandData) {
+          setDefaultExpandToolcalls(expandData.defaultExpandToolcalls === true);
         }
       } catch (e) {
         console.error('Failed to load model settings:', e);
@@ -166,13 +190,25 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
         agentModelOverrides
       };
 
-      const res = await fetch(`${API}/api/settings/models`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      const [resModels, resEngine, resExpand] = await Promise.all([
+        fetch(`${API}/api/settings/models`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }),
+        fetch(`${API}/api/settings/engineMode`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ engineMode, serveUrl, opencodeServeUrl: serveUrl })
+        }),
+        fetch(`${API}/api/settings/defaultExpandToolcalls`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ defaultExpandToolcalls })
+        })
+      ]);
 
-      if (res.ok) {
+      if (resModels.ok && resEngine.ok && resExpand.ok) {
         setSavedSuccess(true);
         if (onSaved) onSaved();
         setTimeout(() => {
@@ -237,6 +273,118 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           >
             ✕
           </button>
+        </div>
+
+        {/* 0. Engine Mode — luôn hiện ngay đầu dialog, không ẩn sau loading */}
+        <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
+            ⚡ Chế độ thực thi (Engine Mode)
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+            Cách AgentForge giao tiếp với OpenCode engine.
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', fontSize: 12 }}>
+              <input
+                type="radio"
+                name="engineMode"
+                value="run"
+                checked={engineMode === 'run'}
+                onChange={() => setEngineMode('run')}
+                style={{ marginTop: 2 }}
+              />
+              <div>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>1. opencode run (Mặc định)</span>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block' }}>
+                  Spawn tiến trình CLI độc lập cho từng agent.
+                </span>
+              </div>
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', fontSize: 12 }}>
+              <input
+                type="radio"
+                name="engineMode"
+                value="attach"
+                checked={engineMode === 'attach'}
+                onChange={() => setEngineMode('attach')}
+                style={{ marginTop: 2 }}
+              />
+              <div>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>2. opencode attach</span>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block' }}>
+                  Gắn CLI vào daemon OpenCode Serve qua cờ --attach.
+                </span>
+              </div>
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer', fontSize: 12 }}>
+              <input
+                type="radio"
+                name="engineMode"
+                value="http"
+                checked={engineMode === 'http'}
+                onChange={() => setEngineMode('http')}
+                style={{ marginTop: 2 }}
+              />
+              <div>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>3. http stream</span>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block' }}>
+                  Giao tiếp HTTP/SSE trực tiếp tới OpenCode Serve (không qua CLI).
+                </span>
+              </div>
+            </label>
+          </div>
+
+          {(engineMode === 'attach' || engineMode === 'http') && (
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px dashed var(--af-border-strong)' }}>
+              <label style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-secondary)', display: 'block', marginBottom: 4 }}>
+                URL OpenCode Serve:
+              </label>
+              <input
+                type="text"
+                value={serveUrl}
+                onChange={(e) => setServeUrl(e.target.value)}
+                placeholder="http://127.0.0.1:4096"
+                style={{
+                  width: '100%',
+                  background: 'var(--bg-panel)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid var(--af-border-strong)',
+                  borderRadius: 6,
+                  padding: '6px 10px',
+                  fontSize: 12,
+                  outline: 'none',
+                  boxSizing: 'border-box'
+                }}
+              />
+              <div style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 3 }}>
+                Chạy opencode serve --port 4096 trên máy để khởi động daemon.
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 0.5. Tool Call Expansion Setting */}
+        <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
+            🔍 Hiển thị Tool Calls (Tool Call Expansion)
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12 }}>
+            <input
+              type="checkbox"
+              checked={defaultExpandToolcalls}
+              onChange={(e) => setDefaultExpandToolcalls(e.target.checked)}
+              style={{ cursor: 'pointer' }}
+            />
+            <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+              Hiển thị chi tiết tool calls mặc định
+            </span>
+          </label>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            Tự động mở rộng phần chi tiết nội dung giao việc/báo cáo của tool calls trong cửa sổ chat.
+          </div>
         </div>
 
         {loading ? (

@@ -38,6 +38,7 @@ export const PROJECT_ROOT_STORAGE = resolveProjectRootForStorage();
 export const DATA_DIR = join(PROJECT_ROOT_STORAGE, 'data');
 export const STATE_FILE = join(DATA_DIR, 'agentforge-state.json');
 export const BAK_FILE = join(DATA_DIR, 'agentforge-state.json.bak');
+export const CHAT_JSONL_FILE = join(DATA_DIR, 'chat.jsonl');
 
 export const MAX_PERSISTED_MESSAGES = Infinity;
 export const MAX_LOGS_ENTRIES = 5000;

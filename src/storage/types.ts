@@ -69,6 +69,45 @@ export interface ModelSettings {
   agentModelOverrides: Record<string, string>;
 }
 
+// ============ TEAM SETTINGS (live per-team limits, editable via UI/API) ============
+export interface TeamSettings {
+  /** Max tasks chưa hoàn thành trên 1 agent (default 5). */
+  taskLimit: number;
+  /** Trần số agent theo từng role trong team. Role không liệt kê → fallback 1 (khớp getRoleLimit cũ). */
+  agentLimits: Record<string, number>;
+  /** Max tổng thành viên trong 1 team, tính cả Orchestrator (default 7: 6 worker + 1 Orchestrator). */
+  maxTeamSize: number;
+  /** Max số role phân biệt trong 1 team (default 12 — generous, không phá vỡ team hiện tại). */
+  maxRoles: number;
+  /** Model mặc định cho team (nếu có) */
+  defaultModel?: string;
+  /** Adapters và mở rộng cho Frontend: */
+  maxTeamMembers?: number;
+  roleLimits?: Record<string, { maxAgents: number; taskLimit: number }>;
+  liveCheckEnabled?: boolean;
+  autoCleanupCompleted?: boolean;
+}
+
+export const DEFAULT_TEAM_SETTINGS: TeamSettings = {
+  taskLimit: 5,
+  agentLimits: { coder: 4, researcher: 2 },
+  maxTeamSize: 7,
+  maxRoles: 12
+};
+
+export interface SpawnGateUsage {
+  teamSize: number;
+  roleCount: number;
+  distinctRoles: number;
+  roleExists: boolean;
+}
+
+export interface SpawnGateResult {
+  canSpawn: boolean;
+  reason: string;
+  code: 'OK' | 'TEAM_LIMIT' | 'ROLE_LIMIT' | 'ROLES_LIMIT';
+}
+
 export interface UpdateAgentOptions {
   status?: string;
   sessionId?: string | null;

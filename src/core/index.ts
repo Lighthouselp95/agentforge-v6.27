@@ -2,3 +2,8 @@ export * from './logger.js';
 export * from './prompts.js';
 export * from './command-parser.js';
 export * from './agents.js';
+export * from './state-machine.js';
+export * from './broadcast.js';
+export * from './lifecycle.js';
+export * from './app.js';
+export * from './dispatch.js';

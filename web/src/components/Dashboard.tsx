@@ -156,13 +156,12 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
     safeAgents.map(a => {
       if (a.teamId) return a.teamId;
       if (a.id === 'orchestrator') return 'default';
-      if (a.type === 'orchestrator' || a.role === 'orchestrator') return `team-${a.id.slice(-8)}`;
       return 'default';
     })
   ));
 
   // Các team mồ côi (đã xóa Orchestrator nhưng worker vẫn còn)
-  const orphanTeams = allTeamIds.filter(tId => !sortedOrchs.some(o => (o.teamId || (o.id === 'orchestrator' ? 'default' : `team-${o.id.slice(-8)}`)) === tId));
+  const orphanTeams = allTeamIds.filter(tId => !sortedOrchs.some(o => (o.teamId || (o.id === 'orchestrator' ? 'default' : '')) === tId));
 
   const toggleCollapse = (orchId: string) => {
     setCollapsed(prev => ({ ...prev, [orchId]: !prev[orchId] }));
@@ -408,7 +407,7 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
             const isCollapsed = Boolean(collapsed[orch.id]);
 
             // Tìm các worker thuộc về orchestrator này: Khớp chính xác theo teamId hoặc spawnedBy
-            const orchTeamId = orch.teamId || (orch.id === 'orchestrator' ? 'default' : `team-${orch.id.slice(-8)}`);
+            const orchTeamId = orch.teamId || (orch.id === 'orchestrator' ? 'default' : '');
             const childWorkers = safeAgents.filter(a => {
               if (a.id === orch.id || a.type === 'orchestrator' || a.role === 'orchestrator') return false;
               // 1. So khớp chính xác theo teamId
@@ -452,13 +451,15 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                     border: isOrchError
                       ? '1px solid #ef4444'
                       : isOrchSelected
-                      ? '2px solid var(--accent-strong)'
+                      ? '2px solid #38bdf8'
                       : '1px solid var(--af-border)',
                     boxShadow: isOrchError
                       ? '0 0 16px rgba(239, 68, 68, 0.25)'
                       : isOrchSelected
-                      ? '0 0 24px -2px var(--accent)'
+                      ? '0 0 0 2px rgba(56, 189, 248, 0.4), 0 8px 24px -4px rgba(56, 189, 248, 0.35)'
                       : 'none',
+                    transform: isOrchSelected ? 'translateY(-2px)' : 'none',
+                    transition: 'all 0.2s ease-in-out',
                     cursor: 'pointer',
                     width: '100%',
                     maxWidth: '100%',
@@ -716,13 +717,15 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                             border: isError
                               ? '1px solid #ef4444'
                               : isSelected
-                              ? '2px solid var(--accent-strong)'
+                              ? '2px solid #38bdf8'
                               : '1px solid var(--af-border)',
                             boxShadow: isError
                               ? '0 0 16px rgba(239, 68, 68, 0.25)'
                               : isSelected
-                              ? '0 0 24px -2px var(--accent)'
+                              ? '0 0 0 2px rgba(56, 189, 248, 0.4), 0 8px 24px -4px rgba(56, 189, 248, 0.35)'
                               : 'none',
+                            transform: isSelected ? 'translateY(-2px)' : 'none',
+                            transition: 'all 0.2s ease-in-out',
                             cursor: 'pointer'
                           }}
                         >
@@ -1018,8 +1021,15 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                             border: isError
                               ? '1px solid #ef4444'
                               : isSelected
-                              ? '2px solid var(--accent-strong)'
+                              ? '2px solid #38bdf8'
                               : '1px solid var(--af-border)',
+                            boxShadow: isError
+                              ? '0 0 16px rgba(239, 68, 68, 0.25)'
+                              : isSelected
+                              ? '0 0 0 2px rgba(56, 189, 248, 0.4), 0 8px 24px -4px rgba(56, 189, 248, 0.35)'
+                              : 'none',
+                            transform: isSelected ? 'translateY(-2px)' : 'none',
+                            transition: 'all 0.2s ease-in-out',
                             cursor: 'pointer',
                             width: '100%',
                             boxSizing: 'border-box'

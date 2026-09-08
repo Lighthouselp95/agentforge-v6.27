@@ -3,10 +3,57 @@ import { Dashboard } from './components/Dashboard';
 import { ChatPanel } from './components/ChatPanel';
 import { SpawnDialog } from './components/SpawnDialog';
 import { ModelSettingsDialog } from './components/ModelSettingsDialog';
+import { TeamSettingsDialog } from './components/TeamSettingsDialog';
 import { TabBar } from './components/TabBar';
 import { parseAgentTaskList, renderAgentTaskList, ParsedAgentTask } from './utils/taskUtils';
 
 const API = window.location.port === '5173' ? '' : (window.location.origin.startsWith('http') ? window.location.origin : 'http://localhost:4001');
+
+// ============ UNIFIED DEDUP HELPERS (re-apply coder-relay v7.0.55) ============
+// Triệt tiêu duplicate user messages mọi nguồn: optimistic push, SSE echo,
+// fetchHistory, force-send. Key chuẩn hoá bằng normText (NFC + lowercase +
+// collapse whitespace) + timeBucket 30s cho temp/stream ID.
+const normText = (s: any) => (s || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
+const timeBucket = (t: number | undefined, bucketMs = 30000) => Math.floor((Number(t) || Date.now()) / bucketMs);
+
+const getMessageKey = (msg: any) => {
+  if (msg?.id && !String(msg.id).startsWith('temp-') && !String(msg.id).startsWith('stream-')) {
+    return `id:${msg.id}`;
+  }
+  const content = normText(msg?.content);
+  if (!content) return `from:${msg?.from || 'unknown'}:empty`;
+  return `${msg?.from || 'unknown'}:${content}:${timeBucket(msg?.timestamp)}`;
+};
+
+const mergeMessage = (prev: any[], incoming: any): any[] => {
+  const incomingKey = getMessageKey(incoming);
+  const incomingTime = incoming.timestamp || Date.now();
+  // 1) Exact key match: cùng ID hoặc cùng content+from+bucket trong 5s
+  let existingIdx = prev.findIndex(p => getMessageKey(p) === incomingKey && Math.abs((p.timestamp || 0) - incomingTime) < 5000);
+
+  // 2) Fallback match: optimistic temp-* ID vs canonical UUID — so sánh from + normalized content + timestamp
+  if (existingIdx === -1 && incomingKey.startsWith('from:')) {
+    const incomingFrom = incoming.from || 'unknown';
+    const incomingContent = normText(incoming.content);
+    if (incomingContent) {
+      existingIdx = prev.findIndex(p => {
+        const pKey = getMessageKey(p);
+        const pFrom = p.from || 'unknown';
+        const pContent = normText(p.content);
+        const timeDiff = Math.abs((p.timestamp || 0) - incomingTime);
+        return pKey.startsWith('from:') && pFrom === incomingFrom && pContent === incomingContent && timeDiff < 5000;
+      });
+    }
+  }
+
+  if (existingIdx !== -1) {
+    const updated = [...prev];
+    updated[existingIdx] = { ...updated[existingIdx], ...incoming, id: incoming.id || updated[existingIdx].id };
+    return updated;
+  }
+  return [...prev, incoming];
+};
+// ============ END UNIFIED DEDUP HELPERS ============
 
 interface ChatMsg {
   id: string;
@@ -69,6 +116,7 @@ export function App() {
   const [showSpawn, setShowSpawn] = useState(false);
   const [spawnParentId, setSpawnParentId] = useState<string | null>(null);
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showTeamSettings, setShowTeamSettings] = useState(false);
   const [connected, setConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'disconnected'>('disconnected');
   const [disconnectedAt, setDisconnectedAt] = useState<number | null>(null);
@@ -124,6 +172,14 @@ export function App() {
   });
   const [enableWatchdog, setEnableWatchdog] = useState(true);
   const [autoContinue, setAutoContinue] = useState(false);
+  const [collapseToolCalls, setCollapseToolCalls] = useState(() => {
+    try {
+      const stored = localStorage.getItem('af-collapseToolCalls');
+      return stored === 'true';
+    } catch { return false; }
+  });
+  // Backward compatibility: expose defaultExpandToolcalls as API value (inverse of collapseToolCalls)
+  const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(() => !collapseToolCalls);
   const wsRef = useRef<WebSocket | null>(null);
   // Bản đồ agentKey -> id tin nhắn stream đang chạy (chat:chunk / chat:tool_call)
   const streamRef = useRef<Record<string, string>>({});
@@ -212,6 +268,15 @@ export function App() {
     } catch (e) {
       console.error('Failed to fetch autoContinue settings:', e);
     }
+    try {
+      const res3 = await fetch(`${API}/api/settings/defaultExpandToolcalls`);
+      const data3 = await res3.json();
+      if (typeof data3.defaultExpandToolcalls === 'boolean') {
+        setDefaultExpandToolcalls(data3.defaultExpandToolcalls);
+      }
+    } catch (e) {
+      console.error('Failed to fetch defaultExpandToolcalls settings:', e);
+    }
   };
 
   const toggleWatchdog = async (enabled: boolean) => {
@@ -237,6 +302,38 @@ export function App() {
       });
     } catch (e) {
       console.error('Failed to update autoContinue settings:', e);
+    }
+  };
+
+  const toggleDefaultExpandToolcalls = async (enabled: boolean) => {
+    setDefaultExpandToolcalls(enabled);
+    try {
+      await fetch(`${API}/api/settings/defaultExpandToolcalls`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ defaultExpandToolcalls: enabled })
+      });
+    } catch (e) {
+      console.error('Failed to update defaultExpandToolcalls settings:', e);
+    }
+  };
+
+  const toggleCollapseToolCalls = async (collapse: boolean) => {
+    setCollapseToolCalls(collapse);
+    setDefaultExpandToolcalls(!collapse);
+    try {
+      localStorage.setItem('af-collapseToolCalls', String(collapse));
+    } catch (e) {
+      console.error('Failed to persist collapseToolCalls setting:', e);
+    }
+    try {
+      await fetch(`${API}/api/settings/defaultExpandToolcalls`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ defaultExpandToolcalls: !collapse })
+      });
+    } catch (e) {
+      console.error('Failed to update collapse tool calls setting:', e);
     }
   };
 
@@ -278,7 +375,7 @@ export function App() {
     }
   };
 
-  // Tạo/lấy tin nhắn stream của 1 agent rồi mutate nội dung (dùng cho chat:chunk / chat:tool_call)
+  // Tạo/lấy tin nhắn stream của 1 agent rồi mutate nội dung (dùng cho chat:chunk / chat:tool_call / chat:thinking)
   const upsertStreamMsg = (key: string, mut: (m: ChatMsg) => ChatMsg, teamId?: string, isNewTurn?: boolean) => {
     const now = Date.now();
     const lastActive = lastChunkAtRef.current[key] || 0;
@@ -291,15 +388,43 @@ export function App() {
     setAllMessages(prev => {
       let sid = streamRef.current[key];
       let list = prev;
-      if (!sid || !prev.some(p => p.id === sid)) {
+      const existing = sid ? prev.find(p => p.id === sid) : undefined;
+
+      if (!existing) {
         sid = `stream-${key}-${Date.now()}`;
         streamRef.current[key] = sid;
         const targetAgent = agents.find(a => a.id === key || a.name === key);
         const agentRole = targetAgent?.role || targetAgent?.type || (key === 'orchestrator' ? 'orchestrator' : undefined);
         const agentTeamId = teamId || targetAgent?.teamId || (key === 'orchestrator' ? 'default' : `team-${key.slice(-8)}`);
-        list = [...prev, { id: sid, from: key, to: 'user', content: '', timestamp: Date.now(), teamId: agentTeamId, agentRole }];
+
+        // Áp dụng mutation lên message tạm để kiểm tra nội dung THỰC trước khi tạo bubble
+        const tempMsg: ChatMsg = {
+          id: sid,
+          from: key,
+          to: 'user',
+          content: '',
+          timestamp: Date.now(),
+          teamId: agentTeamId,
+          agentRole
+        };
+        const mutated = mut(tempMsg);
+        const hasRealContent =
+          (typeof mutated.content === 'string' && mutated.content.trim().length > 0) ||
+          (Array.isArray(mutated.parts) && mutated.parts.some((p: any) => p && typeof p.content === 'string' && p.content.trim().length > 0)) ||
+          (typeof mutated.thinking === 'string' && mutated.thinking.trim().length > 0) ||
+          (Array.isArray(mutated.toolCalls) && mutated.toolCalls.length > 0);
+
+        if (!hasRealContent) {
+          // Không tạo bubble rỗng khi stream chưa có chữ/tool/thinking thực
+          return prev;
+        }
+
+        list = [...prev, mutated];
+      } else {
+        return list.map(m => m.id === sid ? mut(m) : m);
       }
-      return list.map(m => m.id === sid ? mut(m) : m);
+
+      return list;
     });
   };
 
@@ -642,6 +767,16 @@ export function App() {
       setAutoContinue(msg.autoContinue);
     }
 
+if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'boolean') {
+       setDefaultExpandToolcalls(msg.defaultExpandToolcalls);
+       setCollapseToolCalls(!msg.defaultExpandToolcalls);
+       try {
+         localStorage.setItem('af-collapseToolCalls', String(!msg.defaultExpandToolcalls));
+       } catch (e) {
+         console.error('Failed to persist collapseToolCalls setting from server:', e);
+       }
+     }
+
     if (msg.type === 'agent:created' || msg.type === 'agent:updated' || msg.type === 'agent:deleted') {
       if (msg.type === 'agent:deleted') {
         const deletedId = msg.id || msg.agentId;
@@ -820,7 +955,7 @@ export function App() {
   // Send queued message helper (actual network)
   const sendQueuedMessage = async (qmsg: ChatMsg) => {
     lastSendAtRef.current = Date.now();
-    setAllMessages(prev => [...prev, qmsg]);
+    setAllMessages(prev => mergeMessage(prev, qmsg));
     setLoading(true);
     const targetId = qmsg.to || 'orchestrator';
     // Đánh dấu agent đích đang có 1 queued message in-flight
@@ -836,17 +971,26 @@ export function App() {
       });
       const data = await res.json().catch(() => null);
       if (!data || data.error) {
-        setAllMessages(prev => {
-          const errId = `err-${Date.now()}`;
-          const errMsg = data?.error || 'Phản hồi không hợp lệ từ máy chủ';
-          if (prev.some(p => p.content === `❌ Error: ${errMsg}`)) return prev;
-          return [...prev, { id: errId, from: targetId, to: 'user', content: `❌ Error: ${errMsg}`, timestamp: Date.now(), msgType: 'error' }];
-        });
+        setAllMessages(prev => mergeMessage(prev, {
+          id: `err-${Date.now()}`,
+          from: targetId,
+          to: 'user',
+          content: `❌ Error: ${data?.error || 'Phản hồi không hợp lệ từ máy chủ'}`,
+          timestamp: Date.now(),
+          msgType: 'error'
+        }));
         setLoading(false);
         done();
       }
     } catch (e: any) {
-      setAllMessages(prev => [...prev, { id: `err-${Date.now()}`, from: targetId, to: 'user', content: `❌ Connection error: ${e.message}`, timestamp: Date.now(), msgType: 'error' }]);
+      setAllMessages(prev => mergeMessage(prev, {
+        id: `err-${Date.now()}`,
+        from: targetId,
+        to: 'user',
+        content: `❌ Connection error: ${e.message}`,
+        timestamp: Date.now(),
+        msgType: 'error'
+      }));
       setLoading(false);
       done();
     }
@@ -977,21 +1121,30 @@ export function App() {
         });
       }
 
-      // Hiển thị ngay tin nhắn người dùng vào bóng chat
+      // Hiển thị ngay tin nhắn người dùng vào bóng chat (qua mergeMessage để triệt tiêu dup)
       lastSendAtRef.current = Date.now();
-      setAllMessages(prev => [...prev, userMsg]);
+      setAllMessages(prev => mergeMessage(prev, userMsg));
 
       if (!data || data.error) {
-        setAllMessages(prev => {
-          const errId = `err-${Date.now()}`;
-          const errMsg = data?.error || 'Phản hồi không hợp lệ từ máy chủ';
-          if (prev.some(p => p.content === `❌ Error: ${errMsg}`)) return prev;
-          return [...prev, { id: errId, from: targetId, to: 'user', content: `❌ Error: ${errMsg}`, timestamp: Date.now(), msgType: 'error' }];
-        });
+        setAllMessages(prev => mergeMessage(prev, {
+          id: `err-${Date.now()}`,
+          from: targetId,
+          to: 'user',
+          content: `❌ Error: ${data?.error || 'Phản hồi không hợp lệ từ máy chủ'}`,
+          timestamp: Date.now(),
+          msgType: 'error'
+        }));
         setLoading(false);
       }
     } catch (e: any) {
-      setAllMessages(prev => [...prev, { id: `err-${Date.now()}`, from: targetId, to: 'user', content: `❌ Connection error: ${e.message}`, timestamp: Date.now(), msgType: 'error' }]);
+      setAllMessages(prev => mergeMessage(prev, {
+        id: `err-${Date.now()}`,
+        from: targetId,
+        to: 'user',
+        content: `❌ Connection error: ${e.message}`,
+        timestamp: Date.now(),
+        msgType: 'error'
+      }));
       setLoading(false);
     }
   };
@@ -1201,11 +1354,13 @@ export function App() {
         // Fix 6.36: MAIN view chỉ hiển thị msg thuộc TEAM của Orchestrator đang active.
         // Mọi Main Orchestrator đều ngang hàng, không hardcode id 'orchestrator'.
         const defaultOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+        const orchId = defaultOrch?.id || 'orchestrator';
         const mainTeamId = defaultOrch?.teamId || 'default';
-        if (m.teamId && m.teamId !== mainTeamId) return false;
+        // Team isolation safe: target-based check — chỉ cho phép tin từ orchestrator hiện tại hoặc gửi đến orchestrator hiện tại
+        // khi teamId không match. Tránh leak talk/spawn của orchestrator khác sang team này.
+        if (m.teamId && m.teamId !== mainTeamId && m.from !== orchId && m.to !== orchId) return false;
         // Tab Main: chỉ hiển thị snapshot 'opencode' của ROOT ORCHESTRATOR.
         // Ẩn hoàn toàn snapshots opencode của Sub-Orchestrators và Workers (msgType 'opencode', from !== orchId && from !== 'orchestrator').
-        const orchId = defaultOrch?.id || 'orchestrator';
         const isNotRootOrch = (m.from !== orchId) && (m.from !== 'orchestrator');
         if (m.msgType === 'opencode' && isNotRootOrch) {
           return false;
@@ -1393,7 +1548,7 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (e.repeat) return;
-        if (showSpawn || showModelSettings) return;
+        if (showSpawn || showModelSettings || showTeamSettings) return;
         
         const currentAgent = selectedAgentId
           ? agents.find(a => a.id === selectedAgentId)
@@ -1407,7 +1562,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [stopAgent, showSpawn, showModelSettings, selectedAgentId, agents, loading]);
+  }, [stopAgent, showSpawn, showModelSettings, showTeamSettings, selectedAgentId, agents, loading]);
 
   const selectAgent = (agentId: string | null) => {
     setSelectedAgentId(agentId);
@@ -1444,7 +1599,7 @@ export function App() {
       };
 
   return (
-    <div className="af-shell" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg-main)', color: 'var(--text-primary)', overflow: 'hidden', position: 'relative' }}>
+    <div className="af-shell" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg-main)', color: 'var(--text-primary)', overflow: 'hidden', position: 'relative', minHeight: 0 }}>
 
       {/* ===== TOP ROW: Activity bar + Sidebar + Resizer + Chat column ===== */}
       <div style={{ display: 'flex', flexDirection: 'row', flex: 1, minHeight: 0, overflow: 'hidden' }}>
@@ -1517,6 +1672,29 @@ export function App() {
                 }}
               >
                 {theme === 'dark' ? '☀️' : '🌙'}
+              </button>
+              {/* Settings icon: always visible on mobile to access Settings view (activity bar hidden on mobile) */}
+              <button
+                onClick={() => setActiveView('settings')}
+                title="Cài đặt / Settings"
+                aria-label="Settings"
+                aria-current={activeView === 'settings' ? 'page' : undefined}
+                style={{
+                  width: 30,
+                  height: 30,
+                  borderRadius: 8,
+                  border: activeView === 'settings' ? '1px solid var(--accent)' : '1px solid rgba(15,23,42,0.12)',
+                  background: activeView === 'settings' ? 'var(--accent-soft)' : (theme === 'dark' ? 'var(--bg-input)' : '#ffffff'),
+                  color: activeView === 'settings' ? 'var(--accent)' : (theme === 'dark' ? '#94a3b8' : '#64748b'),
+                  fontSize: 15,
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  transition: 'all 0.2s'
+                }}
+              >
+                ⚙️
               </button>
             </div>
           </div>
@@ -1637,6 +1815,51 @@ export function App() {
                 </label>
               </div>
 
+              {/* Collapse Tool Calls Toggle Switch */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '8px 12px',
+                background: 'var(--bg-inset)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--af-border)'
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', userSelect: 'none' }} title="Tự động thu gọn các khối Tool Calls khi nhận stream mới">
+                  📦 Collapse Tool Calls
+                </span>
+                <label style={{ position: 'relative', display: 'inline-block', width: 34, height: 18, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={collapseToolCalls}
+                    onChange={(e) => toggleCollapseToolCalls(e.target.checked)}
+                    style={{ opacity: 0, width: 0, height: 0 }}
+                  />
+                  <span style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: collapseToolCalls ? '#2563eb' : '#475569',
+                    borderRadius: 18,
+                    transition: '0.2s'
+                  }}>
+                    <span style={{
+                      position: 'absolute',
+                      content: '""',
+                      height: 14,
+                      width: 14,
+                      left: collapseToolCalls ? 17 : 2,
+                      bottom: 2,
+                      backgroundColor: 'white',
+                      borderRadius: '50%',
+                      transition: '0.2s'
+                    }} />
+                  </span>
+                </label>
+              </div>
+
               {/* Model Hierarchy Settings Button */}
               <button
                 onClick={() => setShowModelSettings(true)}
@@ -1667,6 +1890,38 @@ export function App() {
               >
                 <span>⚙️</span>
                 <span>Cấu hình Phân cấp Model</span>
+              </button>
+
+              {/* Team Settings Button */}
+              <button
+                onClick={() => setShowTeamSettings(true)}
+                style={{
+                  width: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 6,
+                  padding: '8px 12px',
+                  background: 'var(--bg-inset)',
+                  color: 'var(--text-secondary)',
+                  borderRadius: 'var(--radius-md)',
+                  border: '1px solid var(--af-border)',
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s'
+                }}
+                onMouseOver={(e) => {
+                  e.currentTarget.style.borderColor = '#3b82f6';
+                  e.currentTarget.style.background = '#273549';
+                }}
+                onMouseOut={(e) => {
+                  e.currentTarget.style.borderColor = 'var(--af-border)';
+                  e.currentTarget.style.background = 'var(--bg-inset)';
+                }}
+              >
+                <span>👥</span>
+                <span>Cấu hình Team Settings</span>
               </button>
             </div>
           )}
@@ -1754,6 +2009,7 @@ export function App() {
                 offlineForText={offlineForText}
                 uptimeText={uptimeText}
                 showToolBlocks={true}
+                defaultExpandToolcalls={defaultExpandToolcalls}
                 queuedMessages={currentQueue}
                 onFlushQueue={() => handleForceSendAll(activeTargetId)}
                 onClearQueue={() => clearQueueForAgent(activeTargetId)}
@@ -1792,7 +2048,7 @@ export function App() {
             position: 'fixed',
             top: 10,
             left: 10,
-            zIndex: 45,
+            zIndex: 50,
             width: 44,
             height: 44,
             borderRadius: 10,
@@ -1808,6 +2064,38 @@ export function App() {
           }}
         >
           ☰
+        </button>
+      )}
+      {/* Settings button always visible on mobile (nằm ngoài drawer) */}
+      {isMobile && (
+        <button
+          onClick={() => {
+            setActiveView('settings');
+            setSidebarOpen(false); // Close drawer when selecting settings
+          }}
+          aria-label="Cài đặt"
+          title="Cài đặt / Settings"
+          style={{
+            position: 'fixed',
+            top: 10,
+            right: 10,
+            zIndex: 55,
+            width: 44,
+            height: 44,
+            borderRadius: 10,
+            border: activeView === 'settings' ? '1px solid var(--accent)' : '1px solid #334155',
+            background: activeView === 'settings' ? 'var(--accent-soft)' : '#111827',
+            color: activeView === 'settings' ? 'var(--accent)' : '#f8fafc',
+            fontSize: 18,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+            transition: 'all 0.2s'
+          }}
+        >
+          ⚙️
         </button>
       )}
 
@@ -2076,6 +2364,16 @@ export function App() {
         <ModelSettingsDialog
           agents={agents}
           onClose={() => setShowModelSettings(false)}
+          onSaved={fetchAgents}
+        />
+      )}
+
+      {/* Team Settings Dialog */}
+      {showTeamSettings && (
+        <TeamSettingsDialog
+          teamId={selectedAgentId && agents.find(a => a.id === selectedAgentId)?.teamId ? (agents.find(a => a.id === selectedAgentId)?.teamId || 'default') : 'default'}
+          agents={agents}
+          onClose={() => setShowTeamSettings(false)}
           onSaved={fetchAgents}
         />
       )}

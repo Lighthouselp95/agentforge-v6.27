@@ -1,43 +1,78 @@
 import type { StorageEngine } from './engine.js';
 import type { HistoryPageOptions } from './types.js';
 import { MAX_PERSISTED_MESSAGES } from './constants.js';
+import { resolveTeamIdForMsg } from './team-resolver.js';
+import { chatWAL } from './chat-wal.js';
 
 export class MessageStorage {
+  private jsonlInitialized = false;
+
   constructor(private engine: StorageEngine) {}
 
-  // Xác định teamId của một tin nhắn dựa trên agent liên quan (from/to).
-  // Ưu tiên: msg.teamId sẵn → agent theo from → agent theo to → 'default'.
-  // Đặc biệt: khi from = 'user', cid = 'user' không phải agent -> chuyển sang xét 'to' để lấy teamId của agent nhận.
-  resolveTeamIdForMsg(msg: any): string {
-    if (msg && msg.teamId && typeof msg.teamId === 'string') return msg.teamId;
-    const candidates = [msg && msg.from, msg && msg.to];
-    for (const cid of candidates) {
-      if (!cid || typeof cid !== 'string' || cid === 'user' || cid === 'broadcast') continue;
-      const ag = this.engine.inMemoryAgents.get(cid);
-      if (ag && ag.teamId && typeof ag.teamId === 'string') return ag.teamId;
-      if (cid === 'orchestrator') {
-        // Tìm orchestrator mặc định
-        const defaultOrch = Array.from(this.engine.inMemoryAgents.values()).find(a => (a.role === 'orchestrator' || a.id === 'orchestrator') && a.teamId);
-        if (defaultOrch && defaultOrch.teamId) return defaultOrch.teamId;
+  /**
+   * Khởi tạo và nạp lịch sử từ chat.jsonl WAL (Append-only).
+   * Nếu có migration từ inMemoryHistory cũ của state.json, tự động dump sang chat.jsonl.
+   */
+  public initChatJsonl(): void {
+    if (this.jsonlInitialized) return;
+    this.jsonlInitialized = true;
+
+    // Hydrate từ ChatWAL — Single Source of Truth (hydrateOnce để tránh log lặp)
+    const walMessages = chatWAL.hydrateOnce();
+    if (walMessages.length > 0) {
+      const map = new Map<string, any>();
+      for (const m of this.engine.inMemoryHistory) {
+        if (m && m.id) map.set(m.id, m);
       }
+      for (const m of walMessages) {
+        if (m && m.id) map.set(m.id, m);
+      }
+      this.engine.inMemoryHistory = Array.from(map.values());
+      console.log(`[ChatWAL] Đã nạp ${this.engine.inMemoryHistory.length} tin nhắn từ ${walMessages.length} WAL entries`);
+    } else if (this.engine.inMemoryHistory.length > 0 && !chatWAL.isHydrated()) {
+      // Migration: state.json có history nhưng chat.jsonl chưa tồn tại -> dump sang WAL
+      chatWAL.rewriteAll(this.engine.inMemoryHistory);
+      chatWAL.clearCache();
+      console.log(`[ChatWAL] Migrated ${this.engine.inMemoryHistory.length} messages from state.json to chat.jsonl`);
     }
-    return 'default';
+  }
+
+  // Xác định teamId của một tin nhắn dựa trên agent liên quan (from/to).
+  // Ủy quyền hoàn toàn cho team-resolver.ts để đảm bảo một nguồn chân lý (Single Source of Truth)
+  resolveTeamIdForMsg(msg: any): string {
+    return resolveTeamIdForMsg(
+      msg,
+      (id: string) => this.engine.inMemoryAgents.get(id),
+      () => Array.from(this.engine.inMemoryAgents.values())
+    );
   }
 
   saveMessage(msg: any): void {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     const m = { ...msg };
     if (!m.teamId) {
       const tid = this.resolveTeamIdForMsg(msg);
       if (tid) m.teamId = tid;
     }
-    this.engine.inMemoryHistory.push(m);
-    if (Number.isFinite(MAX_PERSISTED_MESSAGES) && this.engine.inMemoryHistory.length > MAX_PERSISTED_MESSAGES) {
-      this.engine.inMemoryHistory.shift();
+    const existingIdx = m.id ? this.engine.inMemoryHistory.findIndex((x: any) => x.id === m.id) : -1;
+    if (existingIdx !== -1) {
+      this.engine.inMemoryHistory[existingIdx] = m;
+      // Cập nhật lại toàn bộ file nếu tin nhắn đã tồn tại được sửa (update)
+      // Sử dụng rewriteAll(..., false) để tránh backup disk cho hot-path update (Option A fix)
+      chatWAL.rewriteAll(this.engine.inMemoryHistory, false);
+    } else {
+      this.engine.inMemoryHistory.push(m);
+      if (Number.isFinite(MAX_PERSISTED_MESSAGES) && this.engine.inMemoryHistory.length > MAX_PERSISTED_MESSAGES) {
+        this.engine.inMemoryHistory.shift();
+      }
+      // Ghi nối đuôi (Append-only) tức thì siêu tốc độ vào JSONL WAL!
+      chatWAL.appendMessage(m);
     }
-    this.engine.schedulePersist();
+    // Không cần persist toàn bộ state JSON cồng kềnh cho mỗi message nữa!
   }
 
   getHistory(limit?: number, teamId?: string): any[] {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     let list = this.engine.inMemoryHistory;
     if (teamId) {
       list = list.filter(m => {
@@ -53,12 +88,14 @@ export class MessageStorage {
   }
 
   getHistoryByAgent(agentId: string, limit = 100): any[] {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     return this.engine.inMemoryHistory
       .filter(m => m.from_id === agentId || m.to_id === agentId || m.from === agentId || m.to === agentId)
       .slice(-limit);
   }
 
   getHistoryPage(opts: HistoryPageOptions = {}): any[] {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     let list = this.engine.inMemoryHistory;
     const aid = opts.agentId;
     if (aid) {
@@ -81,22 +118,25 @@ export class MessageStorage {
   }
 
   clearOrchestratorConversation(): void {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     this.engine.inMemoryHistory = this.engine.inMemoryHistory.filter(m =>
       (m.to_id !== 'orchestrator' && m.to !== 'orchestrator') &&
       (m.from_id !== 'orchestrator' && m.from !== 'orchestrator')
     );
-    this.engine.schedulePersist();
+    chatWAL.rewriteAll(this.engine.inMemoryHistory);
   }
 
   clearAgentConversation(agentId: string): void {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     this.engine.inMemoryHistory = this.engine.inMemoryHistory.filter(m =>
       (m.to_id !== agentId && m.to !== agentId) &&
       (m.from_id !== agentId && m.from !== agentId)
     );
-    this.engine.schedulePersist();
+    chatWAL.rewriteAll(this.engine.inMemoryHistory);
   }
 
   loadHistory(limit?: number): any[] {
+    if (!this.jsonlInitialized) this.initChatJsonl();
     if (typeof limit === 'number' && limit > 0) {
       return this.engine.inMemoryHistory.slice(-limit);
     }

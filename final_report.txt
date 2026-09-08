@@ -1,0 +1,1 @@
+Task complete. === TASK REPORT === Fixed Settings button visibility on mobile devices. Modified web/src/App.tsx to add always-visible Settings button (⚙️) in sidebar header for mobile access. Built web app successfully. Settings view now accessible via mobile sidebar header.

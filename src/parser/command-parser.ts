@@ -8,25 +8,93 @@ export * from './xml-parser.js';
 
 export function getCodeFenceRanges(text: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
+  if (!text) return ranges;
   let i = 0;
-  while (i < text.length) {
-    if (text.startsWith('```', i)) {
-      const end = text.indexOf('```', i + 3);
-      if (end !== -1) { ranges.push([i, end + 3] as [number, number]); i = end + 3; continue; }
-      ranges.push([i, text.length] as [number, number]); break;
-    }
+  const len = text.length;
+  while (i < len) {
+    // 1. Check backticks: ` or `` or ```+
     if (text[i] === '`') {
-      const nextNewline = text.indexOf('\n', i + 1);
-      const end = text.indexOf('`', i + 1);
-      if (end !== -1 && (nextNewline === -1 || end < nextNewline)) {
-        ranges.push([i, end + 1] as [number, number]);
-        i = end + 1;
+      let runLen = 0;
+      while (i + runLen < len && text[i + runLen] === '`') {
+        runLen++;
+      }
+      const fenceMarker = '`'.repeat(runLen);
+      if (runLen >= 3) {
+        // Multi-line code fence: ``` or ````
+        const end = text.indexOf(fenceMarker, i + runLen);
+        if (end !== -1) {
+          ranges.push([i, end + runLen]);
+          i = end + runLen;
+          continue;
+        } else {
+          // Unclosed fence extends to end of buffer
+          ranges.push([i, len]);
+          break;
+        }
+      } else {
+        // Inline code: `...` or ``...``
+        let searchPos = i + runLen;
+        let foundEnd = -1;
+        while (searchPos < len) {
+          const nextMatch = text.indexOf(fenceMarker, searchPos);
+          if (nextMatch === -1) break;
+          const beforeOk = nextMatch === 0 || text[nextMatch - 1] !== '`';
+          const afterOk = nextMatch + runLen >= len || text[nextMatch + runLen] !== '`';
+          if (beforeOk && afterOk) {
+            foundEnd = nextMatch + runLen;
+            break;
+          }
+          searchPos = nextMatch + 1;
+        }
+        if (foundEnd !== -1) {
+          ranges.push([i, foundEnd]);
+          i = foundEnd;
+          continue;
+        }
+      }
+      i += runLen;
+      continue;
+    }
+
+    // 2. Check tildes: ~~~+
+    if (text.startsWith('~~~', i)) {
+      let runLen = 0;
+      while (i + runLen < len && text[i + runLen] === '~') {
+        runLen++;
+      }
+      const fenceMarker = '~'.repeat(runLen);
+      const end = text.indexOf(fenceMarker, i + runLen);
+      if (end !== -1) {
+        ranges.push([i, end + runLen]);
+        i = end + runLen;
         continue;
+      } else {
+        ranges.push([i, len]);
+        break;
       }
     }
+
     i++;
   }
   return ranges;
+}
+
+export function maskCodeSpans(text: string, ranges?: Array<[number, number]>): string {
+  if (!text) return '';
+  const codeRanges = ranges || getCodeSpanRanges(text);
+  if (codeRanges.length === 0) return text;
+  
+  const chars = text.split('');
+  for (const [start, end] of codeRanges) {
+    const s = Math.max(0, start);
+    const e = Math.min(chars.length, end);
+    for (let j = s; j < e; j++) {
+      if (chars[j] !== '\n') {
+        chars[j] = ' ';
+      }
+    }
+  }
+  return chars.join('');
 }
 
 export function getCodeSpanRanges(text: string): Array<[number, number]> {
@@ -80,10 +148,10 @@ export function isInCodeSpan(idx: number, ranges: Array<[number, number]>): bool
   return false;
 }
 
-export function extractDualCommands(text: string, targetTags: string[] = ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT']): BracketCommand[] {
+export function extractDualCommands(text: string, targetTags: string[] = ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT'], ignoreMarkdownDoc: boolean = false): BracketCommand[] {
   const commands: BracketCommand[] = [];
   if (!text) return commands;
-  const codeRanges = getCodeSpanRanges(text);
+  const codeRanges = ignoreMarkdownDoc ? getCodeFenceRanges(text) : getCodeSpanRanges(text);
 
   let pos = 0;
   while (pos < text.length) {
@@ -162,7 +230,7 @@ export function extractBracketCommands(text: string, targetTags: string[] = ['TA
 
 export function stripCommandTags(text: string): string {
   if (!text) return '';
-  const commands = extractDualCommands(text, ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT', 'TASK_UPDATE', 'TASK UPDATE']);
+  const commands = extractDualCommands(text, ['TALK', 'SPAWN', 'CREATE ROLE', 'STOP', 'RESUME', 'STOP AGENT', 'RESUME AGENT', 'DELETE AGENT', 'TASK_UPDATE', 'TASK UPDATE'], false);
   if (commands.length === 0) return text.trim();
   let result = '';
   let lastIndex = 0;
@@ -171,9 +239,21 @@ export function stripCommandTags(text: string): string {
     lastIndex = cmd.endIndex;
   }
   result += text.substring(lastIndex);
-  result = result.replace(/\[\/(?:TALK|SPAWN|STOP|RESUME|CREATE ROLE|STOP AGENT|RESUME AGENT|DELETE AGENT|TASK_UPDATE|TASK UPDATE)\]/gi, '');
-  result = result.replace(/<\/(?:talk|spawn|stop|stop_agent|stop-agent|resume|resume_agent|resume-agent|create_role|create-role|delete|delete_agent|delete-agent|task_update|task-update)>/gi, '');
-  return result.trim();
+  
+  // Remove orphaned closing tags ONLY outside code spans/backticks
+  const codeRanges = getCodeSpanRanges(result);
+  const closingRegex = /(?:\[\/(?:TALK|SPAWN|STOP|RESUME|CREATE ROLE|STOP AGENT|RESUME AGENT|DELETE AGENT|TASK_UPDATE|TASK UPDATE)\]|<\/(?:talk|spawn|stop|stop_agent|stop-agent|resume|resume_agent|resume-agent|create_role|create-role|delete|delete_agent|delete-agent|task_update|task-update)>)/gi;
+  let m: RegExpExecArray | null;
+  let cleanedResult = '';
+  let curIdx = 0;
+  while ((m = closingRegex.exec(result)) !== null) {
+    if (!isInCodeSpan(m.index, codeRanges)) {
+      cleanedResult += result.substring(curIdx, m.index);
+      curIdx = m.index + m[0].length;
+    }
+  }
+  cleanedResult += result.substring(curIdx);
+  return cleanedResult.trim();
 }
 
 export function parseTalkTag(tagContent: string): { agentId: string; message: string; task?: string } | null {
@@ -259,8 +339,8 @@ export function parseTalkCommand(cmd: BracketCommand): { agentId: string; messag
     if (agentId && finalMessage) {
       if (task) {
         const words = task.trim().split(/\s+/).filter(Boolean);
-        if (words.length > 25) {
-          return null; // Chặn thực thi lệnh vi phạm barrier vượt quá 25 từ
+        if (words.length > 30) {
+          return null; // Chặn thực thi lệnh vi phạm barrier vượt quá 30 từ
         }
       }
       return { agentId, message: finalMessage, ...(task ? { task: task.trim() } : {}) };
@@ -287,8 +367,8 @@ export function parseSpawnCommand(cmd: BracketCommand): { role: string; name: st
     let rawTaskAttr = stripQuotes(taskMatch ? (taskMatch[1] || taskMatch[2] || taskMatch[3] || taskMatch[4]) : '');
     if (rawTaskAttr) {
       const words = rawTaskAttr.trim().split(/\s+/).filter(Boolean);
-      if (words.length > 25) {
-        return null; // Chặn thực thi lệnh vi phạm barrier vượt quá 25 từ
+      if (words.length > 30) {
+        return null; // Chặn thực thi lệnh vi phạm barrier vượt quá 30 từ
       }
     }
     let task = rawTaskAttr;

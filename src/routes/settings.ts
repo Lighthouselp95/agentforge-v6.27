@@ -11,9 +11,68 @@ export interface SettingsRouteDeps {
 export function createSettingsRouter(deps: SettingsRouteDeps): Router {
   const router = Router();
 
+  // GET /api/settings
+  router.get('/', (_req, res) => {
+    const engineMode = deps.storage.getSetting('engineMode', 'attach');
+    const opencodeServeUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
+    res.json({
+      engineMode,
+      opencodeServeUrl,
+      serveUrl: opencodeServeUrl,
+      autoContinue: deps.storage.getSetting('autoContinue', false) === true,
+      enableWatchdog: deps.storage.getSetting('enableWatchdog', false) === true,
+      models: deps.storage.getModelSettings()
+    });
+  });
+
+  // POST /api/settings
+  router.post('/', (req, res) => {
+    const { engineMode, opencodeServeUrl, serveUrl, autoContinue } = req.body || {};
+    const validModes = ['run', 'attach', 'http'];
+    let changed = false;
+
+    if (engineMode && validModes.includes(engineMode)) {
+      deps.storage.setSetting('engineMode', engineMode);
+      changed = true;
+    }
+    const url = (typeof opencodeServeUrl === 'string' && opencodeServeUrl.trim())
+      ? opencodeServeUrl.trim()
+      : (typeof serveUrl === 'string' && serveUrl.trim() ? serveUrl.trim() : null);
+    if (url) {
+      deps.storage.setSetting('opencodeServeUrl', url);
+      deps.storage.setSetting('serveUrl', url);
+      changed = true;
+    }
+    if (autoContinue !== undefined) {
+      deps.storage.setSetting('autoContinue', Boolean(autoContinue));
+    }
+
+    if (changed) {
+      deps.clients.clear();
+    }
+
+    const currentMode = deps.storage.getSetting('engineMode', 'attach');
+    const currentUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
+
+    deps.broadcast('settings:updated', {
+      engineMode: currentMode,
+      opencodeServeUrl: currentUrl,
+      serveUrl: currentUrl,
+      autoContinue: deps.storage.getSetting('autoContinue', false)
+    });
+
+    res.json({
+      ok: true,
+      success: true,
+      engineMode: currentMode,
+      opencodeServeUrl: currentUrl,
+      serveUrl: currentUrl
+    });
+  });
+
   // GET /api/settings/watchdog
   router.get('/watchdog', (_req, res) => {
-    res.json({ enableWatchdog: false });
+    res.json({ enableWatchdog: deps.storage.getSetting('enableWatchdog', false) === true });
   });
 
   // POST /api/settings/watchdog
@@ -37,6 +96,45 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     deps.storage.setSetting('autoContinue', enabled);
     deps.broadcast('settings:updated', { autoContinue: enabled });
     res.json({ success: true, autoContinue: enabled });
+  });
+
+  // GET /api/settings/defaultExpandToolcalls
+  router.get('/defaultExpandToolcalls', (_req, res) => {
+    res.json({ defaultExpandToolcalls: deps.storage.getSetting('defaultExpandToolcalls', false) === true });
+  });
+
+  // POST /api/settings/defaultExpandToolcalls
+  router.post('/defaultExpandToolcalls', (req, res) => {
+    const { defaultExpandToolcalls } = req.body || {};
+    const enabled = Boolean(defaultExpandToolcalls);
+    deps.storage.setSetting('defaultExpandToolcalls', enabled);
+    deps.broadcast('settings:updated', { defaultExpandToolcalls: enabled });
+    res.json({ success: true, defaultExpandToolcalls: enabled });
+  });
+
+  // GET /api/settings/engineMode
+  router.get('/engineMode', (_req, res) => {
+    const engineMode = deps.storage.getSetting('engineMode', 'attach');
+    const opencodeServeUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
+    res.json({ engineMode, opencodeServeUrl, serveUrl: opencodeServeUrl });
+  });
+
+  // POST /api/settings/engineMode
+  router.post('/engineMode', (req, res) => {
+    const { engineMode, serveUrl, opencodeServeUrl } = req.body || {};
+    const validMode = (engineMode === 'attach' || engineMode === 'http' || engineMode === 'run') ? engineMode : 'attach';
+    const rawUrl = (typeof opencodeServeUrl === 'string' && opencodeServeUrl.trim())
+      ? opencodeServeUrl.trim()
+      : (typeof serveUrl === 'string' && serveUrl.trim() ? serveUrl.trim() : 'http://127.0.0.1:4096');
+
+    deps.storage.setSetting('engineMode', validMode);
+    deps.storage.setSetting('opencodeServeUrl', rawUrl);
+    deps.storage.setSetting('serveUrl', rawUrl);
+
+    deps.clients.clear();
+
+    deps.broadcast('settings:updated', { engineMode: validMode, opencodeServeUrl: rawUrl, serveUrl: rawUrl });
+    res.json({ success: true, engineMode: validMode, opencodeServeUrl: rawUrl, serveUrl: rawUrl });
   });
 
   // GET /api/settings/models

@@ -1,5 +1,406 @@
 # Changelog
 
+## v7.0.56 (2026-09-07)
+
+### Tính năng mới: Auto-Continue Watchdog — Tự Nhắc Agent Tiếp Tục Task Khi Idle
+
+**Yêu cầu user**: Nếu 1 agent đang có việc làm mà về trạng thái idle >= 30s (hoặc ngừng sinh stream >= 1 phút), hệ thống tự gửi 1 tin nhắc agent tiếp tục hoàn thành task "x" — với x là task nhỏ nhất chưa xong — cho đến khi hoàn thành. Lịch nhắc lại: 30s → 1p → 1p → 3p → 5p. Gom vào toggle setting đã có trên UI (`autoContinue` / `enableWatchdog`). Giữ modules cũ tách biệt để không xung đột.
+
+**Triển khai v8 core (không đụng production v7 server.ts)**:
+
+1. **`src/core/task-queue-config.ts`** (MỚI): interface `TaskQueueConfig` — `idleDetectionMs` (mặc định 30s), `taskCheckIntervalMs` (mặc định 1p), `blockCriticalTasks`.
+
+2. **`src/core/task-queue.ts`** (MỚI): class `TaskQueueManager` — trái tim tính năng:
+   - `onAgentIdle(agentId)`: BroadcastManager gọi khi agent về idle → debounce `idleDetectionMs` (30s) → tự tìm task nhỏ nhất chưa hoàn thành.
+   - `checkAndAssignTask()`: chỉ chạy khi toggle `autoContinue` *hoặc* `enableWatchdog` bật (đọc từ storage settings). Quét toàn bộ agent trong storage, lọc task `pending`/`assigned`, chọn task có `priority` thấp nhất (hoặc id lex nhỏ nhất).
+   - `scheduleRetry()`: lập lịch nhắc lại theo `DEFAULT_RETRY_SCHEDULE_MS = [30s, 1p, 1p, 3p, 5p]`, lặp đến khi task hoàn thành hoặc agent quay lại `working`.
+   - `taskStillPending()`: dừng retry khi task đã xong (không còn pending/assigned).
+   - `cancelRetry()/cancelIdle()`: hủy lịch khi agent hoạt động lại.
+   - `setOnAssignTask(fn)`: hook inject từ core/app để gửi tin thật cho agent — tránh circular import.
+   - `destroy()`: dọn timers.
+
+3. **`src/core/broadcast.ts`**: 
+   - Thêm `taskQueueManager?: TaskQueueManager` (public) + `createBroadcastManager()` factory tạo instance kèm taskQueueManager (config mặc định 30s/1p).
+   - `setAgentStatus()`: khi agent về idle (trực tiếp hoặc qua debounce 300/500ms) → gọi `taskQueueManager.onAgentIdle(agentId)`.
+   - Sửa cấu trúc end-of-file: không còn export function lồng trong class.
+
+4. **`src/core/app.ts`**: dùng `createBroadcastManager()` thay vì `new BroadcastManager()`; option `onAutoContinueTask` wire hook gửi tin nhắc.
+
+5. **`src/core/dispatch.ts`**: fix type — `sid = (result as any).sessionId || (client as any).getSessionId?.() || null` (AgentMessage không có sessionId property).
+
+**Verify thực tế**:
+- `npx tsc --noEmit` exit 0 (0 errors); `npx tsc` build dist OK.
+- Smoke test 1: autoContinue OFF → không gửi auto-continue (chỉ log debug). PASS.
+- Smoke test 2: autoContinue ON + agent có task pending → `system:auto-continue` broadcast + onAssignTask gọi đúng task nhỏ nhất. PASS.
+- Smoke test 3: retry schedule rút gọn [60ms,90ms] → nhắc lại liên tục đến khi task xong/agent working. PASS.
+- Smoke test 4: enableWatchdog ON cũng kích hoạt (tương thích toggle watchdog). PASS.
+
+**Không có thay đổi** đối với `src/server.ts` production v7.0.55 (port 4001); tính năng nằm hoàn toàn trong module v8 core phía sau feature flag `USE_V8_CORE`.
+
+## v7.0.53 (2026-09-07)
+
+### Fix QUEUE KHÔNG CHỊU XẢ Dù Agent Đã Về Idle (Root Cause Thật — Bug Proxy `backendUserQueues`)
+
+**Bối cảnh**: v7.0.52 đã thêm Queue Watchdog + retry 3s, nhưng user vẫn báo "agent đã về idle nhưng tin queue không chịu pass". Điều tra production 4001 (v7.0.52, boot 02:43) xác định: **queue messages đúng là KHÔNG BAO GIỜ vào được in-memory queue** → watchdog/processNext thấy queue rỗng → không có gì để xả, dù HAVE watchdog logs zero.
+
+**Root cause THẬT** — interplay nguy hiểm giữa Proxy `backendUserQueues` (server.ts L1243) và pattern enqueue có guard:
+- `backendUserQueues` là `new Proxy` có `get` → `userQueueManager.getQueue(prop)`.
+- `getQueue()` (queue/user-queue.ts) trả `this.backendUserQueues[key] || []` → **một array rác MỚI mỗi lần** khi key chưa tồn tại.
+- Pattern enqueue dùng `if (!backendUserQueues[key]) backendUserQueues[key] = [];` — KHÔNG BAO GIỜ kích hoạt vì `getQueue()` trả `[]` (truthy, `![] === false`).
+- → Proxy `set` trap (`setQueue`) không bao giờ chạy → `.push()` ghi vào **array rác bị vứt bỏ** → in-memory queue RỖNG VĨNH VIỄN, chỉ có disk persistence chạy.
+- **Chỉ tiện lợi vô tình**: tin được lưu xuống đĩa qua `saveUnprocessedMessage` (độc lập), nên force-send UI (`backendUserQueues` get → `|| []`) gom được "Message 1/Message 2" từ *client queue bar*, nhưng **in-memory queue thật không bao giờ có** → auto-drain/watchdog bất lực.
+
+**Bằng chứng thực tế**:
+- Node repro 1-1 proxy pattern: sau `if (!q) q=[]; q.push(msg)` → `len=0`, `managerStore keys=[]` (message MẤT). Đúng hành vi production.
+- Log production: `[02:45:25] target orchestrator is busy (status: working). Queued message (queue length: 0...)` — **length 0 ngay sau push** = tin đã gửi vào array rác.
+- Messages API: 2 tin `temp-1788723925020-weyx` + `temp-1788724214524-ehz6` vẫn `isQueued=true` từ 02:45/02:50 → chưa từng được xả.
+- Force-send 02:51:19 gom cả 2 thành "Message 1/Message 2" (client format) → **in-memory orchestrator queue rỗng tại thời điểm đó** → sao watchdog/chạy 10s 10 phút mà không xả được.
+
+**Fixes (v7.0.53)**:
+1. **`src/routes/chat.ts`** (user enqueue L282): `if (!deps.backendUserQueues[key]) = []` → **gán UNCONDITIONAL** `deps.backendUserQueues[targetIdKey] = deps.backendUserQueues[targetIdKey] || [];` → kích hoạt proxy `set` → `setQueue` persist vào manager.
+2. **`src/server.ts`** StreamDispatch early-talk (L1404) + deliverTalk queued-talk (L3614): đổi sang gán unconditional `backendUserQueues[targetAgent.id] = ... || [];`.
+3. **`src/server.ts`** boot-restore (L5642): đổi sang gán unconditional `backendUserQueues[targetKey] = ... || [];` → khiến vòng lặp boot "Tự động kích hoạt drain queue" (Object.keys → ownKeys) giờ THỰC SỰ thấy các target đã restore.
+4. **`src/routes/chat.ts`** force-send mode 'all': sau khi gom+xoá queue, **blanket-sweep dọn cờ `isQueued=true` dính trên chatHistory/DB** (L407) → UI queue bar hết hiển thị "queue kẹt" vĩnh viễn dù tin đã gửi (sửa luôn 2 tin kẹt hiện tại trên production).
+
+**Verify thực tế**:
+- Node repro pattern FIX: push → `len=1`, `store keys=[orchestrator]`, `stored len=1`; push thứ 2 → `len=2`; drain `splice` dispatch đủ items; sau drain rỗng. (Trước fix: `len=0`, `store keys=[]` — message mất.)
+- Repro force-send: gom đúng `[Message 1]: msg-A / [Message 2]: msg-B`, queue about `0`, chatHistory flags `m1:false,m2:false`.
+- `npx tsc --noEmit` exit 0; `npx tsc` (build dist) exit 0, dist chứa đủ 3 fix + blanket cleanup.
+- Phân tích production: chưa deploy binary; cần rebuild + restart production 4001 để auto-xả 2 tin kẹt (hoặc force-send lại sau khi deploy).
+
+## v7.0.52 (2026-09-07)
+
+### Fix Queue Tích Lũy Không Tự Spawn Khi Agent Về Idle (Bug User Báo)
+
+**Root cause**: Backend user queue chỉ xả khi có các trigger rời rạc gọi `processNextBackendUserQueue` (dispatchUserChat L4828, deliverTalk finally L3872, drainDispatchState L1475). Các chuyển trạng thái "đáng lẽ về idle" sau đây KHÔNG kích hoạt drain → queue kẹt vĩnh viễn, khớp đúng hiện tượng "mess tích lũy nhưng không spawn tiến trình mới":
+- **Zombie-working rescue (`src/routes/chat.ts`)**: reset `status='working'` → `'idle'` nhưng KHÔNG gọi `processNextBackendUserQueue`. Khi queue đã có sẵn tin, mọi message mới tiếp tục bị queue (`hasPendingQueue=true`) mà không bao giờ được xả.
+- **Error path (`src/routes/chat.ts`)**: khi turn chết với lỗi thường, status set `'error'` và chỉ drain nếu `status==='idle'` → queue vĩnh viễn kẹt ở trạng thái error.
+- **Không có periodic sweep**: các trigger xả queue đều event-driven; bất kỳ transition nào bị bỏ lỡ → kẹt vĩnh viễn.
+
+**Fixes**:
+1. **`src/queue/user-queue.ts`** — `processNext`:
+   - Khi `isAgentBusy` true: **hẹn retry sau 3s** (dedup bằng `retryTimers[targetId]`, `unref()`) thay vì bỏ queue. Agent về idle bất kỳ lúc nào → tự xả trong 3s.
+   - **Chống mất tin khi dispatch thất bại**: nếu `dispatchUserChat`/`deliverTalk` throw, re-enqueue + re-persist (`saveUnprocessedMessage`) tin đã bị shift ra thay vì nuốt mất.
+2. **`src/routes/chat.ts`**:
+   - Sau zombie-rescue: gọi `deps.processNextBackendUserQueue?.(targetIdKey)` để xả ngay queue tồn đọng.
+   - Nhánh busy-branch sau khi queue message: thêm `deps.processNextBackendUserQueue?.(targetIdKey)` (no-op khi bận thật, tự xả khi zombie/error).
+3. **`src/server.ts`** — **Backend Queue Drain Watchdog**: timer 10s quét mọi queue non-empty, gọi `processNextBackendUserQueue` cho các target không busy (safety net chống kẹt vĩnh viễn kể cả khi mọi trigger rời rạc bị bỏ lỡ). Bật sau boot Bước 5, clear trong `gracefulShutdown`.
+- API `ChatRouteDeps` giữ nguyên; UserQueueOptions bổ sung `saveUnprocessedMessage` (wire `storage.saveUnprocessedMessage` trong server.ts).
+
+**Verify thực tế**:
+- `npx tsc --noEmit` exit 0; `npm run build:exe` exit 0 (tsc + vite + SEA).
+- Smoke test binary v7.0.52 trên sandbox (port 4002, data copy riêng): boot clean, HTTP 200, `version=7.0.52`, 18 agents restore, **6 tin unprocessed của coder-core được restore đúng**; `isAgentBusy` gate chạy đúng (session thật đang chạy ở production → queue chờ không double-spawn). Không spawn con trùng lặp.
+- Production 4001 (v7.0.51, PID 16748) giữ nguyên — chưa deploy 7.0.52.
+
+## v7.0.51 (2026-09-07)
+
+### Fix HTTP/JSON Stream Mode Tương Thích + Rebuild Binary
+- **Fix `runHttp` model format (`src/agents/opencode-serve-client.ts`)**:
+  - **Root cause**: HTTP mode gửi `model` dạng **string** (`"9router/1"`), nhưng OpenCode Serve API yêu cầu object `{ providerID, modelID }` → trả **HTTP 400**. Verify thực tế: `POST /session/{id}/message` với `model` string → 400 (validation), với `model` object → 200/500. Provider `9router` có đúng 1 model tên `"1"` → model config `9router/1` hợp lệ, chỉ cần map đúng object.
+  - **Fix**: tách `"provider/model"` → `{ providerID, modelID }`; fallback default model như attach mode; không gửi model nếu rỗng để Serve tự chọn.
+  - **Parse đầy đủ part trả về**: không chỉ `text` — thêm `thinking/reasoning/thought` và `tool_use/tool_call` vào `MessagePart[]` (đồng bộ với attach).
+  - **Error handling**: bọc `sendHttpMessage` throw với message rõ ràng hơn thay vì nuốt.
+- **Audit HTTP/JSON Stream tương thích**: xác nhận từ OpenCode Serve 1.18.25 thực tế:
+  - `POST /session` tạo session: OK
+  - `POST /session/{id}/message` với `{parts, model:{providerID,modelID}}`: hợp lệ
+  - Các feature còn ADAP: chưa dùng SSE `/event` realtime (chỉ blocking POST), chưa map agent id, `getSessionStats` chưa lấy token/context từ HTTP.
+- **Rebuild v7.0.51**: Bump `package.json` (root + web) → `7.0.51`, `APP_VERSION` → `7.0.51` (`src/server.ts`), đóng gói `release/agentforge-web-v7.0.51.exe` + `release/agentforge-web.exe` (106,189,824 bytes). Smoke test: server listen port 4511, root HTTP 200, boot sequence/18 agents/7681 messages restore chạy sạch; production 4001 (PID 4352) giữ nguyên.
+
+## v7.0.50 (2026-09-07)
+
+### Fix Root Cause Spawn Không Hoạt Động Ở Attach Mode + Mặc Định Attach/Agent/Task
+- **Fix Spawn & Toàn Bộ Command Trong Attach Mode (`src/agents/opencode-serve-client.ts`)**:
+  - **Root cause**: `parseJsonlEvents` (dùng bởi attach client `runAttachCli`) chỉ đọc `ev.text`, nhưng OpenCode Serve trả event JSON dạng `{type:'text', part:{..., text}}` — text nằm trong **`ev.part.text`**. Hệ quả `content` luôn RỖNG → orchestrator response rỗng → `parseSpawnTags('')` không bao giờ thấy `<spawn>` → **agent không được spawn**, mọi `<talk>/<task>` và text response cũng mất.
+  - **Fix**: đọc từ `ev.part` trước rồi fallback `ev.text` (đồng bộ với ACPClient):
+    - `text`/`assistant`: `ev.part?.text ?? ev.text ?? ev.message ?? ev.content`
+    - `thinking`/`reasoning`/`thought`: `ev.part?.text ?? ev.text ?? ev.part?.thinking ?? ev.thinking`
+    - `tool_use`/`tool_call`: đọc từ `ev.part.state.*`/`ev.part.*`
+    - `tokenUsage`: `ev.part?.tokens ?? ev.part?.usage ?? ev.tokens ?? ev.usage` (bắt `step_finish.part.tokens`)
+  - Verify: replica test old logic `content=[] len=0` → new logic `content="<spawn .../>"` + đúng thinking/toolCalls/tokenUsage; `tsc --noEmit` exit 0.
+- **Mặc Định Engine Mode = Attach (`src/server.ts`, `src/routes/settings.ts`)**:
+  - Thêm `DEFAULT_ENGINE_MODE = 'attach'`; tất cả `getSetting('engineMode', 'run')` → `'attach'`; fallback `validMode` → `'attach'`. App mới khởi động mặc định dùng OpenCode Serve attach.
+- **Mặc Định Max Agent = 6 / Max Task = 5 (`src/storage/types.ts`, `src/relay/team-isolation.ts`)**:
+  - `DEFAULT_TEAM_SETTINGS.taskLimit: 6 → 5`; `MAX_AGENT_TASKS: 6 → 5`; `maxTeamSize: 7` (6 worker + 1 orchestrator) giữ nguyên.
+  - Áp dụng live cho team default trên server đang chạy: `taskLimit=5`, `maxTeamSize=7`, `roleLimits[*].taskLimit=5` (qua `PUT /api/teams/default/settings`).
+- **Fix Mất Tin Nhắn Khi Agent Về Idle (`web/src/App.tsx`)**:
+  - **Root cause**: handler `chat:message` khi tin canonical của agent KHÔNG merge được vào stream bubble (do `chat:done`/`agent:updated(idle)` đã xoá `streamRef` trước đó) thì **DROP thẳng `return`** → tool/content hiển thị lúc working rồi "biến mất" khi idle.
+  - **Fix**: thêm vòng merge cuối vào stream bubble còn lại trong `allMessages` (kể cả bubble đã `isStreaming:false`); không còn bubble nào thì **fall through** xuống logic add-dedup chung — KHÔNG BAO GIỜ làm rơi mất tin cuối của agent.
+- **Rebuild**: Bump `package.json` (root + web) `7.0.49 → 7.0.50`, đóng gói `release/agentforge-web-v7.0.50.exe` + `release/agentforge-web.exe` (106,187,264 bytes).
+
+## v7.0.49 (2026-09-06)
+
+### UI Engine Mode & Xác Nhận Attach Mode Vận Hành Chuẩn
+- **UI Engine Mode (`web/src/components/ModelSettingsDialog.tsx`)**:
+  - Di chuyển section "Chế độ thực thi (Engine Mode)" lên ĐẦU dialog, luôn hiển thị trước loading spinner (không bị ẩn khi đang fetch models).
+  - 3 radio buttons: `run` / `attach` / `http`; ô nhập `opencodeServeUrl` hiển thị khi chọn attach/http; gửi song song với model settings khi lưu.
+- **Xác Nhận Thực Nghiệm Attach Mode (`src/agents/opencode-serve-client.ts`)**:
+  - Reproduce và xác nhận lệnh `opencode run --attach <serverUrl> --dir <projectDir> --auto --format json --agent <role> --model <model> --thinking` (L436-439) hoạt động chuẩn xác trên OpenCode Serve 1.18.25 (port 4096).
+  - Xác nhận model `opencode/big-pickle` & `9router/1` chạy qua attach thành công; `anthropic/claude-sonnet-4-20250514` gây `UnknownError` do không tồn tại trên Serve (không phải lỗi code).
+- **Đóng Gói Binary v7.0.49**:
+  - Bump version `7.0.48` → `7.0.49` trong package.json (backend + web), rebuild & đóng gói SEA single executable.
+
+## v7.0.48 (2026-09-06)
+
+### Bổ Sung Cờ engineMode (run / attach / http) và Đấu Nối Dispatch
+- **Settings Engine Mode (`src/routes/settings.ts`)**:
+  - `GET /api/settings` & `GET /api/settings/engineMode`: Trả về `engineMode` (`run` | `attach` | `http`), `opencodeServeUrl`, `serveUrl`.
+  - `POST /api/settings` & `POST /api/settings/engineMode`: Nhận và lưu cấu hình engine mode, dọn dẹp cache client (`deps.clients.clear()`), broadcast `settings:updated`.
+- **Factory Dispatch (`src/server.ts`)**:
+  - Thêm `createAgentClient(config: AgentConfig)`:
+    + Khi `engineMode === 'attach'` hoặc `'http'`: Tạo instance `OpenCodeServeClient` với mode tương ứng.
+    + Khi `engineMode === 'run'` (mặc định): Tạo instance `ACPClient` (giữ nguyên vẹn 100%).
+  - Áp dụng cho toàn bộ hàm quản lý agent: `getClient`, `getOrchClient`, `deleteAgent`, `syncSessionTitle`, `cleanupZombieProcesses`.
+- **UI Settings Dialog (`web/src/components/ModelSettingsDialog.tsx`)**:
+  - 3 lựa chọn Radio: `opencode run`, `opencode attach`, `http stream`.
+  - Ô nhập URL `opencode serve` (`http://127.0.0.1:4096`) khi chọn `attach` hoặc `http`.
+- **Sửa Lỗi UI Render Tin Nhắn Đúp (`web/src/App.tsx`)**:
+  - Xóa logic lỗi `if (prev.length === 0) return data.slice(-MAX_DISPLAY_MESSAGES);` trong `fetchHistory`, giữ nguyên merge logic thông minh và giảm `MAX_DISPLAY_MESSAGES` xuống 200.
+- **Đóng Gói Binary v7.0.48**:
+  - Bump version từ `7.0.47` lên `7.0.48` trong package.json (backend + web).
+
+## v7.0.47 (2026-09-06)
+
+### Kiến Trúc Routing Early-First, Final-As-Fallback & Thuần Túy Windows Kernel Job Object
+- **Kiến Trúc Early-First với Final-As-Fallback (`src/server.ts`)**:
+  - `scanStreamForDispatch` ưu tiên phát hiện thẻ `<talk>` đóng hoàn chỉnh ngay trong luồng token stream.
+  - Khi Target bận (`isTargetBusy: true`): Đánh dấu `isQueued: true`, lưu storage, đưa vào queue nội bộ (`pendingOrchTriggers` / `backendUserQueues`), tuyệt đối không broadcast `chat:message` ra UI timeline khi đang bận.
+  - Khi Target rảnh (`isTargetBusy: false`): Đánh dấu `isQueued: false`, lưu storage, broadcast `chat:message` ra timeline tức thì và dispatch ngay lập tức.
+  - Final Pass (`handleAgentResponse`) đóng vai trò Fallback: Bỏ qua 100% các tin đã early-dispatched, loại bỏ tận gốc đúp bubble.
+- **Thuần Túy Windows Kernel Job Object — Hủy Bỏ Toàn Bộ Watchdog Polling (`src/process/job-object.ts`, `scripts/bin/`)**:
+  - Loại bỏ hoàn toàn PowerShell background watchdog loop polling.
+  - Khởi tạo Job Object `AgentForge_ChildJob_<parentPid>` với cờ `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000`.
+  - Toàn bộ tiến trình con (`powershell.exe`, `opencode.exe`, `opencode serve`) tự động được gán vào Job Object qua `assignProcessToJob`.
+  - Khi app cha bị tắt đột ngột, Windows Kernel tự động quét sạch và tiêu diệt lập tức toàn bộ cây tiến trình con `opencode`.
+- **Tự Động Xả Queue & Respawn Đúng Chu Trình**:
+  - Xả queue tuần tự khi target rảnh hoàn toàn, gán timestamp mới tại thời điểm respawn chính thức.
+- **Khắc Phục Lỗi Xả Hàng Đợi Khởi Động (BootSequence Step 5 & UserQueueManager)**:
+  - Sửa lỗi bypass `dispatchUserChat` trong `src/queue/user-queue.ts` do early return khi `targetId === 'orchestrator'`, đảm bảo toàn bộ tin nhắn khôi phục từ đĩa được gộp và kích hoạt ngay tiến trình `opencode`.
+  - Bổ sung fallback `findExistingOrchestrator()` trong `isAgentBusy` tại `src/server.ts`.
+- **Đóng Gói Binary v7.0.47**:
+  - Đóng gói single binary executable `release/agentforge-web.exe` thông qua Node SEA và postject blob injection.
+
+## v7.0.45 (2026-09-06)
+
+### Giao Diện Căn Lề Trái Tối Giản, Stream Persistence & Chu Trình Xả Queue 1 Sợi Chỉ Tuần Tự
+- **Giao Diện Trực Quan & Căn Lề Trái Đồng Nhất (`web/src/components/ChatPanel.tsx`)**:
+  - Căn lề trái toàn bộ các tin nhắn, giao diện thẻ giao việc mịn tối giản nền đen `#0d111a`.
+  - Triệt tiêu hoàn toàn duplicate tin nhắn User bằng cơ chế lọc 3 lớp.
+- **Chu Trình Xả Queue & Gán Timestamp Respawn (`src/server.ts`)**:
+  - Chỉ xả queue khi tiến trình cũ của Agent đã đóng hoàn toàn (`!client.isBusy()` và `agent.status !== 'working'`).
+  - Gán timestamp tại chính xác thời điểm respawn lượt mới (`Date.now()`), sau đó mới ghi vào DB và broadcast ra UI timeline.
+- **Stream Persistence & Gỡ Bỏ Task Limit Đối Với User (`src/routes/chat.ts`, `src/server.ts`, `src/storage/message-storage.ts`)**:
+  - Gỡ bỏ hoàn toàn kiểm tra task limit đối với tin nhắn người dùng.
+  - Tức thời lưu tin nhắn user và cập nhật live stream xuống database.
+- **Đóng Gói Binary v7.0.45**:
+  - Đóng gói single binary executable `release/agentforge-web-v7.0.45.exe` và `release/agentforge-web.exe` (>106MB).
+
+## v7.0.44 (2026-09-06)
+
+### Khắc Phục Lỗi TypeScript TS2367, Hoàn Thiện Cơ Chế Xử Lý Task & Đóng Gói Binary v7.0.44
+- **Sửa Lỗi Type Narrowing TS2367 (`src/server.ts`)**:
+  - Khắc phục triệt để lỗi so sánh dead code tại dòng 2722 trong `src/server.ts`, thay thế bằng `newStatus === 'completed' || newStatus === 'idle'`, đạt 0 lỗi biên dịch `tsc --noEmit`.
+- **Triệt Tiêu Hoàn Toàn Final Pass Broadcast & Stream-First Directives**:
+  - Directives `<talk>`, `<task_update>`, `<spawn>` được bắt và thực thi tức thời trong luồng live stream (`scanStreamForDispatch`).
+  - Xóa bỏ hoàn toàn lệnh `broadcast('chat:message')` ở cuối turn trong `handleOrchestratorResponse` và `handleAgentResponse`, triệt tiêu duplicate talk card.
+- **Tự Động Reset Agent Idle & Xả Hàng Đợi Sau Khi Boot (`src/server.ts`)**:
+  - Chuẩn hóa 100% agent về `idle` khi khởi động (`loadState` & Bước 3 Boot Sequence), tự động xả queue trong Bước 5.
+- **Đóng Gói Binary Thực Thi Độc Lập**:
+  - Đóng gói single binary executable `release/agentforge-web-v7.0.44.exe` và `release/agentforge-web.exe` thông qua Node SEA và postject blob injection (>100MB).
+
+## v7.0.43 (2026-09-06)
+
+### Khử Triệt Để Double User Message, Render Stream Thẻ Talk, Xóa Bỏ Broadcast Cuối Turn & Chặn Nhảy Cóc Task
+- **Xóa Bỏ Hoàn Toàn Broadcast Cuối Turn & Mở Khóa Stream Toàn Diện (`src/server.ts`)**:
+  - Loại bỏ hoàn toàn `broadcast('chat:message')` ở cuối turn trong `handleOrchestratorResponse` và `handleAgentResponse`, triệt tiêu bóng chat thứ hai trùng lặp.
+  - Bỏ chặn `<talk target="orchestrator">` trong stream: Worker báo cáo về Orchestrator được phân tích, lưu DB và kích hoạt `triggerOrchestrator` tức thì trong luồng live stream.
+  - Thực thi tức thời các lệnh `<task_update>` ngay trong stream.
+- **Tự Động Reset 100% Agent về Idle & Xả Hàng Đợi Khi Boot (`src/server.ts`)**:
+  - Khắc phục gốc rễ đóng băng hàng đợi: Reset 100% Agent về `idle` khi khởi động (`loadState` & Bước 3), tự động kích hoạt `processNextBackendUserQueue` trong Bước 5 của Boot Sequence mà không cần bấm nút STOP thủ công.
+- **Khử Triệt Để Double User Message (`web/src/components/ChatPanel.tsx`, `web/src/App.tsx`)**:
+  - Áp dụng logic `hasPriorUserMsg = visibleMessages.slice(0, idx).some(...)` loại bỏ hoàn toàn hiện tượng hiển thị trùng lặp tin nhắn người dùng.
+  - Tối ưu `fetchHistory()` thay thế in-place tin tạm `temp-` bằng ID chuẩn canonical từ server.
+- **Khắc Phục Ngâm Thẻ Talk & Stream-First Live Render (`src/server.ts`)**:
+  - Tối ưu `scanStreamForDispatch`: Bắt và render tức thì `UnifiedDirectiveCard` ngay khi thẻ `<talk>` vừa trọn vẹn trong luồng stream, cập nhật trạng thái agent nhận thành `working` và phát `broadcast('chat:message')` tức thì.
+- **Chặn Nhảy Cóc Task `pending` $\rightarrow$ `completed` & Ràng Buộc Tuần Tự (`src/storage/agent-storage.ts`, `src/server.ts`)**:
+  - Chặn đứng hành vi đóng task khi chưa qua trạng thái `working`, phản hồi thông báo lỗi `[TASK_UPDATE_REJECTED]` trực tiếp vào context của agent.
+  - Ràng buộc hoàn thành tuần tự từ task 1 đến N-1.
+- **Cấu Trúc Parts Tuần Tự Xen Kẽ (`src/agents/acp-client.ts`, `src/agents/types.ts`, `src/server.ts`)**:
+  - Interface `MessagePart` chuẩn gồm thinking, text, tool và lưu cấu trúc `parts` bền vững vào DB.
+- **Khử Lag Bàn Phím 60 FPS & Căn Lề Bất Biến (`web/src/components/ChatPanel.tsx`)**:
+  - `ChatInputBar` memoized, gõ phím mượt mà không giật lag. Căn lề trái bất biến cho tin nhắn Agent từ token đầu tiên.
+
+## v7.0.42 (2026-09-06)
+
+### Nâng Cấp Cấu Trúc Parts Tuần Tự, Chặn Nhảy Cóc Task Pending -> Completed & Stream-First Live Talk Render
+- **Cấu Trúc Parts Tuần Tự & Stream-First (`src/agents/acp-client.ts`, `src/agents/types.ts`, `src/server.ts`)**:
+  - Định nghĩa interface `MessagePart` chuẩn gồm `{ type: 'thinking' | 'text' | 'tool', content, tool, input, output, callId }`.
+  - Parse các event OpenCode JSONL tuần tự theo thời gian: gom stream thinking/text, ghép nối output cho tool_result chính xác theo `callId`.
+  - Bỏ gom 1 cục trả về cuối, lưu trữ trường `parts` có cấu trúc vào cơ sở dữ liệu `agentforge-state.json`.
+- **Dung Lỗi (Tolerance) Cho Thẻ `<task_update>` (`src/server.ts`)**:
+  - Tự động nhận diện `targetAgentId = currentSenderAgentId` nếu agent không truyền thuộc tính `agent="..."` hoặc `agent-id="..."`.
+  - Chấp nhận các lệnh dạng `<task_update task="N" status="working|completed" />` của chính worker.
+- **Ràng Buộc Tuần Tự, Chặn Nhảy Cóc & Phản Hồi Lỗi Trực Tiếp Cho Agent (`src/server.ts`, `src/storage/agent-storage.ts`)**:
+  - **Chặn nhảy cóc `pending` $\rightarrow$ `completed`**: Bắt buộc task phải được chuyển sang `working` trước khi đóng task. Nếu task đang ở trạng thái `pending`, hệ thống sẽ từ chối và phản hồi lỗi:
+    `[TASK_UPDATE_REJECTED] Không thể đóng task #N: Task đang ở trạng thái 'pending' (chưa thực hiện). Hãy thực hiện task (chuyển sang 'working') trước khi đóng task này!`
+  - **Ràng buộc hoàn thành tuần tự**: Khi hoàn thành task (`status === 'completed'`), kiểm tra tuần tự từ task 1 đến N-1. Nếu có task trước chưa hoàn tất, chặn lại và gửi thông báo lỗi chuẩn xác:
+    `[TASK_UPDATE_REJECTED] Không thể đóng task #N: Hãy hoàn thành task/job trước (#M) để có thể đóng task này! Quy định: Các task phải được hoàn thành tuần tự từ trước ra sau.`
+  - Gửi thông báo lỗi trực tiếp vào session/context của chính agent qua `deliverTalk` để agent nắm rõ và tự khắc phục.
+- **Stream-First Live Talk Render (`src/server.ts`)**:
+  - Tối ưu `scanStreamForDispatch`: Khi bắt được thẻ `<talk>` trọn vẹn trong luồng stream, hệ thống lập tức cập nhật trạng thái agent nhận thành `working`, lưu trữ `ChatMsg` vào cơ sở dữ liệu và phát `broadcast('chat:message')` hiển thị bong bóng chat ngay lập tức lên UI, triệt tiêu hiện tượng ngâm tin nhắn đến cuối turn.
+
+## v7.0.41 (2026-09-05)
+
+### Triệt Tiêu Bóng Chat Giao Việc Kép 2 Bên & Thay Thế In-Place Tin Nhắn Người Dùng
+- **Triệt Tiêu 2 Bóng Chat Giao Việc 2 Bên (`web/src/components/ChatPanel.tsx`)**:
+  - Áp dụng guard clause cứng `if (isOrchestratorTask) return null;` nhằm loại bỏ bong bóng text trùng lặp của Orchestrator. Mỗi chỉ đạo giao việc chỉ hiển thị duy nhất 1 thẻ `UnifiedDirectiveCard`.
+- **Khử Double User Message Khi Focus/Reload (`web/src/App.tsx`)**:
+  - Tối ưu hàm `fetchHistory()` quét tìm và thay thế in-place tin tạm `temp-` bằng ID chuẩn canonical từ server trong cửa sổ 60s, không append bản sao thứ hai.
+- **Siết Chặt Khởi Động Lại & Quét Dọn Tiến Trình Mồ Côi (`src/storage/engine.ts`, `src/server.ts`)**:
+  - Chuẩn hóa quy trình 5 bước Boot Sequence chuẩn xác:
+    + Bước 1: Dọn zombie processes và child process trees (`cleanupZombieProcesses`).
+    + Bước 2: Load DB + tự động reset bản ghi Outbox `in_flight` $\rightarrow$ `pending` trong `engine.loadStateSync()`.
+    + Bước 3: Chuẩn hóa trạng thái agent về `idle` trước khi nhận việc, dập tắt đóng băng hàng đợi.
+    + Bước 4: Replay outbox theo đúng thứ tự FIFO (`createdAt` ascending).
+    + Bước 5: Xả `backendUserQueues` cho user khi agent đã sẵn sàng.
+  - Tự động quét dọn các tiến trình `opencode.exe` mồ côi khi máy chủ khởi động lại.
+
+## v7.0.40 (2026-09-05)
+
+### Dập Tắt Treo Stream Xoay Xoay, Khử Dup Đa Tầng & Nút Xóa Thật Tin Nhắn Hàng Đợi
+- **Dập Tắt Treo Stream Khi Agent Idle/Completed (`web/src/components/ChatPanel.tsx`)**:
+  - Tích hợp listener tự động quét và tắt trạng thái `isStreaming: false` ngay khi agent chuyển sang `idle` hoặc `completed`.
+- **Khử Dup Đa Tầng User x2 và Agent x3 (`src/server.ts`, `web/src/components/ChatPanel.tsx`)**:
+  - In-memory dedup đa tầng tại client đối soát nội dung chuẩn hóa NFC trong cửa sổ 60s (User) và 15-30s (Agent).
+  - Loại bỏ hoàn toàn việc broadcast bubble talk khi task chưa thực sự được spawn từ hàng chờ.
+- **Queue UI Chuyên Biệt & Nút [X] Xóa Thật Khỏi Backend (`src/routes/agents.ts`, `web/src/components/ChatPanel.tsx`)**:
+  - Hàng đợi tin nhắn chuyên biệt cho User, không hiển thị rác Queue UI cho các Agent con.
+  - Nút [X] xóa thật tin nhắn khỏi hàng chờ `backendUserQueues` ở backend qua API.
+
+## v7.0.39 (2026-09-05)
+
+### Triệt Tiêu Trùng Lặp Tin Nhắn 3 Flow, Phân Quyền Task Status & Thẻ Giao Việc Phẳng Nghệ Thuật
+- **Triệt Tiêu 3 Flow Trùng Lặp Tin Nhắn (`src/server.ts`, `web/src/components/ChatPanel.tsx`)**:
+  - Xóa bỏ việc tạo `talkMsg`/`spawnMsg` ở Final Pass trong `src/server.ts`, chỉ parse và broadcast duy nhất qua live stream scanner.
+  - Xóa stale stream, áp dụng dedup trong vòng 3 giây và khôi phục dedup directive card ở client.
+- **Phân Quyền Task Status Độc Lập**:
+  - Chỉ duy nhất Agent mới có quyền chuyển trạng thái task của chính mình (`pending` $\rightarrow$ `working` $\rightarrow$ `completed`).
+  - Task mới tạo luôn khởi đầu ở `pending`, Orchestrator không can thiệp trực tiếp vào trạng thái nội bộ của Worker.
+- **Thẻ Giao Việc Nghệ Thuật Phẳng (Flat Aesthetic) & Copy Markdown Mọi Bong Bóng**:
+  - Loại bỏ hoàn toàn hiệu ứng 3D đổ bóng nặng. Thẻ Tên đen tuyền `#000000` bo góc thanh thoát `6px - 8px`, Thẻ Task xám tro `#4b5563` phẳng lì.
+  - Tích hợp nút Copy Markdown tinh tế trên tất cả các loại bong bóng chat, thẻ directive và report card.
+
+## v7.0.38 (2026-09-05)
+
+### Cô Lập Tin Nhắn Đa Team (Strict Team Isolation), Giao Diện Directive Card 3 Tầng & Đồng Bộ Peer Orchestrator Parity
+- **Cô Lập Tin Nhắn Đa Team (`web/src/App.tsx`)**:
+  - Khắc phục triệt để lỗi rò rỉ tin nhắn giữa các Team qua cơ chế Strict Team Isolation và Auto Team Resolution.
+- **Unified Directive Card 3 Tầng & Copy Chuẩn Markdown (`web/src/components/ChatPanel.tsx`)**:
+  - Nâng cấp Thẻ Giao Việc Độc Lập chuẩn 3 tầng (Badge đen béo, Title xám, Expanded Content nền trắng tuyền chữ `#0f172a !important`).
+  - Tích hợp nút Copy chuẩn Markdown kèm nhãn thời gian `🕒 [HH:MM:SS]`.
+  - Khử triệt để hiện tượng double-fire phím Enter với cooldown 800ms, chống nuốt chữ dở dang.
+- **Peer Orchestrator Parity & Thừa Hưởng Model 3 Tầng (`src/server.ts`, `src/relay/router.ts`)**:
+  - Đồng bộ 1 cổng duy nhất cho tất cả các Orchestrator (không phân biệt Main/Sub).
+  - Phân cấp thừa hưởng Model 3 tầng từ Main Card (Flash 3.7) và chặn bão broadcast log.
+  - Xóa bỏ hoàn toàn xung đột BootReconcile / AutoResume sau restart.
+
+## v7.0.37 (2026-09-05)
+
+### Tái Cấu Trúc Server-First Messaging, Unified Expandable Directive Card & Live Incremental Streaming
+- **Server-First Messaging & Sequential Queue Drain (`src/server.ts`, `src/relay/router.ts`)**:
+  - Máy chủ là Single Source of Truth cho toàn bộ Message ID và luồng xử lý tin nhắn.
+  - Xả hàng đợi người dùng tuần tự chuẩn xác theo thứ tự thời gian ($t_{\text{xả}} > t_{\text{trả lời}}$).
+  - Tự động reset `workingSince = Date.now()` khi restart/crash và áp dụng chặt chẽ ràng buộc Task Sequence tuần tự.
+- **Unified Expandable Directive Card & Live Incremental Streaming (`web/src/components/ChatPanel.tsx`)**:
+  - Hợp nhất thành 1 thẻ directive duy nhất với badge tên agent nền tối, tiêu đề task nền xám và khối `<details>` mở rộng/thu gọn Markdown body.
+  - Hiển thị trực tiếp (Live Incremental Directive Streaming): có thẻ directive nào render ngay thẻ đó theo thời gian thực mà không cần đợi kết thúc stream.
+- **Chặn Triệt Để Double-Fire Enter & Duplicate User Message**:
+  - Áp dụng `lastSendTimeRef` cooldown 400ms khi nhấn Enter trong `ChatPanel.tsx` và cơ chế `applyOacDedup` theo bucket thời gian.
+
+## v7.0.36 (2026-09-05)
+
+### Triệt Tiêu Trùng Lặp Tin Nhắn Người Dùng (Deduplicate User Message)
+- **Xử Lý Duplicate User Message (`web/src/components/ChatPanel.tsx`)**:
+  - Khắc phục hoàn toàn tình trạng xuất hiện đồng thời tin nhắn optimistic và tin nhắn broadcast từ server.
+  - Khử trùng lặp chuẩn xác bằng cách so khớp nội dung và thời gian, bảo đảm mỗi tin nhắn người dùng chỉ xuất hiện duy nhất 1 lần trên timeline chat.
+
+## v7.0.35 (2026-09-05)
+
+### Tối Ưu Tốc Độ Giao Diện & Đồng Bộ Kiến Trúc
+- **Tối Ưu Giao Diện & Live Update**:
+  - Hoàn thiện luồng streaming tương tác mượt mà, phản hồi WebSocket tức thời.
+  - Tối ưu hóa render timeline tin nhắn và quản lý trạng thái agent.
+
+## v7.0.34 (2026-09-05)
+
+### Zero-Buffering Streaming Cho Main Orchestrator
+- **Phát Token Trực Tiếp Thời Gian Thực (`src/server.ts`)**:
+  - Gỡ bỏ hoàn toàn bộ đệm che chắn directive `streamMaskingBuf`, chuyển sang cơ chế zero-buffering streaming 100%.
+  - Từng token text, thinking và tool delta sinh ra từ model của Main Orchestrator được đẩy tức thời xuống client UI qua WebSocket ngay tại thời điểm nhận được.
+  - Loại bỏ triệt để độ trễ chờ đợi dồn chuỗi văn bản, mang lại trải nghiệm streaming mượt mà như OpenCode gốc.
+
+## v7.0.33 (2026-09-05)
+
+### Khắc Phục Zombie Working Khi Restart, Live Stream Realtime Token & Sắp Xếp Queue Timeline
+- **Xử Lý Zombie Working Khi Restart (`src/server.ts`)**:
+  - Tự động chuyển toàn bộ agent và task đang ở trạng thái `working` thành `pending` khi server khởi động lại mà không bật `autoContinue`.
+  - Loại bỏ hoàn toàn tình trạng agent bị treo trạng thái `working` vô hạn sau khi khởi động app.
+- **Live Streaming Realtime Token Cho UI Main Orchestrator (`src/server.ts`, `web/src/components/ChatPanel.tsx`)**:
+  - Chuẩn hóa và phát sự kiện stream realtime cho mọi token của Main Orchestrator ngay khi nhận được, không còn tình trạng đợi dồn toàn bộ chuỗi mới hiển thị.
+- **Sắp Xếp Timeline Hàng Đợi (Queue Ordering) Chuẩn Xác**:
+  - Đảm bảo thứ tự hiển thị bong bóng tin nhắn và hàng đợi pending trên ChatPanel tuân thủ chặt chẽ timestamp thời gian thực.
+
+## v7.0.32 (2026-09-05)
+
+### Đồng Bộ Auto-Continue Khi Khởi Động Lại & Tách Biệt Card Talk / Spawn Kèm Body Đầy Đủ
+- **Auto-Continue & Auto-Resume Lifecycle (`src/server.ts`, `src/storage/engine.ts`)**:
+  - Khi tắt chế độ `autoContinue`, toàn bộ task `working` của cả Orchestrator và Worker được tự động chuyển thành `pending`.
+  - Cơ chế `autoResumeWorkingAgents` chỉ dispatch khi agent không có hàng đợi pending chờ sẵn, loại bỏ loop trùng lặp tín hiệu resume.
+  - Loại bỏ hoàn toàn tàn dư bảng `[TEAM]` markdown lỗi thời khi serialize state.
+- **Directive Card & Full Body Markdown (`web/src/components/ChatPanel.tsx`)**:
+  - Tách biệt rõ ràng thẻ Talk Directive và Spawn Directive (icon, tiêu đề, layout).
+  - Khắc phục triệt để lỗi nuốt Markdown body trong thẻ Talk, cho phép xem toàn bộ nội dung chỉ đạo mà không bị xén.
+  - Tối ưu hóa phản hồi nút bấm Force-Send tức thì.
+
+## v7.0.31 (2026-09-05)
+
+### Cập Nhật Giới Hạn Đội Hình (6 Worker + 1 Main Orchestrator) & Tối Ưu Realtime Stream UI
+- **Team Size Limit (`src/storage/types.ts`, `src/relay/team-isolation.ts`, `src/prompts/orchestrator.md`)**:
+  - Chuẩn hóa giới hạn đội hình team: tối đa 6 worker active không kể Main Orchestrator (tổng tối đa 7 thành viên trong một team).
+  - Đồng bộ quy tắc kiểm soát và phản hồi hướng dẫn tái sử dụng trong prompt Orchestrator.
+- **Optimistic UI $t=0ms$ & Atomic Queue Drain (`web/src/components/ChatPanel.tsx`, `web/src/App.tsx`)**:
+  - Hiển thị tức thời bubble tin nhắn người dùng ngay khi bấm gửi ($t=0ms$) với trạng thái queued đồng bộ.
+  - Khắc phục triệt để hiện tượng mất bong bóng queue quá sớm bằng cơ chế chuyển đổi atomic 300ms.
+- **Stream Interleaved Parts & Directive Card Hợp Nhất**:
+  - Khôi phục cơ chế render xen kẽ `parts` (text, tool call, thinking) trong luồng stream realtime.
+  - Hợp nhất directive card giao tiếp `<talk>` và bong bóng phản hồi thành một thẻ thống nhất, loại bỏ lỗi hiển thị nhầm icon/thẻ spawn.
+
+## v7.0.30 (2026-09-05)
+
+### Giới Hạn Độ Dài Tiêu Đề Task 30 Từ & Hot Reload Trực Tuyến Quota/Model
+- **Task Length Limit 30 Từ (`src/server.ts`, `src/relay/router.ts`)**:
+  - Chuẩn hóa giới hạn độ dài task giao việc tối đa 30 từ, tự động cắt tỉa gọn gàng kèm cảnh báo phản hồi nếu vượt quá giới hạn.
+- **Hot Reload Trực Tuyến Quota & Cấu Hình Model**:
+  - Hỗ trợ hot reload live tức thời cho các thiết lập quota giới hạn role, kích thước team và cấu hình model mà không cần khởi động lại máy chủ.
+
+## v7.0.29 (2026-09-05)
+
+### Triệt Để Xóa Fallback TeamId & Cơ Chế Lỗi TEAM_ORCH_NOT_FOUND
+- **Backend (`src/server.ts`, `src/storage/team-resolver.ts`)**:
+  - Loại bỏ hoàn toàn việc bịa ID `team-${row.id.slice(-8)}` và gán fallback `return 'default'` tùy tiện khi giải quyết `teamId`.
+  - `team-resolver.ts` ném lỗi chuẩn mực `TEAM_ORCH_NOT_FOUND` khi không xác định được team context của tin nhắn.
+  - `getAgentTeamId` ném lỗi `TEAM_ORCH_NOT_FOUND` nếu agentId không tồn tại hoặc agent không có `teamId` hợp lệ.
+  - Bắt lỗi `TEAM_ORCH_NOT_FOUND` trong luồng xử lý OAC Stream, tự động tạo và phát broadcast bong bóng `chat:message` `msgType: 'error'` lên UI, đồng thời gửi `deliverTalk` phản hồi về `issuerAgent`.
+  - `findAgentByIdNameOrRole` so khớp chính xác `agent.teamId === preferredTeamId` thay vì fallback `default`.
+
+### Task Lifecycle: Xóa Ngay Lập Tức Task Completed
+- **`src/server.ts` & `src/storage/agent-storage.ts`**:
+  - `countRealTasks` loại bỏ task đã completed, chỉ đếm task active đang thực thi.
+  - `<task_update>` khi chuyển sang trạng thái `completed` sẽ xóa bỏ ngay lập tức task khỏi danh sách `agent.tasks`, tự động re-index lại 1..N và chuyển status agent sang `idle` khi hết task.
+
+### Frontend (`web/src/components/Dashboard.tsx` & `web/src/components/TeamSettingsDialog.tsx`)**:
+  - `Dashboard.tsx`: Bỏ toàn bộ chuỗi cắt `slice(-8)` khi tính toán `orchTeamId` và `orphanTeams`.
+  - `TeamSettingsDialog.tsx`: Thiết kế độc lập theo từng team, loại bỏ cảnh báo vàng, cho phép linh hoạt cấu hình per-team.
+
 ## v7.0.22 (2026-09-05)
 
 ### Multi-Team Isolation: Triệt Để Khắc Phục Rò Rỉ Tin Nhắn Giữa Các Team (5 Chains)

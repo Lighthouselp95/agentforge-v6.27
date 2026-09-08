@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { ACPClient } from './acp-client.js';
-import type { TokenUsage } from './types.js';
+import type { MessagePart, TokenUsage } from './types.js';
 import { storage } from '../storage.js';
 import { WORKER_FORMAT_BLOCK } from '../prompts/prompt-service.js';
 import { cleanTargetIdentifier, INVALID_TARGET_PLACEHOLDERS } from '../parser/string-utils.js';
@@ -9,7 +9,7 @@ import { checkRoleLimit, getRoleLimit } from './role-limits.js';
 export interface AgentTask {
   id: string;
   task: string;
-  status: 'pending' | 'working' | 'completed';
+  status: 'pending' | 'working' | 'completed' | 'cancelled';
   createdAt: number;
   completedAt?: number;
 }
@@ -41,6 +41,7 @@ export interface ChatMsg {
   content: string;
   task?: string;
   timestamp: number;
+  sourceCreatedAt?: number;
   agentName?: string;
   agentRole?: string;
   teamId?: string;
@@ -49,7 +50,8 @@ export interface ChatMsg {
   toolCalls?: Array<{ tool: string; input?: string; output?: string }>;
   thinking?: string;
   allowThinking?: boolean;
-  parts?: Array<{ type: 'text' | 'tool'; content?: string; tool?: string; input?: any; output?: any }>;
+  parts?: MessagePart[];
+  isQueued?: boolean;
 }
 
 export class AgentManager {

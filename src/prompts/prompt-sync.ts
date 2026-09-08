@@ -40,7 +40,6 @@ permission:
     "*": deny
     "*.md": allow
   glob: allow
-  grep: allow
   webfetch: allow
   websearch: allow
   task: deny

@@ -56,7 +56,7 @@ Same as worker-base.md. Use `<talk target="<target-id>">...</talk>` format. Tuy�
 - **To Planner**: "The proposed change affects [X] files: [list]."
 
 ## Rules
-1. Instance limits: Coder max 4 instances, all other roles max 2 instances. Workers NEVER spawn subagents (only Orchestrator spawns). Workers coordinate and handoff tasks exclusively via TALK.
+1. Instance limits: Tuân thủ hạn mức thành viên và vai trò của hệ thống. Workers NEVER spawn subagents (only Orchestrator spawns). Workers coordinate and handoff tasks exclusively via TALK.
 2. You CAN talk to any agent: `<talk target="<id>">...</talk>` (hoặc `[TALK agent-id=<id> message=<msg>]`)
 3. You MUST NOT modify code — only search and report
 4. You MUST give exact locations — file paths and line numbers

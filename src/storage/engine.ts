@@ -1,6 +1,8 @@
 import { existsSync, statSync, readFileSync, copyFileSync } from 'fs';
 import { STATE_FILE, BAK_FILE, MAX_PERSISTED_MESSAGES, MAX_LOGS_ENTRIES } from './constants.js';
 import { atomicWriteFile } from './file-utils.js';
+import { chatWAL } from './chat-wal.js';
+import type { ChatMessage } from './chat-wal.js';
 import type { StorageSchema, OutboxReport, ChatQueueItem, SystemLogEntry } from './types.js';
 
 export class StorageEngine {
@@ -93,13 +95,37 @@ export class StorageEngine {
           if (a.status === 'working' && !autoContinue) {
             a.status = 'idle';
             a.workingSince = undefined;
+            if (Array.isArray(a.tasks)) {
+              for (const t of a.tasks) {
+                if (t && t.status === 'working') t.status = 'pending';
+              }
+            }
+          } else if (a.status === 'working' && autoContinue) {
+            a.workingSince = Date.now();
           }
           this.inMemoryAgents.set(a.id, a);
         }
       }
-      this.inMemoryHistory = loadedState.history;
+      this.inMemoryHistory = Array.isArray(loadedState.history) ? loadedState.history : [];
+      // Hydrate inMemoryHistory từ ChatWAL — chạy 1 lần duy nhất (hydrateOnce()),
+      // tránh lặp lại "Hydrated N messages" ~20 lần lúc boot khi loadStateFromDisk được gọi nhiều lần.
+      const walMessages = chatWAL.hydrateOnce();
+      if (walMessages.length > 0) {
+        const map = new Map<string, any>();
+        for (const m of this.inMemoryHistory) { if (m && m.id) map.set(m.id, m); }
+        for (const m of walMessages) { if (m && m.id) map.set(m.id, m); }
+        this.inMemoryHistory = Array.from(map.values());
+      } else if (this.inMemoryHistory.length > 0 && !chatWAL.isHydrated()) {
+        // Migration: state.json có history nhưng chat.jsonl chưa tồn tại -> dump sang WAL
+        chatWAL.rewriteAll(this.inMemoryHistory);
+      }
       this.inMemorySettings = loadedSettings;
-      this.inMemoryOutbox = loadedState.outbox || [];
+      this.inMemoryOutbox = (loadedState.outbox || []).map((r: any) => {
+        if (r.status === 'in_flight') {
+          return { ...r, status: 'pending', inFlightSince: undefined };
+        }
+        return r;
+      });
       this.inMemoryChatQueue = (loadedState as any).chatQueue || [];
       this.inMemoryUnprocessedUserMessages = (loadedState as any).unprocessedUserMessages || {};
       this.inMemoryLogs = (loadedState as any).logs || [];
@@ -124,11 +150,20 @@ export class StorageEngine {
     try {
       const data: StorageSchema = {
         agents: Array.from(this.inMemoryAgents.values()),
-        history: Number.isFinite(MAX_PERSISTED_MESSAGES) ? this.inMemoryHistory.slice(-MAX_PERSISTED_MESSAGES) : this.inMemoryHistory,
+        history: [], // Tách lịch sử chat sang data/chat.jsonl (Append-Only WAL), giải phóng state.json
         settings: this.inMemorySettings,
         outbox: this.inMemoryOutbox.slice(-500),
         chatQueue: this.inMemoryChatQueue.slice(-200),
-        unprocessedUserMessages: this.inMemoryUnprocessedUserMessages,
+        unprocessedUserMessages: (() => {
+          const clean: Record<string, string[]> = {};
+          for (const [k, v] of Object.entries(this.inMemoryUnprocessedUserMessages || {})) {
+            if (Array.isArray(v)) {
+              const valid = v.filter(m => typeof m === 'string' && m.trim() && !m.trim().startsWith('[TEAM]') && !m.includes('Your ID:'));
+              if (valid.length > 0) clean[k] = valid;
+            }
+          }
+          return clean;
+        })(),
         logs: this.inMemoryLogs.slice(-MAX_LOGS_ENTRIES)
       };
       const content = JSON.stringify(data, null, 2);
@@ -184,9 +219,17 @@ export class StorageEngine {
   }
 
   private registerProcessHooks(): void {
+    // Guard MODULE-LEVEL (không phải per-instance): dù StorageEngine được khởi tạo lại
+    // bao nhiêu lần, mỗi signal CHỈ đăng ký 1 listener duy nhất → hết MaxListenersExceededWarning.
+    if (engineProcessHooksRegistered) return;
+    engineProcessHooksRegistered = true;
     process.on('beforeExit', () => this.flushSync());
     process.on('exit', () => this.flushSync());
     process.on('SIGINT', () => this.flushSync());
     process.on('SIGTERM', () => this.flushSync());
   }
 }
+
+// Module-level flag: bảo đảm chỉ đăng ký hooks 1 lần cho TOÀN BỘ tiến trình,
+// bất kể có bao nhiêu instance StorageEngine được tạo ra trong vòng đời.
+let engineProcessHooksRegistered = false;

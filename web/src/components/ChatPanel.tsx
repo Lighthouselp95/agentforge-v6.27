@@ -1,5 +1,14 @@
 ﻿import React, { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback, Component } from 'react';
-import { highlight, isSupportedLang } from '../utils/highlight';
+import { UnifiedDirectiveCard } from './chat/UnifiedDirectiveCard';
+import { MarkdownRenderer, renderInlineMarkdown, splitMarkdownSections } from './chat/MarkdownRenderer';
+import { CodeBlock, clampToolLines } from './chat/CodeBlock';
+import {
+  extractAllDirectivesAndText,
+  parseXmlAttributes,
+  stripSystemTaskTags,
+  splitReportAndConversation,
+  DirectiveItem
+} from '../utils/directiveParser';
 
 interface Message {
   id: string;
@@ -17,6 +26,7 @@ interface ChatMsg {
   content: string;
   task?: string;
   timestamp?: number | string;
+  sourceCreatedAt?: number | string;
   agentName?: string;
   agentRole?: string;
   msgType?: string;
@@ -259,10 +269,83 @@ function computeDiffRows(oldStr: string, newStr: string): Array<{ type: 'ctx' | 
   return rows;
 }
 
+// Helper chuyển đổi vùng chọn / node sang Markdown đơn giản
+function htmlToMarkdown(html: string): string {
+  if (!html) return '';
+  const container = document.createElement('div');
+  container.innerHTML = html;
+
+  const walk = (node: Node): string => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return node.textContent || '';
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+    const el = node as HTMLElement;
+    const tag = el.tagName.toLowerCase();
+    const inner = Array.from(el.childNodes).map(walk).join('');
+
+    switch (tag) {
+      case 'strong':
+      case 'b':
+        return `**${inner.trim()}**`;
+      case 'em':
+      case 'i':
+        return `*${inner.trim()}*`;
+      case 'del':
+      case 's':
+        return `~~${inner.trim()}~~`;
+      case 'code':
+        if (el.parentElement && el.parentElement.tagName.toLowerCase() === 'pre') {
+          return inner;
+        }
+        return `\`${inner}\``;
+      case 'pre': {
+        const lang = el.getAttribute('data-language') || '';
+        return `\n\`\`\`${lang}\n${el.textContent || ''}\n\`\`\`\n`;
+      }
+      case 'blockquote':
+        return `\n> ${inner.trim().split('\n').join('\n> ')}\n`;
+      case 'h1': return `\n# ${inner.trim()}\n`;
+      case 'h2': return `\n## ${inner.trim()}\n`;
+      case 'h3': return `\n### ${inner.trim()}\n`;
+      case 'h4': return `\n#### ${inner.trim()}\n`;
+      case 'h5': return `\n##### ${inner.trim()}\n`;
+      case 'h6': return `\n###### ${inner.trim()}\n`;
+      case 'p': return `\n\n${inner.trim()}\n\n`;
+      case 'li': return `\n- ${inner.trim()}`;
+      case 'ul':
+      case 'ol': return `\n${inner}\n`;
+      case 'br': return '\n';
+      case 'hr': return '\n\n---\n\n';
+      case 'a': {
+        const href = el.getAttribute('href') || '';
+        return `[${inner.trim()}](${href})`;
+      }
+      default:
+        return inner;
+    }
+  };
+
+  return walk(container).replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // ============ ANSI COLOR RENDERER ============
 // Gỡ CSI điều khiển không phải màu; giữ SGR (...m) để tô màu như terminal thật.
 const ANSI_NOISE_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-NPRZcf-nqry=><]/g;
 const ANSI_SGR_SPLIT = /((?:\u001b\[|\u009b\[|\[)\d{1,3}(?:;\d{1,3}){0,8}m)/g;
+
+// Hàm dọn dẹp các lệnh hệ thống (delete_task, task_update, directives) khỏi text hiển thị
+export function stripSystemTaskTags(text: string): string {
+  if (!text) return '';
+  return String(text)
+    .replace(/<\s*delete_task\b[^>]*\/>/gi, '')
+    .replace(/<\s*delete_task\b[^>]*>[\s\S]*?<\/\s*delete_task\s*>/gi, '')
+    .replace(/\[DELETE\s+TASK\b[^\]]*\]/gi, '')
+    .replace(/<\s*task_update\b[^>]*\/>/gi, '')
+    .replace(/<\s*task_update\b[^>]*>[\s\S]*?<\/\s*task_update\s*>/gi, '')
+    .replace(/\[TASK\s+UPDATE\b[^\]]*\]/gi, '')
+    .trim();
+}
 
 function ansiApplyCode(code: number, style: React.CSSProperties): React.CSSProperties {
   const s = { ...style };
@@ -390,7 +473,7 @@ function extIcon(path: string): React.ReactNode {
   );
 }
 
-function CodeBlock({ code, lang, isMobile }: { code: string; lang: string; isMobile?: boolean }) {
+const CodeBlock = React.memo(function CodeBlock({ code, lang, isMobile }: { code: string; lang: string; isMobile?: boolean }) {
   const [copied, setCopied] = useState(false);
 
   // USER: giới hạn tối đa 90 dòng hiển thị code (cắt trước khi tokenize)
@@ -481,618 +564,7 @@ function CodeBlock({ code, lang, isMobile }: { code: string; lang: string; isMob
       </pre>
     </div>
   );
-}
-
-function parseXmlAttributes(attrStr: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
-  if (!attrStr) return attrs;
-  const regex = /([a-zA-Z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
-  let match;
-  while ((match = regex.exec(attrStr)) !== null) {
-    const key = String(match[1] || '').toLowerCase();
-    const val = match[2] !== undefined ? match[2] : (match[3] !== undefined ? match[3] : (match[4] || ''));
-    attrs[key] = val;
-  }
-  return attrs;
-}
-
-export interface DirectiveItem {
-  type: 'text' | 'talk' | 'spawn';
-  start: number;
-  end: number;
-  data: {
-    target?: string;
-    role?: string;
-    name?: string;
-    task?: string;
-    message?: string;
-    raw: string;
-  };
-}
-
-export function extractAllDirectivesAndText(content: string): DirectiveItem[] {
-  if (!content) return [];
-  const text = String(content).normalize('NFC');
-  const items: DirectiveItem[] = [];
-
-  // Regex bắt toàn bộ các khối <spawn ...>...</spawn>, <spawn .../>, <talk ...>...</talk>, <talk .../>
-  // và [SPAWN ...] hoặc [TALK ...]...[/TALK]
-  const directiveRegex = /(?:<\s*spawn\b([^>]*)\/>|<\s*spawn\b([^>]*)>([\s\S]*?)<\/\s*spawn\s*>|\[SPAWN\]\s*(\S+)\s*(?:"([^"]+)"|'([^']+)'|(\S+))\s*(?:assigned:\s*([\s\S]*?))?(?=(?:<\s*(?:talk|spawn)|\[(?:TALK|SPAWN)|$))|<\s*talk\b([^>]*)\/>|<\s*talk\b([^>]*)>([\s\S]*?)<\/\s*talk\s*>|\[TALK\b([^\]]*)\]([\s\S]*?)(?:\[\/TALK\]|(?=\[(?:TALK|SPAWN)|<\s*(?:talk|spawn)|$)))/gi;
-
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = directiveRegex.exec(text)) !== null) {
-    const matchIndex = match.index;
-    const matchStr = match[0];
-    const matchEnd = matchIndex + matchStr.length;
-
-    // Nếu có text trước thẻ directive
-    if (matchIndex > lastIndex) {
-      const precedingText = text.substring(lastIndex, matchIndex);
-      if (precedingText.trim().length > 0) {
-        items.push({
-          type: 'text',
-          start: lastIndex,
-          end: matchIndex,
-          data: { raw: precedingText }
-        });
-      }
-    }
-
-    // Phân tích directive item
-    if (match[1] !== undefined) {
-      // Self-closing <spawn ... />
-      const attrs = parseXmlAttributes(match[1]);
-      items.push({
-        type: 'spawn',
-        start: matchIndex,
-        end: matchEnd,
-        data: {
-          role: attrs.role || '',
-          name: attrs.name || attrs.target || '',
-          task: attrs.task || attrs.message || '',
-          target: attrs.name || attrs.target || '',
-          raw: matchStr
-        }
-      });
-    } else if (match[2] !== undefined) {
-      // Full XML <spawn ...>body</spawn>
-      const attrs = parseXmlAttributes(match[2]);
-      const body = (match[3] || '').trim();
-      items.push({
-        type: 'spawn',
-        start: matchIndex,
-        end: matchEnd,
-        data: {
-          role: attrs.role || '',
-          name: attrs.name || attrs.target || '',
-          task: attrs.task || '',
-          message: body,
-          target: attrs.name || attrs.target || '',
-          raw: matchStr
-        }
-      });
-    } else if (match[4] !== undefined) {
-      // Bracket [SPAWN] role "name" assigned: task
-      const role = match[4] || '';
-      const name = match[5] || match[6] || match[7] || '';
-      const task = (match[8] || '').trim();
-      items.push({
-        type: 'spawn',
-        start: matchIndex,
-        end: matchEnd,
-        data: {
-          role,
-          name,
-          task,
-          target: name,
-          raw: matchStr
-        }
-      });
-    } else if (match[9] !== undefined) {
-      // Self-closing <talk ... />
-      const attrs = parseXmlAttributes(match[9]);
-      items.push({
-        type: 'talk',
-        start: matchIndex,
-        end: matchEnd,
-        data: {
-          target: attrs.target || attrs.agent || attrs.to || '',
-          task: attrs.task || '',
-          message: attrs.message || attrs.msg || attrs.content || '',
-          raw: matchStr
-        }
-      });
-    } else if (match[10] !== undefined) {
-      // Full XML <talk ...>body</talk>
-      const attrs = parseXmlAttributes(match[10]);
-      const body = (match[11] || '').trim();
-      items.push({
-        type: 'talk',
-        start: matchIndex,
-        end: matchEnd,
-        data: {
-          target: attrs.target || attrs.agent || attrs.to || '',
-          task: attrs.task || '',
-          message: body || attrs.message || attrs.msg || attrs.content || '',
-          raw: matchStr
-        }
-      });
-    } else if (match[12] !== undefined) {
-      // Bracket [TALK attrs]body[/TALK]
-      const attrs = parseXmlAttributes(match[12]);
-      const body = (match[13] || '').replace(/\[\/TALK\]\s*$/i, '').trim();
-      items.push({
-        type: 'talk',
-        start: matchIndex,
-        end: matchEnd,
-        data: {
-          target: attrs.target || attrs.agent || attrs.to || '',
-          task: attrs.task || '',
-          message: body || attrs.message || attrs.msg || attrs.content || '',
-          raw: matchStr
-        }
-      });
-    }
-
-    lastIndex = matchEnd;
-  }
-
-  // Nếu còn text sau directive cuối cùng
-  if (lastIndex < text.length) {
-    const trailingText = text.substring(lastIndex);
-    if (trailingText.trim().length > 0) {
-      items.push({
-        type: 'text',
-        start: lastIndex,
-        end: text.length,
-        data: { raw: trailingText }
-      });
-    }
-  }
-
-  return items;
-}
-
-interface SplitMessageResult {
-  conversationText: string;
-  hasReport: boolean;
-  reportTitle?: string;
-  reportContent?: string;
-}
-
-function splitReportAndConversation(content: string): SplitMessageResult {
-  if (!content) return { conversationText: '', hasReport: false };
-
-  let text = String(content || '').normalize('NFC');
-
-  // Code Span Masking: Tạm thời thay thế nội dung trong ```...``` hoặc `...` bằng placeholder
-  // để bảo vệ các ví dụ mẫu XML/command bên trong code blocks không bị regex xóa nhầm
-  const codeBlocks: string[] = [];
-  text = text.replace(/```[\s\S]*?```|`[^`\n]+`/g, (match) => {
-    const token = `__AF_CODE_BLOCK_${codeBlocks.length}__`;
-    codeBlocks.push(match);
-    return token;
-  });
-
-  // Doc Line Masking: bảo vệ dòng trích dẫn, danh sách markdown giải thích/hướng dẫn về thẻ
-  // (ví dụ: "- Dùng thẻ <spawn role=... />", "> trích dẫn <talk ...>", "Chỉ đạo (ví dụ: gán agent.task = ...):")
-  const docLines: string[] = [];
-  text = text.replace(/^[ \t]*(?:>|[-*+]|\d+\.|\([^\n)]*|.*(?:ví dụ|hướng dẫn|cú pháp|lệnh|thẻ|dùng|tag|syntax|example|instruction|task_update)[^\n]*)[ \t]+.*(?:<|\b(?:TALK|SPAWN|TASK_UPDATE)\b).*$/gmi, (match) => {
-    const token = `__AF_DOC_LINE_${docLines.length}__`;
-    docLines.push(match);
-    return token;
-  });
-
-  // 1. Strip full XML command blocks: <talk ...>...</talk>, <spawn ...>...</spawn>, <stop ...>...</stop>
-  text = text.replace(/^[ \t]*<\s*(?:talk|spawn|stop|resume|create_role|create-role|delete_agent)\b[^>]*\b(?:target|target-id|target_id|agent-id|agent_id|agent|to|id|role|name|task)\s*=[^>]*>[\s\S]*?<\/\s*(?:talk|spawn|stop|resume|create_role|create-role|delete_agent)\s*>[ \t]*\n?/gmi, '');
-  text = text.replace(/<\s*(?:talk|spawn)\b[^>]*>[\s\S]*?<\/\s*(?:talk|spawn)\s*>/gmi, '');
-  text = text.replace(/^[ \t]*<\s*(?:spawn|stop|resume|create_role|create-role|delete_agent)\b[^>]*\b(?:target|target-id|target_id|agent-id|agent_id|agent|to|id|role|name|task)\s*=[^>]*\/>[ \t]*\n?/gmi, '');
-  text = text.replace(/<\s*(?:talk|spawn)\b[^>]*\/>/gmi, '');
-  text = text.replace(/^[ \t]*<\s*(?:talk|spawn)\b[^>]*\b(?:target|target-id|target_id|agent-id|agent_id|agent|to|id|role|name|task)\s*=[^>]*>[ \t]*\n?/gmi, '');
-  text = text.replace(/<\s*(?:talk|spawn)\b[^>]*>/gmi, '');
-  text = text.replace(/<\/\s*(?:talk|spawn)\s*>/gmi, '');
-  text = text.replace(/^[ \t]*\[(?:TALK|SPAWN|STOP|RESUME|CREATE ROLE)\b[^\]]*\][ \t]*\n?/gmi, '');
-
-  // 3. Clean technical routing tags and headers
-  text = text.replace(/(?:\[FROM:\s*[^\]]+\]\s*)?\[TO:\s*[^\]]+\]\s*(?:Task complete\.?)?/gi, '');
-  text = text.replace(/^\s*\[TASK\][^\n]*\n?/gmi, '');
-
-  // Lọc sạch các thẻ chỉ đạo <talk>...</talk>, <spawn>...</spawn> và lệnh bracket khỏi conversationText
-  // để text đối thoại với user hiển thị độc lập, không bị bọc trùng bên trong hay bên ngoài thẻ directive
-  text = text.replace(/<\s*spawn\b[^>]*>[\s\S]*?<\/\s*spawn\s*>/gi, '');
-  text = text.replace(/<\s*spawn\b[^>]*\/?>/gi, '');
-  text = text.replace(/<\s*talk\b[^>]*>[\s\S]*?<\/\s*talk\s*>/gi, '');
-  text = text.replace(/<\s*talk\b[^>]*\/?>/gi, '');
-  text = text.replace(/\[SPAWN\][^\n]*\n?/gi, '');
-  text = text.replace(/\[TALK\b[^\]]*\][\s\S]*?(?:\[\/TALK\]|$)/gi, '');
-
-  // Khôi phục lại docLines đã được bảo vệ an toàn
-  for (let i = 0; i < docLines.length; i++) {
-    text = text.replace(`__AF_DOC_LINE_${i}__`, docLines[i]);
-  }
-
-  // Khôi phục lại các code blocks đã được bảo vệ an toàn
-  for (let i = 0; i < codeBlocks.length; i++) {
-    text = text.replace(`__AF_CODE_BLOCK_${i}__`, codeBlocks[i]);
-  }
-
-  // 4. Extract structured report block if present: Đã tắt chức năng tách report, xem như render xml bình thường của text
-  let conversationText = text.trim().replace(/__AF_CODE_BLOCK_(\d+)__/g, (_, idx) => codeBlocks[Number(idx)] || '');
-
-  return {
-    conversationText,
-    hasReport: false
-  };
-}
-
-function renderInlineMarkdown(text: string): React.ReactNode[] {
-  if (!text) return [];
-  const safeText = String(text).normalize('NFC');
-  const nodes: React.ReactNode[] = [];
-  const regex = /(`[^`]+`|\*\*\*[^*]+\*\*\*|\*\*[^*]+\*\*|(?<!\w)__[^_]+__(?!\w)|\*[^*]+\*|(?<!\w)_[^_]+_(?!\w)|~~[^~]+~~|\[[^\]]+\]\([^)]+\))/gu;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = regex.exec(safeText)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push(safeText.slice(lastIndex, match.index));
-    }
-    const token = match[0];
-    const key = `inline-${match.index}-${token.length}`;
-
-    if (token.startsWith('`') && token.endsWith('`')) {
-      nodes.push(
-        <code key={key} style={{
-          background: 'rgba(255, 255, 255, 0.08)',
-          color: '#93c5fd',
-          padding: '2px 6px',
-          borderRadius: 4,
-          fontSize: '0.9em',
-          fontFamily: 'monospace'
-        }}>
-          {token.slice(1, -1)}
-        </code>
-      );
-    } else if (token.startsWith('***') && token.endsWith('***')) {
-      nodes.push(<strong key={key} style={{ color: 'var(--text-primary)', fontWeight: 700 }}><em>{token.slice(3, -3)}</em></strong>);
-    } else if ((token.startsWith('**') && token.endsWith('**')) || (token.startsWith('__') && token.endsWith('__'))) {
-      nodes.push(<strong key={key} style={{ color: 'var(--text-primary)', fontWeight: 600 }}>{token.slice(2, -2)}</strong>);
-    } else if ((token.startsWith('*') && token.endsWith('*')) || (token.startsWith('_') && token.endsWith('_'))) {
-      nodes.push(<em key={key}>{token.slice(1, -1)}</em>);
-    } else if (token.startsWith('~~') && token.endsWith('~~')) {
-      nodes.push(<del key={key} style={{ opacity: 0.6 }}>{token.slice(2, -2)}</del>);
-    } else if (token.startsWith('[') && token.includes('](')) {
-      const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/u);
-      if (parts) {
-        nodes.push(
-          <a key={key} href={parts[2]} target="_blank" rel="noreferrer" style={{ color: '#60a5fa', textDecoration: 'underline' }}>
-            {parts[1]}
-          </a>
-        );
-      } else {
-        nodes.push(token);
-      }
-    } else {
-      nodes.push(token);
-    }
-    lastIndex = regex.lastIndex;
-  }
-
-  if (lastIndex < safeText.length) {
-    nodes.push(safeText.slice(lastIndex));
-  }
-
-  return nodes;
-}
-
-function splitMarkdownSections(content: string): Array<{ type: 'code' | 'md'; content: string; lang?: string }> {
-  const sections: Array<{ type: 'code' | 'md'; content: string; lang?: string }> = [];
-  const safeContent = String(content || '').normalize('NFC');
-  const lines = safeContent.split(/\r?\n/);
-  
-  let inCode = false;
-  let codeFenceLength = 0;
-  let codeLang = '';
-  let codeLines: string[] = [];
-  let mdLines: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    
-    if (!inCode) {
-      // Check for code fence opening (3 or more backticks or tildes, optional leading indentation)
-      const match = line.match(/^\s*(`{3,}|~{3,})([a-zA-Z0-9_+#.-]*)\s*$/);
-      if (match) {
-        if (mdLines.length > 0) {
-          sections.push({ type: 'md', content: mdLines.join('\n') });
-          mdLines = [];
-        }
-        inCode = true;
-        codeFenceLength = match[1].length;
-        codeLang = match[2] || '';
-        codeLines = [];
-      } else {
-        mdLines.push(line);
-      }
-    } else {
-      // In code: check for closing fence with exact codeFenceLength backticks/tildes on its own line
-      const closeMatch = line.match(/^\s*(`{3,}|~{3,})\s*$/);
-      if (closeMatch && closeMatch[1].length === codeFenceLength) {
-        sections.push({ type: 'code', lang: codeLang, content: codeLines.join('\n') });
-        inCode = false;
-        codeFenceLength = 0;
-        codeLang = '';
-        codeLines = [];
-      } else {
-        codeLines.push(line);
-      }
-    }
-  }
-
-  if (inCode) {
-    // Unclosed code block - treat as code
-    sections.push({ type: 'code', lang: codeLang, content: codeLines.join('\n') });
-  } else if (mdLines.length > 0) {
-    sections.push({ type: 'md', content: mdLines.join('\n') });
-  }
-
-  return sections;
-}
-
-function MarkdownRenderer({ content, isMobile }: { content: string; isMobile?: boolean }) {
-  if (!content) return null;
-
-  const sections = splitMarkdownSections(content);
-
-  return (
-    <div className="af-markdown" style={{
-      display: 'flex',
-      flexDirection: 'column',
-      gap: 4,
-      fontSize: isMobile ? 12 : 12.5,
-      lineHeight: 1.45,
-      minWidth: 0,
-      maxWidth: '100%',
-      color: 'var(--text-primary)'
-    }}>
-      {sections.map((sec, secIdx) => {
-        if (sec.type === 'code') {
-          return <CodeBlock key={`sec-${secIdx}`} code={sec.content} lang={sec.lang || ''} isMobile={isMobile} />;
-        }
-
-        // Process markdown lines
-        const lines = sec.content.split(/\r?\n/);
-        const elements: React.ReactNode[] = [];
-        let i = 0;
-
-        while (i < lines.length) {
-          const line = lines[i];
-          const trimmed = line.trim();
-
-          // Empty line
-          if (!trimmed) {
-            i++;
-            continue;
-          }
-
-          // Horizontal Rule (CommonMark Specification: 3+ of -, *, _ with optional spaces, e.g. `---`, `- - -`, `***`, `* * *`, `___`, `_ _ _`)
-          if (/^(?:(?:\s*-\s*){3,}|(?:\s*\*\s*){3,}|(?:\s*_\s*){3,})$/.test(trimmed)) {
-            elements.push(
-              <hr
-                key={`hr-${i}`}
-                style={{
-                  border: 'none',
-                  borderTop: '1px solid var(--af-border)',
-                  margin: '10px 0',
-                  opacity: 0.8
-                }}
-              />
-            );
-            i++;
-            continue;
-          }
-
-          // Markdown Headers (Modern Cursor / Claude Style)
-          if (line.startsWith('# ')) {
-            elements.push(<h1 key={`h1-${i}`} style={{ fontSize: 13.5, fontWeight: 700, letterSpacing: '-0.01em', margin: '8px 0 3px', color: 'var(--text-primary)', borderBottom: '1px solid var(--af-border)', paddingBottom: 2, lineHeight: 1.4 }}>{renderInlineMarkdown(line.slice(2))}</h1>);
-            i++;
-            continue;
-          }
-          if (line.startsWith('## ')) {
-            elements.push(<h2 key={`h2-${i}`} style={{ fontSize: 13, fontWeight: 700, margin: '6px 0 2px', color: 'var(--text-primary)', lineHeight: 1.4 }}>{renderInlineMarkdown(line.slice(3))}</h2>);
-            i++;
-            continue;
-          }
-          if (line.startsWith('### ')) {
-            elements.push(<h3 key={`h3-${i}`} style={{ fontSize: 12.5, fontWeight: 700, margin: '5px 0 2px', color: 'var(--text-primary)', lineHeight: 1.4 }}>{renderInlineMarkdown(line.slice(4))}</h3>);
-            i++;
-            continue;
-          }
-          if (line.startsWith('#### ')) {
-            elements.push(<h4 key={`h4-${i}`} style={{ fontSize: 12.5, fontWeight: 700, margin: '4px 0 2px', color: 'var(--text-primary)', lineHeight: 1.4 }}>{renderInlineMarkdown(line.slice(5))}</h4>);
-            i++;
-            continue;
-          }
-
-          // Plain text headers (all caps or ending with colon like 'BÁO CÁO:' or 'Nguyên nhân:')
-          const isAllCapsHeader = /^[A-Z0-9_\sÀ-ỸÁ-ỴĂ-ỮĐ]{3,}:?\s*$/.test(trimmed) && trimmed.length > 2 && trimmed.length < 80 && !trimmed.startsWith('HTTP');
-          const isColonHeader = /^([A-ZÀ-Ỹa-zà-ỹ0-9_ -]{2,50}):$/.test(trimmed);
-          if (isAllCapsHeader || isColonHeader) {
-            elements.push(
-              <div key={`head-${i}`} style={{ fontWeight: 700, fontSize: 12.5, color: 'var(--text-primary)', marginTop: 5, marginBottom: 2, lineHeight: 1.4 }}>
-                {renderInlineMarkdown(line)}
-              </div>
-            );
-            i++;
-            continue;
-          }
-
-          // Horizontal rule (CommonMark compliant: 3 or more -, *, _ with optional spaces)
-          if (/^(?:-{3,}|\*{3,}|_{3,}|(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/.test(trimmed)) {
-            elements.push(
-              <hr
-                key={`hr-${i}`}
-                style={{
-                  border: 'none',
-                  borderTop: '1px solid var(--af-border)',
-                  margin: '12px 0',
-                  width: '100%'
-                }}
-              />
-            );
-            i++;
-            continue;
-          }
-
-          // Blockquote
-          if (line.startsWith('> ') || line === '>') {
-            const bqLines: string[] = [];
-            while (i < lines.length && (lines[i].startsWith('> ') || lines[i] === '>')) {
-              bqLines.push(lines[i].replace(/^>\s?/, ''));
-              i++;
-            }
-            elements.push(
-              <blockquote key={`bq-${i}`} style={{
-                borderLeft: '3px solid #3b82f6',
-                background: 'rgba(59, 130, 246, 0.08)',
-                padding: '6px 12px',
-                margin: '6px 0',
-                borderRadius: '0 6px 6px 0',
-                color: 'var(--text-secondary)'
-              }}>
-                {bqLines.map((bql, bqIdx) => <div key={bqIdx}>{renderInlineMarkdown(bql)}</div>)}
-              </blockquote>
-            );
-            continue;
-          }
-
-          // Table
-          if (trimmed.startsWith('|') && trimmed.endsWith('|') && i + 1 < lines.length && lines[i + 1].includes('---')) {
-            const tableLines: string[] = [];
-            while (i < lines.length && lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
-              tableLines.push(lines[i].trim());
-              i++;
-            }
-            if (tableLines.length >= 2) {
-              const headerCols = tableLines[0].slice(1, -1).split('|').map(c => c.trim());
-              const bodyRows = tableLines.slice(2).map(r => r.slice(1, -1).split('|').map(c => c.trim()));
-              elements.push(
-                <div key={`tbl-${i}`} style={{ overflowX: 'auto', margin: '8px 0' }}>
-                  <table style={{
-                    width: '100%',
-                    borderCollapse: 'collapse',
-                    fontSize: 12.5,
-                    border: '1px solid var(--af-border)',
-                    borderRadius: 6
-                  }}>
-                    <thead>
-                      <tr style={{ background: 'var(--bg-inset)' }}>
-                        {headerCols.map((hc, hcIdx) => (
-                          <th key={hcIdx} style={{ padding: '6px 10px', textAlign: 'left', fontWeight: 600, borderBottom: '1px solid var(--af-border)', color: 'var(--text-primary)' }}>
-                            {renderInlineMarkdown(hc)}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {bodyRows.map((row, rowIdx) => (
-                        <tr key={rowIdx} style={{ background: rowIdx % 2 === 1 ? 'rgba(255,255,255,0.02)' : 'transparent', borderBottom: '1px solid var(--af-border)' }}>
-                          {row.map((cell, cellIdx) => (
-                            <td key={cellIdx} style={{ padding: '6px 10px', color: 'var(--text-secondary)' }}>
-                              {renderInlineMarkdown(cell)}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              );
-              continue;
-            }
-          }
-
-          // Unordered List (standard markdown spec, multi-level indentation)
-          if (/^(\s*)[*+-•\u2022]\s+/.test(line)) {
-            const listItems: Array<{ text: string; isNested: boolean }> = [];
-            while (i < lines.length && /^(\s*)[*+-•\u2022]\s+/.test(lines[i])) {
-              const rawLine = lines[i];
-              const isNested = /^\s{2,}[*+-•\u2022]\s+/.test(rawLine) || /^\t+[*+-•\u2022]\s+/.test(rawLine);
-              listItems.push({
-                text: rawLine.replace(/^(\s*)[*+-•\u2022]\s+/, ''),
-                isNested
-              });
-              i++;
-            }
-            elements.push(
-              <div key={`ul-${i}`} style={{ margin: '3px 0 4px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-                {listItems.map((li, liIdx) => (
-                  <div key={liIdx} style={{ paddingLeft: li.isNested ? 24 : 14, lineHeight: 1.45 }}>
-                    {renderInlineMarkdown(li.text)}
-                  </div>
-                ))}
-              </div>
-            );
-            continue;
-          }
-
-          // Ordered List (standard markdown spec, multi-level indentation)
-          if (/^\s*\d+\.\s+/.test(line)) {
-            const listItems: Array<{ num: string; text: string; isNested: boolean }> = [];
-            while (i < lines.length && /^\s*(\d+)\.\s+(.*)$/.test(lines[i])) {
-              const rawLine = lines[i];
-              const isNested = /^\s{2,}\d+\.\s+/.test(rawLine) || /^\t+\d+\.\s+/.test(rawLine);
-              const lm = rawLine.match(/^\s*(\d+)\.\s+(.*)$/);
-              if (lm) {
-                listItems.push({ num: lm[1], text: lm[2], isNested });
-              }
-              i++;
-            }
-            elements.push(
-              <div key={`ol-${i}`} style={{ margin: '3px 0 4px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-                {listItems.map((li, liIdx) => (
-                  <div key={liIdx} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, paddingLeft: li.isNested ? 24 : 14, lineHeight: 1.45 }}>
-                    <span style={{ color: '#93c5fd', fontWeight: 600, fontFamily: 'monospace', minWidth: 18, flexShrink: 0 }}>
-                      {li.num}.
-                    </span>
-                    <div style={{ flex: 1 }}>{renderInlineMarkdown(li.text)}</div>
-                  </div>
-                ))}
-              </div>
-            );
-            continue;
-          }
-
-          // Regular paragraph / text line with line break preservation
-          elements.push(
-            <div key={`p-${i}`} style={{ margin: '2px 0', whiteSpace: 'pre-wrap', lineHeight: 1.45 }}>
-              {renderInlineMarkdown(line)}
-            </div>
-          );
-          i++;
-        }
-
-        return <React.Fragment key={`sec-${secIdx}`}>{elements}</React.Fragment>;
-      })}
-    </div>
-  );
-}
-
-// ============ TOOL LINES CLAMP (giới hạn hiển thị) ============
-// USER yêu cầu: mọi tool trong UI hiển thị tối đa 200 dòng (nâng từ 90 → 200) — tránh khung tool phình
-// vô hạn khi output dài nhưng vẫn đủ đầy đủ không gian theo dõi code/kết quả.
-const MAX_TOOL_LINES = 200;
-function clampToolLines(text: string, max: number = MAX_TOOL_LINES): { text: string; cut: number; total: number } {
-  if (!text) return { text, cut: 0, total: 0 };
-  const str = String(text);
-  const lines = str.split('\n');
-  const total = lines.length;
-  if (total <= max) return { text: str, cut: 0, total };
-  const kept = lines.slice(0, max).join('\n');
-  return { text: `${kept}\n… (đã cắt ${total - max} dòng, tổng ${total} dòng)`, cut: total - max, total };
-}
+});
 
 // ============ WRITE FILE VIEWER ============
 // Hiển thị tool write dạng khung file đẹp: header nổi bật, nội dung code có expand/collapse, badge thành công.
@@ -1431,30 +903,77 @@ function SearchCommandViewer({ tool, input, output }: { tool: string; input?: st
 }
 
 // ============ TOOL BLOCK SAFE BOUNDARY ============
-// Fallback an toàn: nếu parse/render một ToolCallBlock lỗi, chỉ khối đó sập thành text mờ,
-// không làm trắng toàn bộ panel chat.
-class ToolBlockSafe extends Component<{ children: React.ReactNode }, { hasError: boolean }> {
-  public state = { hasError: false };
-  public static getDerivedStateFromError() {
-    return { hasError: true };
+// Fallback an toàn: nếu render một ToolCallBlock lỗi cú pháp/logic, không làm sập panel chat
+// mà fallback hiển thị trực tiếp dữ liệu thô (raw data) trong khung code để người dùng vẫn đọc được trọn vẹn.
+class ToolBlockSafe extends Component<{ tool?: string; input?: any; output?: any; children: React.ReactNode }, { hasError: boolean; errorInfo?: string }> {
+  public state: { hasError: boolean; errorInfo?: string } = { hasError: false };
+  public static getDerivedStateFromError(error: unknown) {
+    return { hasError: true, errorInfo: String(error) };
   }
   public componentDidCatch(error: unknown) {
-    console.error('[ToolBlockSafe] render error:', error);
+    console.warn('[ToolBlockSafe] Caught render error in tool block, fallback to defensive raw viewer:', error);
   }
   public render() {
     if (this.state.hasError) {
+      const toolName = this.props.tool || 'tool';
+      const formatRawData = (data: any) => {
+        if (data === undefined || data === null) return '';
+        if (typeof data === 'object') {
+          try {
+            return JSON.stringify(data, null, 2);
+          } catch {
+            return String(data);
+          }
+        }
+        const str = String(data);
+        try {
+          const parsed = JSON.parse(str);
+          return JSON.stringify(parsed, null, 2);
+        } catch {
+          return str;
+        }
+      };
+
+      const rawIn = formatRawData(this.props.input);
+      const rawOut = formatRawData(this.props.output);
+
       return (
         <div style={{
-          borderRadius: 10,
-          border: '1px dashed rgba(148,163,184,0.35)',
+          borderRadius: 8,
+          border: '1px solid rgba(148, 163, 184, 0.25)',
           background: 'var(--bg-inset)',
-          padding: '8px 10px',
-          fontFamily: 'monospace',
+          padding: '8px 12px',
+          fontFamily: "'JetBrains Mono', monospace",
           fontSize: 11,
-          color: 'var(--text-muted)',
-          marginBottom: 4
+          color: 'var(--text-primary)',
+          marginBottom: 6,
+          boxSizing: 'border-box',
+          width: '100%',
+          overflowX: 'auto'
         }}>
-          ⚠️ Tool call data lỗi định dạng — không thể hiển thị chi tiết.
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, color: '#38bdf8', fontWeight: 600 }}>
+            <span>🔧</span>
+            <span>{toolName} (Raw View)</span>
+          </div>
+          {rawIn && (
+            <div style={{ marginBottom: rawOut ? 8 : 0 }}>
+              <div style={{ color: 'var(--text-secondary)', fontSize: 10, fontWeight: 600, marginBottom: 2 }}>INPUT:</div>
+              <pre style={{ margin: 0, padding: '6px 8px', background: 'rgba(0,0,0,0.25)', borderRadius: 6, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                <code>{rawIn}</code>
+              </pre>
+            </div>
+          )}
+          {rawOut && (
+            <div>
+              <div style={{ color: 'var(--text-secondary)', fontSize: 10, fontWeight: 600, marginBottom: 2 }}>OUTPUT:</div>
+              <pre style={{ margin: 0, padding: '6px 8px', background: 'rgba(0,0,0,0.25)', borderRadius: 6, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                <code>{rawOut}</code>
+              </pre>
+            </div>
+          )}
+          {!rawIn && !rawOut && (
+            <div style={{ color: 'var(--text-muted)' }}>(empty tool call)</div>
+          )}
         </div>
       );
     }
@@ -1715,12 +1234,14 @@ function renderToolBadge(tool: string, parsedInput: any, safeInput: string, isMo
   );
 }
 
-function ToolCallBlock({ tool, input, output, isMobile }: ToolCallData & { isMobile?: boolean }) {
+function ToolCallBlock({ tool, input, output, isMobile, defaultExpanded = false }: ToolCallData & { isMobile?: boolean; defaultExpanded?: boolean }) {
   // FIX CRASH toLowerCase: tool có thể undefined khi payload lỗi → bọc an toàn 100%
   const safeTool = String(tool || 'unknown').toLowerCase();
-  // Input: strip toàn bộ (dùng để parse JSON diff). Output: GIỮ mã màu SGR cho AnsiRenderer
-  const safeInput = stripAnsi(input || '');
-  const rawOutput = typeof output === 'string' ? output : '';
+  // Input có thể là object (nếu server gửi raw object) → stringify an toàn, tránh [object Object]
+  const inputStr = typeof input === 'string' ? input : (input != null ? (typeof input === 'object' ? JSON.stringify(input, null, 2) : String(input)) : '');
+  const outputStr = typeof output === 'string' ? output : (output != null ? (typeof output === 'object' ? JSON.stringify(output, null, 2) : String(output)) : '');
+  const safeInput = stripAnsi(inputStr || '');
+  const rawOutput = outputStr || '';
 
   // TodoListViewer cho tool todowrite/todoread — checklist đẹp thay vì JSON thô
   if (safeTool.includes('todo')) {
@@ -1780,7 +1301,16 @@ function ToolCallBlock({ tool, input, output, isMobile }: ToolCallData & { isMob
       : [];
 
   // Mặc định COLLAPSED (thu gọn, hiện hint click để mở) — user bấm/click header để mở rộng.
-  const [expanded, setExpanded] = useState(false);
+  // Nếu setting "Expand Toolcalls by default" bật → khởi tạo expanded=true để mở sẵn.
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  // Sync khi prop defaultExpanded thay đổi (setting UI toggle) — tránh trạng thái sticky cũ
+  const prevDefaultExpandedRef = useRef(defaultExpanded);
+  useEffect(() => {
+    if (prevDefaultExpandedRef.current !== defaultExpanded) {
+      prevDefaultExpandedRef.current = defaultExpanded;
+      setExpanded(defaultExpanded);
+    }
+  }, [defaultExpanded]);
   const [copied, setCopied] = useState(false);
 
   const handleCopy = (e: React.MouseEvent) => {
@@ -2140,13 +1670,14 @@ interface MessageItemProps {
   onToggleReport: (msgId: string) => void;
   isMobile?: boolean;
   showToolBlocks?: boolean;
+  defaultExpandToolcalls?: boolean;
   selectedAgentId?: string | null;
   queuedMessages?: ChatMsg[];
   onForceSendSingle?: (msgId: string, content: string, targetId: string) => void;
   allMessagesList?: any[];
 }
 
-const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, onToggleReport, isMobile = false, showToolBlocks = true, selectedAgentId = null, queuedMessages = [], onForceSendSingle, allMessagesList = [] }: MessageItemProps) {
+const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, onToggleReport, isMobile = false, showToolBlocks = true, defaultExpandToolcalls = false, selectedAgentId = null, queuedMessages = [], onForceSendSingle, allMessagesList = [] }: MessageItemProps) {
   const srcAgent = agents.find(a => a.id === msg.from || a.name === msg.from);
   let targetAgent = agents.find(a => a.id === msg.to || a.name === msg.to);
   const isUser = msg.from === 'user' || msg.role === 'user';
@@ -2178,84 +1709,94 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
 
   // FIX 2: Bóc tách danh sách các directives trong content và kiểm tra trùng lặp từng directive
   const contentDirectives = useMemo(() => {
-    if (!isEligibleOrchSender || typeof msg.content !== 'string') return [];
+    if (msg.msgType === 'talk') return [];
+    if (typeof msg.content !== 'string') return [];
     const all = extractAllDirectivesAndText(msg.content);
-    return all.filter(item => item.type === 'talk' || item.type === 'spawn');
-  }, [isEligibleOrchSender, msg.content]);
+    return all;
+  }, [msg.msgType, msg.content]);
 
-  // Kiểm tra từng directive xem đã có tin nhắn độc lập tương ứng trong allMessagesList chưa
+  // FIX: Kích hoạt Dedup Directives
+  // Nếu một directive (Talk/Spawn) đã được phát thành tin nhắn độc lập trong hội thoại (hoặc đã được hiển thị ngoài luồng chat),
+  // thì bên trong bubble tổng hợp của Orchestrator PHẢI ĐƯỢC ẨN ĐI (đưa vào duplicateDirectivesSet), không render lặp lại lần thứ 3!
   const duplicateDirectivesSet = useMemo(() => {
     const dups = new Set<number>();
-    if (msg.msgType === 'talk') return dups; // Bản thân msg là tin độc lập
-    if (contentDirectives.length === 0) return dups;
+    if (!allMessagesList || allMessagesList.length === 0) return dups;
 
     contentDirectives.forEach((dir, idx) => {
-      const target = dir.data.target || '';
-      if (!target) return;
-      const isDup = allMessagesList.some((other: any) => {
-        if (other.id === msg.id) return false;
-        if (other.msgType !== 'talk' && !(other.content && /^\s*\[SPAWN\]/i.test(other.content))) return false;
-        const otherTarget = other.to || '';
-        if (otherTarget !== target) return false;
-        const sameSender = other.from === msg.from || (isOrchestrator && (other.from === 'orchestrator' || other.agentRole === 'orchestrator' || agents.some(a => a.id === other.from && (a.role === 'orchestrator' || a.type === 'orchestrator'))));
-        const timeDiff = Math.abs((other.timestamp || 0) - (msg.timestamp || 0));
-        return sameSender && timeDiff < 60000;
+      if (dir.type === 'text') return;
+      const targetAgent = (dir.data?.target || dir.data?.name || '').toLowerCase().trim();
+      const taskBody = (dir.data?.task || dir.data?.message || '').toLowerCase().trim();
+
+      // Kiểm tra xem đã có message độc lập nào trùng target hoặc nội dung/task không
+      const exists = allMessagesList.some((other: any) => {
+        if (!other || other.id === msg.id) return false;
+        const otherTo = (other.to || '').toLowerCase().trim();
+        const otherFrom = (other.from || '').toLowerCase().trim();
+        const otherMsgType = other.msgType || '';
+        const otherContent = typeof other.content === 'string' ? other.content.toLowerCase().trim() : '';
+
+        // Khớp lệnh Talk độc lập: nếu bên ngoài đã có tin nhắn gửi tới worker (to === targetAgent hoặc otherMsgType === 'talk')
+        if (dir.type === 'talk') {
+          const isTargetMatch = otherTo === targetAgent || (agents.some(a => (a.id.toLowerCase() === targetAgent || a.name.toLowerCase() === targetAgent) && (otherTo === a.id.toLowerCase() || otherTo === a.name.toLowerCase())));
+          if (isTargetMatch) {
+            // Đã có message độc lập gửi cho agent này: ẩn ngay directive trong Orchestrator
+            if (otherMsgType === 'talk' || other.task) return true;
+            if (taskBody && (otherContent.includes(taskBody.substring(0, 30)) || taskBody.includes(otherContent.substring(0, 30)))) return true;
+          }
+        }
+
+        // Khớp lệnh Spawn độc lập
+        if (dir.type === 'spawn') {
+          const isSpawnItem = otherContent.startsWith('[spawn]') || otherMsgType === 'spawn';
+          if (isSpawnItem && (otherTo === targetAgent || otherContent.includes(targetAgent))) {
+            return true;
+          }
+        }
+
+        return false;
       });
-      if (isDup) {
+
+      if (exists) {
         dups.add(idx);
       }
     });
+
     return dups;
-  }, [msg.id, msg.from, msg.msgType, msg.timestamp, contentDirectives, allMessagesList, isOrchestrator, agents]);
+  }, [contentDirectives, allMessagesList, msg.id, agents]);
 
   // Còn ít nhất 1 directive chưa có tin độc lập
   const activeDirectives = useMemo(() => {
-    return contentDirectives.filter((_, idx) => !duplicateDirectivesSet.has(idx));
+    return contentDirectives.filter((dir, idx) => {
+      if (dir.type === 'text') return true;
+      return !duplicateDirectivesSet.has(idx);
+    });
   }, [contentDirectives, duplicateDirectivesSet]);
 
-  const hasDuplicateIndependentTalk = contentDirectives.length > 0 && activeDirectives.length === 0;
+  const hasDirectiveInItems = contentDirectives.some(d => d.type === 'talk' || d.type === 'spawn');
+  const hasActiveDirectives = activeDirectives.some(d => d.type === 'talk' || d.type === 'spawn');
+  const hasDuplicateIndependentTalk = hasDirectiveInItems && !hasActiveDirectives;
 
   const isOrchestratorTask = isEligibleOrchSender && (
     (msg.msgType === 'talk' && msg.to && msg.to !== 'user' && msg.to !== 'broadcast') ||
-    (activeDirectives.length > 0)
+    hasActiveDirectives
   );
   const isSpawnMsg = isOrchestratorTask && (
     (typeof msg.content === 'string' && msg.content.trim().startsWith('[SPAWN]')) ||
     (typeof (msg as any).content === 'string' && /^\s*\[SPAWN\]/i.test((msg as any).content)) ||
-    (typeof msg.content === 'string' && /<\s*spawn\b/i.test(msg.content))
+    (typeof msg.content === 'string' && /<\s*spawn\b/i.test(msg.content) && !/<\s*talk\b/i.test(msg.content))
   );
 
   const isOrchView = isSelectedOrch;
   const isIncomingToOrch = (isOrchView && !isOrchestrator && !isUser) ||
-    (isSubOrchView ? (msg.to === selectedAgentId && !isUser && !isFromCurrentSubOrch) : (msg.to === 'orchestrator' && !isOrchestrator && !isUser));
+    (isSubOrchView ? (msg.to === 'orchestrator' && !isUser && !isFromCurrentSubOrch) : (msg.to === 'orchestrator' && !isOrchestrator && !isUser));
   const effectiveShowToolBlocks = showToolBlocks && !isIncomingToOrch;
 
-  // Căn lề hai chiều cân bằng Chỉ Đạo (Phải) ⇄ Báo Cáo / Phản Hồi (Trái):
-  // Main view / Sub-Orch view:
-  // - BÊN PHẢI: User ra lệnh (isUser) + Orchestrator/Sub-Orch phát lệnh giao việc/spawn cho Worker (isDirectiveToWorker)
-  // - BÊN TRÁI: Phản hồi trả lời User + Worker báo cáo + Tin đến từ Orchestrator cấp trên + ToolCalls + Thinking
-  // Agent view:
-  // - BÊN PHẢI: Chỉ thị nhận vào từ Orchestrator
-  // - BÊN TRÁI: Tiến trình worker tự sinh (thinking, toolcalls, chat, diff)
-  let isAlignRight = false;
-  if (isSubOrchView) {
-    // Nếu tin nhắn gửi đến Sub-Orch này từ bên ngoài (msg.to === selectedAgentId && msg.from !== selectedAgentId):
-    // ĐÂY LÀ TIN ĐẾN (INCOMING), PHẢI CĂN TRÁI.
-    const isDirectiveFromSelf = Boolean(isFromCurrentSubOrch) &&
-      Boolean(isOrchestratorTask || isSpawnMsg || (msg as any).isDirective || (msg.to && msg.to !== 'user' && msg.to !== 'broadcast' && (msg.msgType === 'talk' || hasDirectiveInContent)));
-    isAlignRight = isUser || isDirectiveFromSelf;
-  } else if (isOrchView) {
-    const isDirectiveToWorker = (isOrchestrator || msg.from === 'orchestrator') &&
-      Boolean(isOrchestratorTask || isSpawnMsg || (msg as any).isDirective || (msg.to && msg.to !== 'user' && msg.to !== 'broadcast' && (msg.msgType === 'talk' || hasDirectiveInContent)));
-    isAlignRight = isUser || isDirectiveToWorker;
-  } else {
-    const isGeneratedByThisAgent = !!selectedAgentId && (
-      msg.from === selectedAgentId ||
-      (srcAgent && srcAgent.id === selectedAgentId) ||
-      (isOpenCode && msg.from === selectedAgentId)
-    );
-    isAlignRight = !isGeneratedByThisAgent;
-  }
+  // QUY TẮC CĂN LỀ THỐNG NHẤT BẤT BIẾN:
+  // 1. DUY NHẤT User (isUser === true): LUÔN CĂN PHẢI (isAlignRight = true).
+  // 2. TẤT CẢ các tin nhắn khác (bao gồm Orchestrator, Worker, Thẻ giao việc, Thẻ kết quả):
+  //    LUÔN CĂN TRÁI (isAlignRight = false)!
+  // Triệt tiêu 100% hiện tượng cùng 1 lượt giao việc nhưng bóng chat nhảy sang 2 bên trái/phải đối nghịch.
+  const isAlignRight = Boolean(isUser);
 
   // Resolve task label for header with full defensive guards (đặt trước spawn/talk card để tránh TDZ)
   let rawTaskStr = '';
@@ -2333,9 +1874,9 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         talkTaskDesc = [mAttr, bText].filter(Boolean).join('\n\n') || tAttr;
       }
     }
-    // 3. Fallback: Nếu không phải bracket hay XML, CHỈ dùng (msg as any).task hoặc cleanTaskTitle, tuyệt đối KHÔNG gán toàn bộ rawContentStr
+    // 3. Fallback: Nếu không phải bracket hay XML, hiển thị rawContentStr (body nội dung giao việc), nếu không có thì fallback sang task/title
     if (!talkTaskDesc) {
-      talkTaskDesc = (msg as any).task || cleanTaskTitle || '';
+      talkTaskDesc = rawContentStr.trim() || (msg as any).task || cleanTaskTitle || '';
     }
   }
 
@@ -2413,15 +1954,49 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
     .replace(/^\s*<talk\b[^>]*>\s*/iu, '')
     .replace(/<\/talk>\s*$/iu, '');
   
-  // FIX 4: Luôn dùng stripTalkTags cho tin nhắn từ Orchestrator/Agent để loại sạch toàn bộ thẻ lẫn body đã tách
-  body = isUser ? body : stripTalkTags(body);
+  // TUYỆT ĐỐI KHÔNG gọi stripTalkTags trên tin nhắn báo cáo / phản hồi từ Worker gửi về Orchestrator
+  // vì stripTalkTags sẽ xóa sạch toàn bộ nội dung nằm trong thẻ <talk target="orchestrator">...</talk>!
+  const isWorkerReportToOrch = !isUser && !isOrchestrator && (msg.to === 'orchestrator' || toTag === 'orchestrator' || isIncomingToOrch);
+
+  if (isWorkerReportToOrch) {
+    // Chỉ loại bỏ các thẻ bọc mở/đóng <talk...>, </talk> và thẻ hệ thống delete_task, task_update
+    body = rawContent
+      .replace(/^\s*(?:\[FROM:\s*[^\]]+\]\s*)?\[TO:\s*[^\]]+\]\s*/iu, '')
+      .replace(/<\s*talk\b[^>]*>/gi, '')
+      .replace(/<\/\s*talk\s*>/gi, '')
+      .replace(/\[\/?TALK\b[^\]]*\]/gi, '')
+      .replace(/<\s*report(?:\s+[^>]*)?>/gi, '')
+      .replace(/<\/\s*report\s*>/gi, '')
+      .replace(/\[\/?REPORT\b[^\]]*\]/gi, '');
+    body = stripSystemTaskTags(body);
+  } else {
+    // Luôn dùng stripTalkTags cho tin nhắn từ Orchestrator phát lệnh để loại sạch toàn bộ thẻ lẫn body đã tách vào directive card
+    body = isUser ? body : stripTalkTags(body);
+    body = isUser ? body : stripSystemTaskTags(body);
+    if (!isUser) {
+      body = body
+        .replace(/<\s*report(?:\s+[^>]*)?>/gi, '')
+        .replace(/<\/\s*report\s*>/gi, '')
+        .replace(/\[\/?REPORT\b[^\]]*\]/gi, '');
+    }
+  }
 
   if (isOrchestratorInternal && !msg.showOnUI) {
     body = '_(Internal orchestrator planning hidden)_';
   }
   if (isOrchestratorTask && !isOpenCode) {
     // Khi đã render thành thẻ Giao việc / Directive Card, nếu không còn nội dung trao đổi ngoài thì dọn sạch để không in đè text rác
-    body = body.replace(/^[ \t]*(?:=== AGENT MESSAGE ===[\s\S]*?=== END MESSAGE ===|\[TALK[^\]]*\][\s\S]*?\[\/TALK\]|<\s*talk\b[^>]*>[\s\S]*?<\/\s*talk\s*>)\s*/gmi, '').trim();
+    body = body.replace(/^[ \t]*(?:=== AGENT MESSAGE ===[\s\S]*?=== END MESSAGE ===|\[TALK[^\]]*\][\s\S]*?\[\/TALK\]|<\s*talk\b[^>]*>[\s\S]*?<\/\s*talk\s*>|\[SPAWN\][\s\S]*?(?=(?:\[SPAWN\]|\[TALK\]|<\s*(?:talk|spawn)|$))|<\s*spawn\b[^>]*>[\s\S]*?<\/\s*spawn\s*>|<\s*spawn\b[^>]*\/>)\s*/gmi, '').trim();
+    // Loại bỏ triệt để các directive tag <spawn ...>...</spawn>, <spawn .../> khỏi body để không sinh bubble text thừa
+    body = body.replace(/<\s*spawn\b[^>]*>[\s\S]*?<\/\s*spawn\s*>/gmi, '').replace(/<\s*spawn\b[^>]*\/>/gmi, '').trim();
+  }
+  // Nếu tin nhắn là Spawn message hoặc chỉ chứa duy nhất lệnh Spawn/Talk, loại bỏ body text rác để không sinh thêm bubble text thứ 2
+  if ((isSpawnMsg || contentDirectives.some(d => d.type === 'spawn')) && !isOpenCode) {
+    body = '';
+  }
+  // Nếu đã render các directive/text theo thứ tự trong activeDirectives, tránh render lặp lại conversationText/body ở cuối
+  if ((hasActiveDirectives || isOrchestratorTask) && !isOpenCode) {
+    body = '';
   }
   const effectiveTo = msg.to && msg.to !== 'user' ? msg.to : toTag;
 
@@ -2495,15 +2070,78 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   }
 
   const formattedTime = formatTimestamp(msg.timestamp);
+  const formattedSourceTime = msg.sourceCreatedAt ? formatTimestamp(msg.sourceCreatedAt) : '';
   const fullDateTime = formatFullDate(msg.timestamp);
+  const hasQueueLatency = Boolean(msg.sourceCreatedAt && msg.timestamp && (Number(msg.timestamp) - Number(msg.sourceCreatedAt) > 3000));
+  const timeTooltip = hasQueueLatency
+    ? `${fullDateTime} (gốc tạo lúc ${formattedSourceTime}, trễ hàng đợi ${Math.round((Number(msg.timestamp) - Number(msg.sourceCreatedAt)) / 1000)}s)`
+    : fullDateTime;
 
   const normBody = (body || '').normalize('NFC');
   // Split conversation text and structured report card
   const splitResult = useMemo(() => {
+    if (isSpawnMsg || hasActiveDirectives || contentDirectives.some(d => d.type === 'spawn')) return { conversationText: '', hasReport: false };
     return isUser ? { conversationText: normBody, hasReport: false } : splitReportAndConversation(normBody);
-  }, [normBody, isUser]);
+  }, [normBody, isUser, isSpawnMsg, hasActiveDirectives, contentDirectives]);
 
   const { conversationText, hasReport, reportTitle, reportContent } = splitResult;
+
+  const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+
+  const copyFullMarkdown = useCallback((e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+    }
+    const rawContentStr = typeof msg.content === 'string' ? msg.content : '';
+    const cleanContent = stripSystemTaskTags(conversationText || rawContentStr || body || '').trim();
+    const timeStr = formattedTime || (msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : '');
+    const headerPrefix = timeStr ? `> 🕒 [${timeStr}] **${sender}**:` : `> **${sender}**:`;
+    const fullMd = `${headerPrefix}\n\n${cleanContent}`;
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(fullMd).then(() => {
+        setCopiedMsgId(msg.id);
+        setTimeout(() => setCopiedMsgId(null), 2000);
+      }).catch(() => {
+        // Fallback
+        const ta = document.createElement('textarea');
+        ta.value = fullMd;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        setCopiedMsgId(msg.id);
+        setTimeout(() => setCopiedMsgId(null), 2000);
+      });
+    }
+  }, [msg.id, msg.content, msg.timestamp, conversationText, body, formattedTime, sender]);
+
+  // Handler tự động gán nhãn thời gian và định dạng Markdown khi bôi đen và bấm Ctrl+C / copy
+  const handleBubbleCopy = useCallback((e: React.ClipboardEvent) => {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+
+    // Lấy html của vùng bôi đen
+    const range = sel.getRangeAt(0);
+    const div = document.createElement('div');
+    div.appendChild(range.cloneContents());
+    const rawSelectedHtml = div.innerHTML;
+    const selectedMd = htmlToMarkdown(rawSelectedHtml);
+    const plainText = sel.toString();
+    const contentToCopy = selectedMd || plainText;
+    if (!contentToCopy) return;
+
+    const timeStr = formattedTime || (msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : '');
+    const headerPrefix = timeStr ? `> 🕒 [${timeStr}] **${sender}**:` : `> **${sender}**:`;
+    const formattedResult = `${headerPrefix}\n\n${contentToCopy}`;
+
+    if (e.clipboardData) {
+      e.clipboardData.setData('text/plain', formattedResult);
+      e.clipboardData.setData('text/markdown', formattedResult);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, [formattedTime, msg.timestamp, sender]);
 
   // Tin có toolCalls (hoặc log opencode) — các khối tool/thinking render ĐỘC LẬP ngoài bubble
   const hasToolBlocks = effectiveShowToolBlocks && Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0;
@@ -2533,10 +2171,12 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   // Guard tin nhắn rỗng: nếu sau khi làm sạch không còn conversationText, không có report,
   // không có body, không có thinking, không có toolCalls và không có parts -> ẨN TOÀN BỘ MessageItem,
   // tránh sinh ra header mồ côi (chỉ hiện tên người gửi mà không có bong bóng nội dung nào).
+  const cleanConvText = stripSystemTaskTags(conversationText || '').trim();
+  const cleanBodyText = stripSystemTaskTags(body || '').trim();
   const hasAnyThinking = typeof msg.thinking === 'string' && msg.thinking.trim().length > 0;
-  const hasAnyText = !!(conversationText && conversationText.trim()) || 
+  const hasAnyText = !!cleanConvText || 
                      !!(hasReport && reportContent && reportContent.trim()) || 
-                     !!(body && body.trim()) ||
+                     !!cleanBodyText ||
                      !!(spawnTaskDesc && spawnTaskDesc.trim()) ||
                      !!(talkTaskDesc && talkTaskDesc.trim()) ||
                      !!(cleanTaskTitle && cleanTaskTitle.trim());
@@ -2549,7 +2189,9 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
 
   return (
     <div
-      className="fade-in"
+      className="fade-in af-message-item-container"
+      onCopy={handleBubbleCopy}
+      data-msg-id={msg.id}
       style={{
         display: 'flex',
         flexDirection: 'column',
@@ -2558,6 +2200,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
         width: '100%',
         minWidth: 0,
         overflowWrap: 'anywhere',
+        marginBottom: 14,
         // Fix copy 6.33: chặn selection lan sang cả khối (sender header/tool thinking header là
         // tiện ích không cần copy). Root kế thừa none; các bubble content element bên dưới
         // override userSelect:'text' để user vẫn chọn được đúng text tin nhắn, không nhảy ra
@@ -2589,18 +2232,18 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           style={{
             display: 'inline-flex',
             alignItems: 'center',
-            gap: 6,
+            gap: 5,
             padding: '3px 10px',
-            borderRadius: 9999,
-            fontSize: 11,
-            fontWeight: 700,
+            borderRadius: 6,
+            fontSize: 11.5,
+            fontWeight: 600,
             whiteSpace: 'nowrap',
-            background: '#0f172a',
+            background: '#000000',
             border: isUser
-              ? '1px solid rgba(96, 165, 250, 0.6)'
+              ? '1px solid rgba(96, 165, 250, 0.4)'
               : isOrchestrator
-              ? '1px solid rgba(129, 140, 248, 0.6)'
-              : '1px solid rgba(52, 211, 153, 0.6)',
+              ? '1px solid rgba(129, 140, 248, 0.4)'
+              : '1px solid rgba(52, 211, 153, 0.4)',
             color: isUser ? '#93c5fd' : isOrchestrator ? '#c7d2fe' : '#6ee7b7'
           }}
         >
@@ -2609,14 +2252,14 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           {!isOrchestrator && !isUser && <span>🤖</span>}
           <span>{sender}</span>
           {!isOrchestrator && !isUser && roleBadge && (
-            <span style={{ opacity: 0.85, fontWeight: 600, fontSize: 10 }}>· {roleBadge}</span>
+            <span style={{ opacity: 0.85, fontWeight: 500, fontSize: 10 }}>· {roleBadge}</span>
           )}
         </span>
 
         {/* Direction Arrow & Receiver Capsule Pill */}
         {displayTo && (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <span className="af-receiver-arrow" style={{ color: '#818cf8', fontWeight: 800, fontSize: 13, lineHeight: 1 }}>➜</span>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+            <span className="af-receiver-arrow" style={{ color: '#818cf8', fontWeight: 700, fontSize: 12, lineHeight: 1 }}>➜</span>
             <span
               className="af-receiver-pill"
               style={{
@@ -2624,12 +2267,12 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 alignItems: 'center',
                 gap: 5,
                 padding: '3px 10px',
-                borderRadius: 9999,
-                fontSize: 11,
-                fontWeight: 700,
+                borderRadius: 6,
+                fontSize: 11.5,
+                fontWeight: 600,
                 whiteSpace: 'nowrap',
-                background: '#0f172a',
-                border: '1px solid #334155',
+                background: '#000000',
+                border: '1px solid rgba(255, 255, 255, 0.2)',
                 color: '#f8fafc'
               }}
             >
@@ -2639,8 +2282,8 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           </span>
         )}
 
-        {/* Task Capsule Pill */}
-        {cleanTaskTitle && (
+        {/* Task Capsule Pill - Chỉ hiển thị khi KHÔNG phải là thẻ giao việc orchestratorTask để tránh lặp 2 lần tiêu đề */}
+        {!isOrchestratorTask && cleanTaskTitle && (
           <span
             style={{
               display: 'inline-flex',
@@ -2723,16 +2366,47 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
               marginLeft: isUser ? 0 : 4,
               marginRight: isUser ? 4 : 0
             }}
-            title={fullDateTime}
+            title={timeTooltip}
           >
             {formattedTime}
+            {hasQueueLatency && formattedSourceTime && (
+              <span style={{ opacity: 0.65, fontSize: 9, marginLeft: 3 }}>
+                (gốc {formattedSourceTime})
+              </span>
+            )}
           </span>
         )}
+
+        {/* Action Button: Copy Markdown (nhãn chữ rõ nét) */}
+        <button
+          onClick={copyFullMarkdown}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '2px 8px',
+            borderRadius: 4,
+            background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.06)',
+            border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : '1px solid rgba(255, 255, 255, 0.12)',
+            color: copiedMsgId === msg.id ? '#4ade80' : 'var(--text-muted, #94a3b8)',
+            fontSize: 11,
+            fontWeight: 600,
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+            flexShrink: 0,
+            marginLeft: isUser ? 0 : 4,
+            marginRight: isUser ? 4 : 0,
+            userSelect: 'none'
+          }}
+          title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
+        >
+          {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
+        </button>
       </div>
 
 {/* Khối 1: Thinking (nếu có) — nằm riêng độc lập, NGOÀI bubble.
-        ẨN khi parts đã chứa thinking (hasThinkingInParts) — thinking interleaved render đúng vị trí trong mảng. */}
-      {!hasThinkingInParts && typeof msg.thinking === 'string' && msg.thinking.trim() && (
+        ẨN hoàn toàn khi tin nhắn đã có parts (hasParts) — thinking, tool, text đều được render xen kẽ tuần tự trong mảng parts. */}
+      {!hasParts && typeof msg.thinking === 'string' && msg.thinking.trim() && (
         <div style={{
           display: 'flex',
           flexDirection: 'column',
@@ -2766,8 +2440,8 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
               output: tc?.output === undefined || tc?.output === null ? undefined : String(tc.output)
             };
             return (
-              <ToolBlockSafe key={safe.tool + '-' + i}>
-                <ToolCallBlock tool={safe.tool} input={safe.input} output={safe.output} isMobile={isMobile} />
+              <ToolBlockSafe key={safe.tool + '-' + i} tool={safe.tool} input={safe.input} output={safe.output}>
+                <ToolCallBlock tool={safe.tool} input={safe.input} output={safe.output} isMobile={isMobile} defaultExpanded={defaultExpandToolcalls} />
               </ToolBlockSafe>
             );
           })}
@@ -2799,8 +2473,8 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
               };
               return (
                 <div key={'pt-' + i} style={{ width: '100%', maxWidth: '100%' }}>
-                  <ToolBlockSafe>
-                    <ToolCallBlock tool={safeTool.tool} input={safeTool.input} output={safeTool.output} isMobile={isMobile} />
+                  <ToolBlockSafe tool={safeTool.tool} input={safeTool.input} output={safeTool.output}>
+                    <ToolCallBlock tool={safeTool.tool} input={safeTool.input} output={safeTool.output} isMobile={isMobile} defaultExpanded={defaultExpandToolcalls} />
                   </ToolBlockSafe>
                 </div>
               );
@@ -2847,6 +2521,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                             background: bubbleBg,
                             color: textColor,
                             padding: '10px 14px',
+                            paddingRight: 48,
                             borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
                             width: 'fit-content',
                             maxWidth: isMobile ? '96%' : '82%',
@@ -2867,6 +2542,31 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                             marginBottom: 4
                           }}
                         >
+                          <button
+                            onClick={copyFullMarkdown}
+                            style={{
+                              position: 'absolute',
+                              top: 6,
+                              right: 6,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              padding: '2px 6px',
+                              borderRadius: 4,
+                              background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                              border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : '1px solid rgba(255, 255, 255, 0.12)',
+                              color: copiedMsgId === msg.id ? '#4ade80' : 'var(--text-muted, #94a3b8)',
+                              fontSize: 10,
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease',
+                              zIndex: 2,
+                              userSelect: 'none'
+                            }}
+                            title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
+                          >
+                            {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
+                          </button>
                           <MarkdownRenderer content={cleanT} isMobile={isMobile} />
                         </div>
                       );
@@ -2879,135 +2579,74 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                       const displayTargetName = pSpawnAgentName || pSpawnRole || 'Agent';
 
                       return (
-                        <div
+                        <UnifiedDirectiveCard
                           key={`pt-${i}-sp-${subIdx}`}
-                          className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
-                          style={{
-                            background: bubbleBg,
-                            color: textColor,
-                            padding: '10px 14px',
-                            borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                            width: 'fit-content',
-                            maxWidth: isMobile ? '96%' : '82%',
-                            minWidth: 0,
-                            overflowWrap: 'anywhere',
-                            boxSizing: 'border-box',
-                            fontSize: 12.5,
-                            lineHeight: 1.45,
-                            whiteSpace: 'normal',
-                            fontFamily: 'inherit',
-                            border: bubbleBorder,
-                            boxShadow: bubbleShadow,
-                            wordBreak: 'break-word',
-                            position: 'relative',
-                            alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
-                            marginLeft: isAlignRight ? 'auto' : undefined,
-                            marginRight: isAlignRight ? undefined : 'auto',
-                            marginBottom: 4
-                          }}
-                        >
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
-                            <div style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'space-between',
-                              gap: 8,
-                              paddingBottom: 6,
-                              borderBottom: '1px solid rgba(168, 85, 247, 0.25)'
-                            }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                <span style={{ fontSize: 14 }}>🚀</span>
-                                <span style={{ fontWeight: 800, fontSize: 11.5, letterSpacing: '0.04em', color: '#c084fc', textTransform: 'uppercase' }}>
-                                  Spawn Agent
-                                </span>
-                              </div>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                {pSpawnRole && (
-                                  <span style={{ padding: '1px 7px', borderRadius: 4, fontSize: 10.5, fontWeight: 700, background: 'rgba(168, 85, 247, 0.25)', border: '1px solid rgba(192, 132, 252, 0.5)', color: '#f3e8ff' }}>
-                                    {pSpawnRole}
-                                  </span>
-                                )}
-                                <span style={{ fontSize: 11.5, fontWeight: 700, color: '#e9d5ff' }}>
-                                  {displayTargetName}
-                                </span>
-                              </div>
-                            </div>
-                            <div style={{ background: 'rgba(15, 23, 42, 0.45)', padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(168, 85, 247, 0.2)' }}>
-                              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                                <span style={{ color: '#c084fc', fontSize: 12, marginTop: 1 }}>📋</span>
-                                <div style={{ flex: 1, minWidth: 0 }}>
-                                  <MarkdownRenderer content={pSpawnTaskDesc || item.raw} isMobile={isMobile} />
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
+                          type="spawn"
+                          title={pSpawnTaskDesc}
+                          role={pSpawnRole}
+                          targetName={displayTargetName}
+                          senderName={srcAgent?.name || 'Orchestrator'}
+                          content={item.data.message || pSpawnTaskDesc || item.raw}
+                          isMobile={isMobile}
+                          bubbleBg={bubbleBg}
+                          bubbleBorder={bubbleBorder}
+                          bubbleShadow={bubbleShadow}
+                          textColor={textColor}
+                          isAlignRight={isAlignRight}
+                          isOpenCode={isOpenCode}
+                          defaultExpanded={defaultExpandToolcalls}
+                        />
+                      );
+                    }
+
+                    if (item.type === 'report') {
+                      const pReportTarget = item.data.target || 'orchestrator';
+                      const pReportTitle = item.data.title || item.data.task || 'Báo Cáo Tiến Độ / Kết Quả';
+                      const pReportContent = item.data.message || item.raw;
+
+                      return (
+                        <UnifiedDirectiveCard
+                          key={`pt-${i}-rp-${subIdx}`}
+                          type="report"
+                          title={pReportTitle}
+                          targetName={pReportTarget}
+                          senderName={srcAgent?.name || msg.from || 'Agent'}
+                          content={pReportContent}
+                          isMobile={isMobile}
+                          bubbleBg={bubbleBg}
+                          bubbleBorder={bubbleBorder}
+                          bubbleShadow={bubbleShadow}
+                          textColor={textColor}
+                          isAlignRight={isAlignRight}
+                          isOpenCode={isOpenCode}
+                          defaultExpanded={defaultExpandToolcalls}
+                        />
                       );
                     }
 
                     if (item.type === 'talk') {
                       const pTalkTarget = item.data.target || '';
-                      const pTalkTaskDesc = item.data.task || '';
+                      const pTalkTaskTitle = item.data.task || '';
+                      const pTalkBody = item.data.message || '';
                       const displayTargetName = pTalkTarget || displayTo || 'Agent';
 
                       return (
-                        <div
-                          key={`pt-${i}-tk-${subIdx}`}
-                          className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
-                          style={{
-                            background: bubbleBg,
-                            color: textColor,
-                            padding: '10px 14px',
-                            borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                            width: 'fit-content',
-                            maxWidth: isMobile ? '96%' : '82%',
-                            minWidth: 0,
-                            overflowWrap: 'anywhere',
-                            boxSizing: 'border-box',
-                            fontSize: 12.5,
-                            lineHeight: 1.45,
-                            whiteSpace: 'normal',
-                            fontFamily: 'inherit',
-                            border: bubbleBorder,
-                            boxShadow: bubbleShadow,
-                            wordBreak: 'break-word',
-                            position: 'relative',
-                            alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
-                            marginLeft: isAlignRight ? 'auto' : undefined,
-                            marginRight: isAlignRight ? undefined : 'auto',
-                            marginBottom: 4
-                          }}
-                        >
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
-                            <div style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'space-between',
-                              gap: 8,
-                              paddingBottom: 6,
-                              borderBottom: '1px solid rgba(99, 102, 241, 0.25)'
-                            }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                <span style={{ fontSize: 14 }}>🎯</span>
-                                <span style={{ fontWeight: 800, fontSize: 11.5, letterSpacing: '0.04em', color: '#818cf8', textTransform: 'uppercase' }}>
-                                  Giao Việc
-                                </span>
-                              </div>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 700 }}>
-                                <span style={{ padding: '2px 8px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(129, 140, 248, 0.5)', color: '#c7d2fe' }}>
-                                  👑 {srcAgent?.name || 'Orchestrator'}
-                                </span>
-                                <span style={{ color: '#818cf8', fontSize: 12 }}>➔</span>
-                                <span style={{ padding: '2px 8px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(148, 163, 184, 0.4)', color: '#f8fafc' }}>
-                                  🤖 {displayTargetName}
-                                </span>
-                              </div>
-                            </div>
-                            <div style={{ background: 'rgba(15, 23, 42, 0.4)', padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(99, 102, 241, 0.18)' }}>
-                              <MarkdownRenderer content={pTalkTaskDesc || item.raw} isMobile={isMobile} />
-                            </div>
-                          </div>
-                        </div>
+<UnifiedDirectiveCard
+                           key={`pt-${i}-tk-${subIdx}`}
+                           type="talk"
+                           title={pTalkTaskTitle || (pTalkBody ? (pTalkBody.split('\n')[0].substring(0, 80) + '...') : '')}
+                           targetName={displayTargetName}
+                           senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
+                           content={pTalkBody || pTalkTaskTitle || item.raw}
+                           isMobile={isMobile}
+                           bubbleBg={bubbleBg}
+                           bubbleBorder={bubbleBorder}
+                           bubbleShadow={bubbleShadow}
+                           textColor={textColor}
+                           isAlignRight={isAlignRight}
+                           isOpenCode={isOpenCode}
+                           defaultExpanded={defaultExpandToolcalls}
+                         />
                       );
                     }
 
@@ -3075,280 +2714,325 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
             userSelect: 'text'
           }}
         >
-          {/* A. Render các Directive Cards nếu có directive */}
+          {/* A. Render tuần tự theo đúng thứ tự xuất hiện của từng Directive/Text item trong CÙNG 1 KHỐI BUBBLE THỐNG NHẤT */}
           {activeDirectives.length > 0 ? (
-            activeDirectives.map((dir, dIdx) => {
-              if (dir.type === 'spawn') {
-                const curRole = dir.data.role || '';
-                const curName = dir.data.name || '';
-                const curTask = dir.data.task || cleanTaskTitle || '';
-                const dTarget = curName || curRole || 'New Agent';
-
-                return (
-                  <div
-                    key={`msg-dir-sp-${dIdx}`}
-                    className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
-                    style={{
-                      background: bubbleBg,
-                      color: textColor,
-                      padding: '10px 14px',
-                      borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                      width: 'fit-content',
-                      maxWidth: isMobile ? '96%' : '82%',
-                      minWidth: 0,
-                      overflowWrap: 'anywhere',
-                      boxSizing: 'border-box',
-                      fontSize: isOpenCode ? 12 : 12.5,
-                      lineHeight: 1.45,
-                      whiteSpace: 'normal',
-                      fontFamily: 'inherit',
-                      border: bubbleBorder,
-                      boxShadow: bubbleShadow,
-                      wordBreak: 'break-word',
-                      position: 'relative',
-                      userSelect: 'text',
-                      alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
-                      marginLeft: isAlignRight ? 'auto' : undefined,
-                      marginRight: isAlignRight ? undefined : 'auto'
-                    }}
-                  >
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
-                      <div style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        gap: 8,
-                        paddingBottom: 6,
-                        borderBottom: '1px solid rgba(168, 85, 247, 0.25)'
-                      }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <span style={{ fontSize: 14 }}>🚀</span>
-                          <span style={{ fontWeight: 800, fontSize: 11.5, letterSpacing: '0.04em', color: '#c084fc', textTransform: 'uppercase' }}>
-                            Spawn Agent
-                          </span>
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          {curRole && (
-                            <span style={{ padding: '1px 7px', borderRadius: 4, fontSize: 10.5, fontWeight: 700, background: 'rgba(168, 85, 247, 0.25)', border: '1px solid rgba(192, 132, 252, 0.5)', color: '#f3e8ff' }}>
-                              {curRole}
-                            </span>
-                          )}
-                          <span className="af-spawn-target-name" style={{ fontSize: 11.5, fontWeight: 700, color: '#e9d5ff' }}>
-                            {dTarget}
-                          </span>
-                        </div>
-                      </div>
-                      <div style={{ background: 'rgba(15, 23, 42, 0.45)', padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(168, 85, 247, 0.2)' }}>
-                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                          <span style={{ color: '#c084fc', fontSize: 12, marginTop: 1 }}>📋</span>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <MarkdownRenderer content={curTask || dir.raw} isMobile={isMobile} />
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              }
-
-              // dir.type === 'talk'
-              const curTarget = dir.data.target || displayTo || 'Agent';
-              const curTask = dir.data.task || '';
-
-              return (
-                <div
-                  key={`msg-dir-tk-${dIdx}`}
-                  className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
-                  style={{
-                    background: bubbleBg,
-                    color: textColor,
-                    padding: '10px 14px',
-                    borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                    width: 'fit-content',
-                    maxWidth: isMobile ? '96%' : '82%',
-                    minWidth: 0,
-                    overflowWrap: 'anywhere',
-                    boxSizing: 'border-box',
-                    fontSize: isOpenCode ? 12 : 12.5,
-                    lineHeight: 1.45,
-                    whiteSpace: 'normal',
-                    fontFamily: 'inherit',
-                    border: bubbleBorder,
-                    boxShadow: bubbleShadow,
-                    wordBreak: 'break-word',
-                    position: 'relative',
-                    userSelect: 'text',
-                    alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
-                    marginLeft: isAlignRight ? 'auto' : undefined,
-                    marginRight: isAlignRight ? undefined : 'auto'
-                  }}
-                >
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      gap: 8,
-                      paddingBottom: 6,
-                      borderBottom: '1px solid rgba(99, 102, 241, 0.25)'
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span style={{ fontSize: 14 }}>🎯</span>
-                        <span style={{ fontWeight: 800, fontSize: 11.5, letterSpacing: '0.04em', color: '#818cf8', textTransform: 'uppercase' }}>
-                          Giao Việc
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 700 }}>
-                        <span className="af-directive-header-orch" style={{ padding: '2px 8px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(129, 140, 248, 0.5)', color: '#c7d2fe' }}>
-                          👑 {srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
-                        </span>
-                        <span style={{ color: '#818cf8', fontSize: 12 }}>➔</span>
-                        <span className="af-directive-header-target" style={{ padding: '2px 8px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(148, 163, 184, 0.4)', color: '#f8fafc' }}>
-                          🤖 {curTarget}
-                        </span>
-                      </div>
-                    </div>
-                    <div style={{ background: 'rgba(15, 23, 42, 0.4)', padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(99, 102, 241, 0.18)' }}>
-                      <MarkdownRenderer content={curTask || dir.raw} isMobile={isMobile} />
-                    </div>
-                  </div>
-                </div>
-              );
-            })
-          ) : (isOrchestratorTask && !hasDuplicateIndependentTalk) ? (
             <div
               className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
               style={{
-                background: bubbleBg,
-                color: textColor,
-                padding: '10px 14px',
-                borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+                background: isOrchestratorTask ? '#ffffff' : bubbleBg,
+                color: isOrchestratorTask ? '#0f172a' : textColor,
+                padding: '12px 14px',
+                paddingRight: 48,
+                borderRadius: '16px 16px 16px 4px',
                 width: 'fit-content',
-                maxWidth: isMobile ? '96%' : '82%',
+                maxWidth: isMobile ? '96%' : '85%',
                 minWidth: 0,
                 overflowWrap: 'anywhere',
                 boxSizing: 'border-box',
                 fontSize: isOpenCode ? 12 : 12.5,
-                lineHeight: 1.45,
+                lineHeight: 1.5,
                 whiteSpace: 'normal',
                 fontFamily: 'inherit',
-                border: bubbleBorder,
-                boxShadow: bubbleShadow,
+                border: isOrchestratorTask ? '1px solid #e2e8f0' : '1px solid rgba(255, 255, 255, 0.08)',
+                boxShadow: isOrchestratorTask ? '0 1px 3px rgba(0, 0, 0, 0.05)' : bubbleShadow,
                 wordBreak: 'break-word',
                 position: 'relative',
                 userSelect: 'text',
                 alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
                 marginLeft: isAlignRight ? 'auto' : undefined,
-                marginRight: isAlignRight ? undefined : 'auto'
+                marginRight: isAlignRight ? undefined : 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 10
               }}
             >
-              {isSpawnMsg ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
-                  <div style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: 8,
-                    paddingBottom: 6,
-                    borderBottom: '1px solid rgba(168, 85, 247, 0.25)'
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span style={{ fontSize: 14 }}>🚀</span>
-                      <span style={{ fontWeight: 800, fontSize: 11.5, letterSpacing: '0.04em', color: '#c084fc', textTransform: 'uppercase' }}>
-                        Spawn Agent
-                      </span>
+              {/* Nút Copy cho bubble Orchestrator Directive */}
+              <button
+                onClick={copyFullMarkdown}
+                style={{
+                  position: 'absolute',
+                  top: 8,
+                  right: 8,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '2px 8px',
+                  borderRadius: 4,
+                  background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : (isOrchestratorTask ? '#f1f5f9' : 'rgba(255, 255, 255, 0.08)'),
+                  border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : (isOrchestratorTask ? '1px solid #cbd5e1' : '1px solid rgba(255, 255, 255, 0.12)'),
+                  color: copiedMsgId === msg.id ? '#16a34a' : (isOrchestratorTask ? '#475569' : 'var(--text-muted, #94a3b8)'),
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                  zIndex: 2,
+                  userSelect: 'none'
+                }}
+                title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
+              >
+                {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
+              </button>
+              {activeDirectives.map((dir, dIdx) => {
+                if (dir.type === 'text') {
+                  const cleanT = stripSystemTaskTags(stripTalkTags(dir.text || dir.data?.raw || '')).trim();
+                  if (!cleanT) return null;
+                  return (
+                    <div key={`msg-dir-txt-${dIdx}`} style={{ width: '100%', lineHeight: 1.55, color: isOrchestratorTask ? '#0f172a' : textColor }}>
+                      <MarkdownRenderer content={cleanT} isMobile={isMobile} />
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      {spawnRole && (
-                        <span style={{ padding: '1px 7px', borderRadius: 4, fontSize: 10.5, fontWeight: 700, background: 'rgba(168, 85, 247, 0.25)', border: '1px solid rgba(192, 132, 252, 0.5)', color: '#f3e8ff' }}>
-                          {spawnRole}
-                        </span>
-                      )}
-                      <span className="af-spawn-target-name" style={{ fontSize: 11.5, fontWeight: 700, color: '#e9d5ff' }}>
-                        {spawnAgentName || displayTo || 'New Agent'}
-                      </span>
-                    </div>
+                  );
+                }
+
+                if (dir.type === 'spawn') {
+                  const curRole = dir.data.role || '';
+                  const curName = dir.data.name || '';
+                  const curTask = dir.data.task || cleanTaskTitle || '';
+                  const dTarget = curName || curRole || 'New Agent';
+
+                  return (
+<UnifiedDirectiveCard
+                       key={`msg-dir-sp-${dIdx}`}
+                       type="spawn"
+                       title={curTask}
+                       role={curRole}
+                       targetName={dTarget}
+                       senderName={srcAgent?.name || 'Orchestrator'}
+                       content={dir.data.message || curTask || dir.raw}
+                       isMobile={isMobile}
+                       bubbleBg="#ffffff"
+                       bubbleBorder="1px solid #e2e8f0"
+                       bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                       textColor="#0f172a"
+                       isAlignRight={isAlignRight}
+                       isOpenCode={isOpenCode}
+                       defaultExpanded={defaultExpandToolcalls}
+                     />
+                  );
+                }
+
+                if (dir.type === 'report') {
+                  const curReportTarget = dir.data.target || 'orchestrator';
+                  const curReportTitle = dir.data.title || dir.data.task || 'Báo Cáo Tiến Độ / Kết Quả';
+                  const curReportContent = dir.data.message || dir.raw;
+
+                  return (
+                    <UnifiedDirectiveCard
+                      key={`msg-dir-rp-${dIdx}`}
+                      type="report"
+                      title={curReportTitle}
+                      targetName={curReportTarget}
+                      senderName={srcAgent?.name || msg.from || 'Agent'}
+                      content={curReportContent}
+                      isMobile={isMobile}
+                      bubbleBg="#ffffff"
+                      bubbleBorder="1px solid #e2e8f0"
+                      bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                      textColor="#0f172a"
+                      isAlignRight={isAlignRight}
+                      isOpenCode={isOpenCode}
+                    />
+                  );
+                }
+
+                // dir.type === 'talk'
+                const curTarget = dir.data.target || displayTo || 'Agent';
+                const curTaskTitle = dir.data.task || '';
+                const curBody = dir.data.message || '';
+                const fullTalkContent = curBody || curTaskTitle || dir.raw;
+
+                return (
+                  <UnifiedDirectiveCard
+                    key={`msg-dir-tk-${dIdx}`}
+                    type="talk"
+                    title={curTaskTitle || (curBody ? (curBody.split('\n')[0].substring(0, 80) + '...') : '')}
+                    targetName={curTarget}
+                    senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
+                    content={fullTalkContent}
+                    isMobile={isMobile}
+                    bubbleBg="#ffffff"
+                    bubbleBorder="1px solid #e2e8f0"
+                    bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                    textColor="#0f172a"
+                    isAlignRight={isAlignRight}
+                    isOpenCode={isOpenCode}
+                  />
+                );
+              })}
+            </div>
+          ) : isOrchestratorTask ? (
+            <div
+              className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
+              style={{
+                background: isOrchestratorTask ? '#ffffff' : bubbleBg,
+                color: isOrchestratorTask ? '#0f172a' : textColor,
+                padding: '12px 14px',
+                paddingRight: 48,
+                borderRadius: '16px 16px 16px 4px',
+                width: 'fit-content',
+                maxWidth: isMobile ? '96%' : '85%',
+                minWidth: 0,
+                overflowWrap: 'anywhere',
+                boxSizing: 'border-box',
+                fontSize: isOpenCode ? 12 : 12.5,
+                lineHeight: 1.5,
+                whiteSpace: 'normal',
+                fontFamily: 'inherit',
+                border: isOrchestratorTask ? '1px solid #e2e8f0' : '1px solid rgba(255, 255, 255, 0.08)',
+                boxShadow: isOrchestratorTask ? '0 1px 3px rgba(0, 0, 0, 0.05)' : bubbleShadow,
+                wordBreak: 'break-word',
+                position: 'relative',
+                userSelect: 'text',
+                alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
+                marginLeft: isAlignRight ? 'auto' : undefined,
+                marginRight: isAlignRight ? undefined : 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 10
+              }}
+            >
+              {/* Nút Copy cho bubble dẫn dắt Orchestrator */}
+              <button
+                onClick={copyFullMarkdown}
+                style={{
+                  position: 'absolute',
+                  top: 8,
+                  right: 8,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '2px 8px',
+                  borderRadius: 4,
+                  background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : (isOrchestratorTask ? '#f1f5f9' : 'rgba(255, 255, 255, 0.08)'),
+                  border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : (isOrchestratorTask ? '1px solid #cbd5e1' : '1px solid rgba(255, 255, 255, 0.12)'),
+                  color: copiedMsgId === msg.id ? '#16a34a' : (isOrchestratorTask ? '#475569' : 'var(--text-muted, #94a3b8)'),
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                  zIndex: 2,
+                  userSelect: 'none'
+                }}
+                title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
+              >
+                {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
+              </button>
+              {/* Nếu có lời dẫn tự sự conversationText, LUÔN LUÔN RENDER bảo toàn 100% */}
+              {(() => {
+                const convText = stripSystemTaskTags(conversationText).trim();
+                if (!convText) return null;
+                return (
+                  <div style={{ width: '100%', lineHeight: 1.55, color: isOrchestratorTask ? '#0f172a' : textColor }}>
+                    <MarkdownRenderer content={convText} isMobile={isMobile} />
                   </div>
-                  <div style={{ background: 'rgba(15, 23, 42, 0.45)', padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(168, 85, 247, 0.2)' }}>
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
-                      <span style={{ color: '#c084fc', fontSize: 12, marginTop: 1 }}>📋</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <MarkdownRenderer content={spawnTaskDesc || cleanTaskTitle || 'Khởi tạo agent'} isMobile={isMobile} />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: isMobile ? '100%' : 360, maxWidth: isMobile ? '100%' : '85%' }}>
-                  <div style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: 8,
-                    paddingBottom: 6,
-                    borderBottom: '1px solid rgba(99, 102, 241, 0.25)'
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span style={{ fontSize: 14 }}>🎯</span>
-                      <span style={{ fontWeight: 800, fontSize: 11.5, letterSpacing: '0.04em', color: '#818cf8', textTransform: 'uppercase' }}>
-                        Giao Việc
-                      </span>
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 700 }}>
-                      <span className="af-directive-header-orch" style={{ padding: '2px 8px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(129, 140, 248, 0.5)', color: '#c7d2fe' }}>
-                        👑 {srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
-                      </span>
-                      <span style={{ color: '#818cf8', fontSize: 12 }}>➔</span>
-                      <span className="af-directive-header-target" style={{ padding: '2px 8px', borderRadius: 6, background: '#0f172a', border: '1px solid rgba(148, 163, 184, 0.4)', color: '#f8fafc' }}>
-                        🤖 {displayTo || 'Agent'}
-                      </span>
-                    </div>
-                  </div>
-                  <div style={{ background: 'rgba(15, 23, 42, 0.4)', padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(99, 102, 241, 0.18)' }}>
-                    {cleanTaskTitle && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, fontSize: 11.5, fontWeight: 700, color: '#93c5fd' }}>
-                        <span>📌</span>
-                        <span>{cleanTaskTitle}</span>
-                      </div>
-                    )}
-                    <MarkdownRenderer content={talkTaskDesc || cleanTaskTitle || (typeof msg.content === 'string' ? msg.content : '')} isMobile={isMobile} />
-                  </div>
-                </div>
+                );
+              })()}
+
+              {/* Directive Card nhúng */}
+              {!hasDuplicateIndependentTalk && (
+                isSpawnMsg ? (
+                  <UnifiedDirectiveCard
+                    type="spawn"
+                    title={spawnTaskDesc || cleanTaskTitle || 'Khởi tạo agent'}
+                    role={spawnRole}
+                    targetName={spawnAgentName || displayTo || 'New Agent'}
+                    senderName={srcAgent?.name || 'Orchestrator'}
+                    content={spawnTaskDesc || cleanTaskTitle || 'Khởi tạo agent'}
+                    isMobile={isMobile}
+                    bubbleBg="#ffffff"
+                    bubbleBorder="1px solid #e2e8f0"
+                    bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                    textColor="#0f172a"
+                    isAlignRight={isAlignRight}
+                    isOpenCode={isOpenCode}
+                  />
+                ) : (
+                  <UnifiedDirectiveCard
+                    type="talk"
+                    title={cleanTaskTitle || (talkTaskDesc ? (talkTaskDesc.split('\n')[0].substring(0, 80) + '...') : '')}
+                    targetName={displayTo || 'Agent'}
+                    senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
+                    content={talkTaskDesc || cleanTaskTitle || (typeof msg.content === 'string' ? msg.content : '')}
+                    isMobile={isMobile}
+                    bubbleBg="#ffffff"
+                    bubbleBorder="1px solid #e2e8f0"
+                    bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                    textColor="#0f172a"
+                    isAlignRight={isAlignRight}
+                    isOpenCode={isOpenCode}
+                  />
+                )
               )}
             </div>
           ) : null}
 
           {/* Render riêng bubble trò chuyện cho conversationText hoặc body (nếu có lời thoại) */}
-          {(conversationText || body) && (
-            <div
-              className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
-              style={{
-                background: isOrchestratorTask ? 'rgba(30, 41, 59, 0.65)' : bubbleBg,
-                color: textColor,
-                padding: '10px 14px',
-                borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                width: 'fit-content',
-                maxWidth: isMobile ? '96%' : '82%',
-                minWidth: 0,
-                overflowWrap: 'anywhere',
-                boxSizing: 'border-box',
-                fontSize: isOpenCode ? 12 : 12.5,
-                lineHeight: 1.45,
-                whiteSpace: 'normal',
-                fontFamily: 'inherit',
-                border: isOrchestratorTask ? '1px solid rgba(148, 163, 184, 0.2)' : bubbleBorder,
-                boxShadow: bubbleShadow,
-                wordBreak: 'break-word',
-                position: 'relative',
-                userSelect: 'text',
-                alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
-                marginLeft: isAlignRight ? 'auto' : undefined,
-                marginRight: isAlignRight ? undefined : 'auto'
-              }}
-            >
-              <MarkdownRenderer content={conversationText || body} isMobile={isMobile} />
-            </div>
-          )}
+          {(() => {
+            // Khi đây là tin nhắn giao việc đã có Thẻ Giao Việc (UnifiedDirectiveCard):
+            // TUYỆT ĐỐI KHÔNG vẽ thêm bong bóng text nữa nếu conversationText trùng với nội dung thẻ!
+            if (isOrchestratorTask) return null;
+
+            const rawDisplayText = conversationText || body;
+            const cleanDisplayText = stripSystemTaskTags(rawDisplayText).trim();
+            if (!cleanDisplayText) return null;
+
+            return (
+              <div
+                className={`af-bubble${isAlignRight ? ' af-bubble-user' : ''}`}
+                style={{
+                  background: bubbleBg,
+                  color: textColor,
+                  padding: '10px 14px',
+                  paddingRight: 48,
+                  borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+                  width: 'fit-content',
+                  maxWidth: isMobile ? '96%' : '82%',
+                  minWidth: 0,
+                  overflowWrap: 'anywhere',
+                  boxSizing: 'border-box',
+                  fontSize: isOpenCode ? 12 : 12.5,
+                  lineHeight: 1.45,
+                  whiteSpace: 'normal',
+                  fontFamily: 'inherit',
+                  border: bubbleBorder,
+                  boxShadow: bubbleShadow,
+                  wordBreak: 'break-word',
+                  position: 'relative',
+                  userSelect: 'text',
+                  alignSelf: isAlignRight ? 'flex-end' : 'flex-start',
+                  marginLeft: isAlignRight ? 'auto' : undefined,
+                  marginRight: isAlignRight ? undefined : 'auto'
+                }}
+              >
+                {/* Nút Copy đặt ở góc trên bên phải của Bubble text */}
+                <button
+                  onClick={copyFullMarkdown}
+                  style={{
+                    position: 'absolute',
+                    top: 6,
+                    right: 6,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '2px 6px',
+                    borderRadius: 4,
+                    background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                    border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : '1px solid rgba(255, 255, 255, 0.12)',
+                    color: copiedMsgId === msg.id ? '#4ade80' : 'var(--text-muted, #94a3b8)',
+                    fontSize: 10,
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease',
+                    zIndex: 2,
+                    userSelect: 'none'
+                  }}
+                  title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
+                >
+                  {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
+                </button>
+                <MarkdownRenderer content={cleanDisplayText} isMobile={isMobile} />
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -3376,12 +3060,174 @@ interface Props {
   offlineForText?: string;
   uptimeText?: string;
   showToolBlocks?: boolean;
+  defaultExpandToolcalls?: boolean;
   queuedMessages?: ChatMsg[];
   onFlushQueue?: () => void;
   onClearQueue?: () => void;
   onRemoveQueueItem?: (index: number) => void;
   onForceSendSingle?: (msgId: string, content: string, targetId: string) => void;
 }
+
+// ============ CHAT INPUT BAR COMPONENT (ISOLATED STATE) ============
+// Tách biệt hoàn toàn state ô gõ văn bản khỏi luồng re-render của ChatPanel (khi stream token)
+// Đảm bảo gõ phím mượt mà 60 FPS, không lag giật, bảo toàn nhịp gõ tiếng Việt / Unikey / IME
+interface ChatInputBarProps {
+  loading: boolean;
+  isMobile?: boolean;
+  onSend: (message: string) => void;
+  onStop?: () => void;
+}
+
+const ChatInputBar = React.memo(function ChatInputBar({
+  loading,
+  isMobile = false,
+  onSend,
+  onStop
+}: ChatInputBarProps) {
+  const [hasText, setHasText] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
+  const isSubmittingRef = useRef<boolean>(false);
+
+  const handleSend = useCallback((e?: React.SyntheticEvent) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (isSubmittingRef.current) return;
+    const rawVal = textareaRef.current ? textareaRef.current.value : '';
+    const trimmed = rawVal.trim().normalize('NFC');
+    if (!trimmed) return;
+    isSubmittingRef.current = true;
+    setTimeout(() => {
+      isSubmittingRef.current = false;
+    }, 800);
+
+    onSend(trimmed);
+    if (textareaRef.current) {
+      textareaRef.current.value = '';
+      textareaRef.current.style.height = 'auto';
+    }
+    setHasText(false);
+  }, [onSend]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    // Bỏ qua Enter khi đang composition IME (gõ tiếng Việt/Unikey):
+    // Native isComposing, isComposingRef hoặc keyCode === 229 (IME pending)
+    if (e.key === 'Enter' && !e.shiftKey) {
+      if (isComposingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      e.stopPropagation();
+      handleSend(e);
+    } else if (e.key === 'Escape') {
+      if (e.repeat) {
+        e.preventDefault();
+        return;
+      }
+      if (loading && onStop) {
+        onStop();
+      }
+    }
+  }, [handleSend, loading, onStop]);
+
+  return (
+    <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+      <textarea
+        ref={textareaRef}
+        defaultValue=""
+        onChange={(e) => {
+          const currentHasText = Boolean(e.target.value.trim());
+          setHasText(prev => (prev !== currentHasText ? currentHasText : prev));
+        }}
+        onCompositionStart={() => { isComposingRef.current = true; }}
+        onCompositionEnd={() => { isComposingRef.current = false; }}
+        onKeyDown={handleKeyDown}
+        placeholder={loading ? "Type to queue next message... (Enter to send)" : "Type your message or instructions... (Enter to send, Shift+Enter for newline)"}
+        style={{
+          flex: 1,
+          background: 'var(--bg-input)',
+          color: 'var(--text-primary)',
+          border: '1px solid var(--af-border-strong)',
+          borderRadius: 'var(--radius-lg)',
+          padding: '12px 16px',
+          fontSize: isMobile ? 16 : 13,
+          lineHeight: 1.5,
+          resize: 'none',
+          minHeight: 44,
+          maxHeight: 140,
+          fontFamily: 'inherit',
+          outline: 'none',
+          transition: 'border-color 0.2s, box-shadow 0.2s'
+        }}
+        onFocus={(e) => {
+          e.currentTarget.style.borderColor = 'var(--accent)';
+          e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-soft)';
+        }}
+        onBlur={(e) => {
+          e.currentTarget.style.borderColor = 'var(--af-border-strong)';
+          e.currentTarget.style.boxShadow = 'none';
+        }}
+        rows={1}
+      />
+
+      <button
+        onClick={handleSend}
+        disabled={!hasText}
+        title={loading ? 'Queue' : 'Send'}
+        style={{
+          background: hasText ? 'linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%)' : 'var(--bg-input)',
+          color: hasText ? 'var(--text-primary)' : 'var(--text-muted)',
+          border: hasText ? 'none' : '1px solid var(--af-border-strong)',
+          borderRadius: 'var(--radius-md)',
+          width: 44,
+          padding: 0,
+          fontSize: 20,
+          cursor: hasText ? 'pointer' : 'not-allowed',
+          fontWeight: 700,
+          height: 44,
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          boxShadow: hasText ? '0 2px 10px rgba(37, 99, 235, 0.3)' : 'none',
+          transition: 'all 0.2s'
+        }}
+        onMouseOver={(e) => {
+          if (hasText) e.currentTarget.style.transform = 'scale(1.04)';
+        }}
+        onMouseOut={(e) => {
+          e.currentTarget.style.transform = 'scale(1)';
+        }}
+      >
+        <span>↑</span>
+      </button>
+
+      {loading && (
+        <button
+          onClick={onStop}
+          title="Stop agent (Esc)"
+          style={{
+            background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)',
+            color: 'white',
+            border: 'none',
+            borderRadius: 12,
+            padding: '12px 16px',
+            fontSize: 13,
+            cursor: 'pointer',
+            fontWeight: 600,
+            height: 44,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            boxShadow: '0 2px 10px rgba(239, 68, 68, 0.3)'
+          }}
+        >
+          <span>⏹</span>
+          {!isMobile && <span>Stop</span>}
+        </button>
+      )}
+    </div>
+  );
+});
 
 export function ChatPanel({
   messages,
@@ -3408,22 +3254,23 @@ export function ChatPanel({
   connStatus,
   offlineForText,
   uptimeText,
-  showToolBlocks = true
+  showToolBlocks = true,
+  defaultExpandToolcalls = false
 }: Props) {
-  const [hasText, setHasText] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const isComposingRef = useRef(false);
   const [collapsedReports, setCollapsedReports] = useState<Record<string, boolean>>({});
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
   const initialLoadRef = useRef(true);
+  // Fix B: Lưu vị trí scroll trước khi re-render → restore sau nếu user KHÔNG ở gần đáy
+  const scrollPosRef = useRef(0);
   const AUTO_SCROLL_THRESHOLD = 150;
 
   // ============ VIRTUALIZED TAIL WINDOW ============
   // Chỉ render N tin nhắn MỚI NHẤT khi vào hội thoại → load nhanh (<150ms) kể cả history dài.
-  const INITIAL_VISIBLE_COUNT = 50;
+  // Giới hạn 100 tin nhắn gần nhất để giữ DOM cực nhẹ, hạ nhiệt RAM Client dưới 80MB.
+  const INITIAL_VISIBLE_COUNT = 100;
   const LOAD_OLDER_STEP = 50;
   const TOP_LOAD_TRIGGER_PX = 80;
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_COUNT);
@@ -3449,7 +3296,59 @@ export function ChatPanel({
 
   const rawDisplay: any[] = allMessages && allMessages.length >= 0 ? allMessages as any[] : messages as any[];
   const displayMessages = useMemo(() => {
-    return [...rawDisplay].sort((a, b) => {
+    // Khử trùng lặp triệt để theo ID hoặc content+from+time gần nhau trước khi sắp xếp hiển thị
+    const deduped: any[] = [];
+    const seenIds = new Set<string>();
+
+    for (const m of rawDisplay) {
+      if (!m) continue;
+      const mId = m.id ? String(m.id) : '';
+      if (mId && seenIds.has(mId)) continue;
+
+      const cleanCur = (m.content || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
+      const mTime = Number(m.timestamp) || 0;
+
+      // 1. Tránh lặp tin nhắn user (optimistic temp-id vs server canonical id, hoặc lệch to: orchestrator vs UUID)
+      if (m.from === 'user') {
+        const isContentDup = deduped.some(prev => {
+          if (prev.from !== 'user') return false;
+          const cleanPrev = (prev.content || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
+          if (!cleanCur || !cleanPrev || cleanCur !== cleanPrev) return false;
+          // Nếu cả 2 tin nhắn đều có timestamp và cách nhau > 5 phút thì coi là 2 lần nhập khác nhau
+          const prevTime = Number(prev.timestamp) || 0;
+          if (mTime && prevTime && Math.abs(prevTime - mTime) > 300000) return false;
+          return true;
+        });
+        if (isContentDup) continue;
+      }
+
+      // 2. Tránh lặp tin nhắn Agent / Orchestrator (bị triple hoặc đúp giữa stream bubble và canonical message)
+      if (m.from && m.from !== 'user') {
+        const isAgentDup = deduped.some(prev => {
+          if (prev.from !== m.from) return false;
+          // Không so sánh tin nhắn quá rỗng
+          if (!cleanCur || cleanCur.length < 5) return false;
+          const cleanPrev = (prev.content || '').trim().normalize('NFC').replace(/\s+/g, ' ');
+          if (cleanPrev === cleanCur && Math.abs((Number(prev.timestamp) || 0) - mTime) < 15000) {
+            return true;
+          }
+          // Khớp cả trường hợp 1 bên là tin stream đang mở và 1 bên là tin chốt
+          const isOneStreaming = prev.isStreaming || m.isStreaming;
+          if (isOneStreaming && Math.abs((Number(prev.timestamp) || 0) - mTime) < 30000) {
+            if (cleanPrev.startsWith(cleanCur.substring(0, 50)) || cleanCur.startsWith(cleanPrev.substring(0, 50))) {
+              return true;
+            }
+          }
+          return false;
+        });
+        if (isAgentDup) continue;
+      }
+
+      if (mId) seenIds.add(mId);
+      deduped.push(m);
+    }
+
+    return deduped.sort((a, b) => {
       const tA = Number(a.timestamp) || 0;
       const tB = Number(b.timestamp) || 0;
       return tA - tB;
@@ -3530,7 +3429,31 @@ export function ChatPanel({
         setShowScrollBtn(false);
       }
     }
-  }, [lastMsgSig, displayMessages.length]);
+  }, [lastMsgSig, displayMessages.length, isMobile]);
+
+  // Fix B: Lưu vị trí scroll trước khi App.tsx setAllMessages() re-render,
+  // restore sau nếu user không ở gần đáy (tránh nhảy đầu khi tab quay lại/fetchHistory).
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // Chỉ save khi đang ở xa đáy; nếu ở gần đáy thì auto-scroll là mong muốn.
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom > AUTO_SCROLL_THRESHOLD) {
+      scrollPosRef.current = el.scrollTop;
+    } else {
+      scrollPosRef.current = 0;
+    }
+  }, [allMessages]);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const saved = scrollPosRef.current;
+    if (saved > 0 && !isNearBottomRef.current) {
+      el.scrollTop = saved;
+      scrollPosRef.current = 0;
+    }
+  }, [displayMessages]);
 
   // Lần mount đầu tiên (hoặc phiên mới sau khi display rỗng) → scroll đáy một lần, không smooth giật.
   useEffect(() => {
@@ -3560,36 +3483,6 @@ export function ChatPanel({
     }
     loadingOlderRef.current = false;
   }, [visibleCount, totalLen]);
-
-  const handleSend = () => {
-    const rawVal = textareaRef.current ? textareaRef.current.value : '';
-    const trimmed = rawVal.trim().normalize('NFC');
-    if (!trimmed) return;
-    onSend(trimmed);
-    if (textareaRef.current) {
-      textareaRef.current.value = '';
-      textareaRef.current.style.height = 'auto';
-    }
-    setHasText(false);
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Bỏ qua Enter khi đang composition IME (gõ tiếng Việt/Unikey):
-    // Native isComposing, isComposingRef hoặc keyCode === 229 (IME pending)
-    if (e.key === 'Enter' && !e.shiftKey) {
-      if (isComposingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
-      e.preventDefault();
-      handleSend();
-    } else if (e.key === 'Escape') {
-      if (e.repeat) {
-        e.preventDefault();
-        return;
-      }
-      if (loading && onStop) {
-        onStop();
-      }
-    }
-  };
 
   const toggleReport = useCallback((msgId: string) => {
     setCollapsedReports(prev => ({
@@ -3849,22 +3742,45 @@ export function ChatPanel({
                     transition: 'all 0.2s'
                   }}
                 >
-                  ⬆ Load {Math.min(LOAD_OLDER_STEP, hiddenOlderCount)} older messages ({hiddenOlderCount} remaining)
+                  ⬆ Tải thêm tin cũ ({hiddenOlderCount} tin nhắn còn lại)
                 </button>
               </div>
             )}
             {(() => {
-              // FIX: Skip opencode system wrapper message ("⚡ OpenCode") when the
-              // next message from the same agent is a report, to avoid double rendering
-              // the report (system wrapper + internal agent report card).
+              // BỘ LỌC DEDUP RENDER CUỐI CÙNG (FINAL RENDER PASS DEDUP):
               const deduplicatedMessages = visibleMessages.filter((msg: any, idx: number) => {
+                const cleanCur = typeof msg.content === 'string' ? msg.content.trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ') : '';
+                const curTime = msg.timestamp ? new Date(msg.timestamp).getTime() : 0;
+
+                const isUserMsg = msg.from === 'user' || msg.role === 'user';
+                const isSystemMsg = msg.from === 'system';
                 const isWrapper = msg.msgType === 'opencode' && msg.content;
-                if (!isWrapper) return true;
-                const next = visibleMessages[idx + 1];
-                if (!next) return true;
-                const sameAgent = !!msg.agentId && msg.agentId === next.agentId;
-                const nextIsReport = !!next.content && (next.content.includes('=== TASK REPORT ===') || next.content.includes('=== ERROR REPORT ===') || next.content.includes('=== AGENT MESSAGE ==='));
-                return !(sameAgent && nextIsReport);
+
+                // 1. Dedup user/system toàn mảng (không chỉ adjacent)
+                if (isUserMsg || isSystemMsg) {
+                  const hasDup = visibleMessages.some((prev: any, pIdx: number) => {
+                    if (pIdx >= idx) return false;
+                    if (prev.from !== msg.from) return false;
+                    const cleanPrev = typeof prev.content === 'string' ? prev.content.trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ') : '';
+                    if (!cleanCur || !cleanPrev || cleanCur !== cleanPrev) return false;
+                    const prevTime = prev.timestamp ? new Date(prev.timestamp).getTime() : 0;
+                    if (curTime && prevTime && Math.abs(curTime - prevTime) > 300000) return false;
+                    return true;
+                  });
+                  if (hasDup) return false;
+                }
+
+                // 2. Wrapper + next report merge
+                if (isWrapper) {
+                  const next = visibleMessages[idx + 1];
+                  if (next) {
+                    const sameAgent = !!msg.agentId && msg.agentId === next.agentId;
+                    const nextIsReport = !!next.content && (next.content.includes('=== TASK REPORT ===') || next.content.includes('=== ERROR REPORT ===') || next.content.includes('=== AGENT MESSAGE ==='));
+                    if (sameAgent && nextIsReport) return false;
+                  }
+                }
+
+                return true;
               });
               return deduplicatedMessages.map((msg: any) => (
                 <MessageItem
@@ -3874,6 +3790,8 @@ export function ChatPanel({
                   isCollapsed={!!collapsedReports[msg.id]}
                   onToggleReport={toggleReport}
                   isMobile={isMobile}
+                  showToolBlocks={showToolBlocks}
+                  defaultExpandToolcalls={defaultExpandToolcalls}
                   selectedAgentId={selectedAgentId}
                   queuedMessages={queuedMessages}
                   onForceSendSingle={onForceSendSingle}
@@ -4084,103 +4002,12 @@ export function ChatPanel({
           </div>
         )}
 
-        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-          <textarea
-            ref={textareaRef}
-            defaultValue=""
-            onChange={(e) => {
-              const currentHasText = Boolean(e.target.value.trim());
-              // Chỉ cập nhật state khi trạng thái rỗng <-> có chữ thay đổi,
-              // tuyệt đối KHÔNG re-render ChatPanel trên mỗi phím gõ để bảo vệ nhịp Backspace của Unikey/EVKey
-              setHasText(prev => (prev !== currentHasText ? currentHasText : prev));
-            }}
-            onCompositionStart={() => { isComposingRef.current = true; }}
-            onCompositionEnd={() => { isComposingRef.current = false; }}
-            onKeyDown={handleKeyDown}
-            placeholder={loading ? "Type to queue next message... (Enter to send)" : "Type your message or instructions... (Enter to send, Shift+Enter for newline)"}
-            style={{
-              flex: 1,
-              background: 'var(--bg-input)',
-              color: 'var(--text-primary)',
-              border: '1px solid var(--af-border-strong)',
-              borderRadius: 'var(--radius-lg)',
-              padding: '12px 16px',
-              fontSize: isMobile ? 16 : 13,
-              lineHeight: 1.5,
-              resize: 'none',
-              minHeight: 44,
-              maxHeight: 140,
-              fontFamily: 'inherit',
-              outline: 'none',
-              transition: 'border-color 0.2s, box-shadow 0.2s'
-            }}
-            onFocus={(e) => {
-              e.currentTarget.style.borderColor = 'var(--accent)';
-              e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-soft)';
-            }}
-            onBlur={(e) => {
-              e.currentTarget.style.borderColor = 'var(--af-border-strong)';
-              e.currentTarget.style.boxShadow = 'none';
-            }}
-            rows={1}
-          />
-
-          <button
-            onClick={handleSend}
-            disabled={!hasText}
-            title={loading ? 'Queue' : 'Send'}
-            style={{
-              background: hasText ? 'linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%)' : 'var(--bg-input)',
-              color: hasText ? 'var(--text-primary)' : 'var(--text-muted)',
-              border: hasText ? 'none' : '1px solid var(--af-border-strong)',
-              borderRadius: 'var(--radius-md)',
-              width: 44,
-              padding: 0,
-              fontSize: 20,
-              cursor: hasText ? 'pointer' : 'not-allowed',
-              fontWeight: 700,
-              height: 44,
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              boxShadow: hasText ? '0 2px 10px rgba(37, 99, 235, 0.3)' : 'none',
-              transition: 'all 0.2s'
-            }}
-            onMouseOver={(e) => {
-              if (hasText) e.currentTarget.style.transform = 'scale(1.04)';
-            }}
-            onMouseOut={(e) => {
-              e.currentTarget.style.transform = 'scale(1)';
-            }}
-          >
-            <span>↑</span>
-          </button>
-
-          {loading && (
-            <button
-              onClick={onStop}
-              title="Stop agent (Esc)"
-              style={{
-                background: 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)',
-                color: 'white',
-                border: 'none',
-                borderRadius: 12,
-                padding: '12px 16px',
-                fontSize: 13,
-                cursor: 'pointer',
-                fontWeight: 600,
-                height: 44,
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                boxShadow: '0 2px 10px rgba(239, 68, 68, 0.3)'
-              }}
-            >
-              <span>⏹</span>
-              {!isMobile && <span>Stop</span>}
-            </button>
-          )}
-        </div>
+        <ChatInputBar
+          loading={loading}
+          isMobile={isMobile}
+          onSend={onSend}
+          onStop={onStop}
+        />
       </div>
     </div>
   );

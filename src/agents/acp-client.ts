@@ -2,14 +2,15 @@
 import { exec, spawn, execSync } from 'child_process';
 import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
-import { openSync, writeSync, fsyncSync, closeSync, unlinkSync, mkdirSync, writeFileSync } from 'fs';
+import { openSync, writeSync, fsyncSync, closeSync, unlinkSync, mkdirSync, writeFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import net from 'net';
 import http from 'http';
 import { StringDecoder } from 'string_decoder';
-import type { AgentConfig, AgentMessage, TokenUsage, ToolCallInfo } from './types.js';
+import type { AgentConfig, AgentMessage, MessagePart, TokenUsage, ToolCallInfo } from './types.js';
 import { storage } from '../storage.js';
+import { assignProcessToJob } from '../process/job-object.js';
 
 const execAsync = promisify(exec);
 const isWin = process.platform === 'win32';
@@ -109,6 +110,12 @@ export class ACPClient {
   }
 
   private pushOACEvent(ev: any) {
+    if (!this.busy) {
+      this.busy = true;
+      try {
+        this.onStatusChange?.(true);
+      } catch {}
+    }
     if (!this.onEvent) return;
     // Bắn trực tiếp tức thì ra event callback (Zero-latency immediate streaming)
     try {
@@ -292,6 +299,7 @@ export class ACPClient {
         throw new Error('Failed to obtain PID for OpenCode Serve');
       }
       serverPid = child.pid;
+      assignProcessToJob(child.pid);
 
       const baseUrl = `http://127.0.0.1:${port}`;
       const healthUrl = `${baseUrl}/global/health`;
@@ -408,6 +416,12 @@ export class ACPClient {
       const tmpBaseDir = getAgentForgeTmpDir();
       const tmpFile = join(tmpBaseDir, `inject-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
       writeFileSync(tmpFile, prompt.normalize('NFC'), { encoding: 'utf-8' });
+      const stat = statSync(tmpFile);
+      if (stat.size === 0) {
+        console.warn(`[ACP] Prompt file ${tmpFile} is 0 bytes. Skipping pipe.`);
+        try { unlinkSync(tmpFile); } catch {}
+        return { success: false };
+      }
 
       const roleToAgent: Record<string, string> = {
         coder: 'coder', reviewer: 'reviewer', tester: 'tester',
@@ -416,10 +430,11 @@ export class ACPClient {
         idea: 'idea'
       };
       const agentName = roleToAgent[this.config.role] || this.config.role || (this.config.type === 'orchestrator' ? 'orchestrator' : 'coder');
-      let agentFlag = ` --agent ${agentName} --session "${this.sessionId}" --thinking --auto --format json`;
-      if (this.config.model) {
-        agentFlag += ` --model "${this.config.model}"`;
+      let injectModel = this.config.model;
+      if (!injectModel || !injectModel.trim() || injectModel.trim().toLowerCase() === 'default') {
+        injectModel = process.env.ORCHESTRATOR_MODEL || process.env.DEFAULT_MODEL || 'antigravity/gemini-3.7-flash-high';
       }
+      let agentFlag = ` --agent ${agentName} --session "${this.sessionId}" --thinking --auto --format json --model "${injectModel}"`;
 
       const isSlash = prompt.trim().startsWith('/');
       let cmdArgs: string[] = [];
@@ -429,7 +444,7 @@ export class ACPClient {
         const cleanCmd = slashParts[0] || '';
         const cmdArgsRest = slashParts.slice(1).join(' ').trim();
         const messageArg = cmdArgsRest ? ` "${cmdArgsRest.replace(/"/g, '`"')}"` : '';
-        const modelFlag = this.config.model ? ` --model "${this.config.model}"` : '';
+        const modelFlag = ` --model "${injectModel}"`;
         const fullCmd = `opencode run${messageArg} --command "${cleanCmd}" --session "${this.sessionId}"${modelFlag} --thinking --auto --format json`;
         cmdArgs = isWin
           ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; ${fullCmd}`]
@@ -463,6 +478,7 @@ export class ACPClient {
       const pid = injectProc.pid;
       if (pid) {
         ACPClient.activeChildPids.add(pid);
+        assignProcessToJob(pid);
       }
 
       injectProc.stdin?.on('error', () => {
@@ -572,7 +588,7 @@ export class ACPClient {
       }
     }
 
-    const reminder = `\n\n=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> or [TO: <target-id>] <message> for communications.`;
+    const reminder = `\n\n=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> or [TO: <target-id>] <message> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />`;
     const combinedBody = messages.join('\n\n---\n\n');
     return `${contextPrefix ? contextPrefix + '\n\n' : ''}${header}\n${combinedBody}${reminder}`;
   }
@@ -633,10 +649,41 @@ export class ACPClient {
       console.log(`[ACP] WARNING: Session ${this.sessionId} format unusual — KEEPING it (persistent-session policy)`);
     }
 
+    const isCompact = /^\s*\/compact\s*$/i.test(prompt);
+    const isSlash = isCompact || /^\/[a-zA-Z0-9_-]+(?:\s+.*)?$/.test(prompt.trim());
+    const slashParts = isSlash ? prompt.trim().replace(/^\//, '').trim().split(/\s+/) : [];
+    const cleanCmd = isCompact ? 'compact' : (slashParts[0] || '');
+    const cmdArgsRest = isCompact ? '' : slashParts.slice(1).join(' ').trim();
+
+    if (isCompact) {
+      this.needPromptReinject = true;
+      if (!this.sessionId) {
+        return {
+          id: uuidv4(),
+          from: this.config.id,
+          to: 'orchestrator',
+          content: '⚠️ Agent chưa có session nào đang hoạt động để rút gọn (compact).',
+          timestamp: Date.now()
+        };
+      }
+    }
+
     // Write prompt to safe OS temp directory with UTF-8 encoding (NFC normalized)
     const tmpBaseDir = getAgentForgeTmpDir();
     const tmpFile = join(tmpBaseDir, `prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
     writeFileSync(tmpFile, prompt.normalize('NFC'), { encoding: 'utf-8' });
+    const stat = statSync(tmpFile);
+    if (!isSlash && stat.size === 0) {
+      console.warn(`[ACP] Prompt file ${tmpFile} is 0 bytes for non-slash command. Skipping execution.`);
+      try { unlinkSync(tmpFile); } catch {}
+      return {
+        id: uuidv4(),
+        from: this.config.id,
+        to: 'orchestrator',
+        content: '⚠️ Lỗi: Nội dung yêu cầu rỗng (0 bytes), không thể khởi chạy tiến trình.',
+        timestamp: Date.now()
+      };
+    }
 
     // Build command — use stdin pipe via cat/type instead of inline args
     const roleToAgent: Record<string, string> = {
@@ -658,9 +705,11 @@ export class ACPClient {
       console.log(`[ACP] Attempt ${attempt}: Using fallback model: ${process.env.FALLBACK_MODEL}`);
       modelToUse = process.env.FALLBACK_MODEL;
     }
-    if (modelToUse) {
-      agentFlag += ` --model "${modelToUse}"`;
+    if (!modelToUse || !modelToUse.trim() || modelToUse.trim().toLowerCase() === 'default') {
+      modelToUse = process.env.ORCHESTRATOR_MODEL || process.env.DEFAULT_MODEL || 'antigravity/gemini-3.7-flash-high';
     }
+    // LUÔN LUÔN truyền cờ --model "<model>" vào câu lệnh opencode run
+    agentFlag += ` --model "${modelToUse}"`;
 
     const utf8Env = {
       ...process.env,
@@ -670,25 +719,6 @@ export class ACPClient {
       LANG: 'en_US.UTF-8',
       LC_ALL: 'en_US.UTF-8'
     };
-
-    const isCompact = /^\s*\/compact\s*$/i.test(prompt);
-    const isSlash = isCompact || /^\/[a-zA-Z0-9_-]+(?:\s+.*)?$/.test(prompt.trim());
-    const slashParts = isSlash ? prompt.trim().replace(/^\//, '').trim().split(/\s+/) : [];
-    const cleanCmd = isCompact ? 'compact' : (slashParts[0] || '');
-    const cmdArgsRest = isCompact ? '' : slashParts.slice(1).join(' ').trim();
-
-    if (isCompact) {
-      this.needPromptReinject = true;
-      if (!this.sessionId) {
-        return {
-          id: uuidv4(),
-          from: this.config.id,
-          to: 'orchestrator',
-          content: '⚠️ Agent chưa có session nào đang hoạt động để rút gọn (compact).',
-          timestamp: Date.now()
-        };
-      }
-    }
 
     let cmdArgs: string[] = [];
     if (isSlash) {
@@ -725,6 +755,7 @@ export class ACPClient {
         this.proc = proc as any;
         if (proc.pid) {
           ACPClient.activeChildPids.add(proc.pid);
+          assignProcessToJob(proc.pid);
         }
 
         // Listener: khi stream stdin lỗi hoặc pipe đóng bất thường, tự động kill child process
@@ -805,7 +836,7 @@ export class ACPClient {
       });
       this._aborted = false;
 
-      const { content, transcript, sessionId, errorMsg, toolCalls, tokenUsage, contextLength, thinking } = this.parseJsonlEvents(stdout);
+      const { content, transcript, sessionId, errorMsg, toolCalls, tokenUsage, contextLength, thinking, parts, firstEventTimestamp } = this.parseJsonlEvents(stdout);
 
       // Session từ event chính xác hơn so sánh danh sách
       if (!this.sessionId && sessionId) {
@@ -831,10 +862,11 @@ export class ACPClient {
         from: this.config.id,
         to: 'orchestrator',
         content: finalContent,
-        timestamp: Date.now(),
+        timestamp: firstEventTimestamp || Date.now(),
         transcript: transcript || undefined,
         toolCalls: toolCalls.length ? toolCalls : undefined,
         thinking,
+        parts: parts && parts.length > 0 ? parts : undefined,
         // Fix badge token = 0: không đánh rơi usage của lượt
         tokenUsage,
         contextLength
@@ -879,7 +911,7 @@ export class ACPClient {
 
       // Lượt cuối sau khi hết retry: trích xuất output nếu có từ JSONL
       const raw = err.stdout?.toString() || '';
-      const { content, transcript, sessionId, errorMsg, toolCalls, tokenUsage, contextLength, thinking } = this.parseJsonlEvents(raw);
+      const { content, transcript, sessionId, errorMsg, toolCalls, tokenUsage, contextLength, thinking, parts, firstEventTimestamp } = this.parseJsonlEvents(raw);
 
       // Nếu có sessionId mới trong event mà agent chưa có session thì cập nhật
       if (!this.sessionId && sessionId) {
@@ -898,12 +930,13 @@ export class ACPClient {
         from: this.config.id,
         to: 'orchestrator',
         content: content || errorMsg || `Error: ${err.message}`,
-        timestamp: Date.now(),
+        timestamp: firstEventTimestamp || Date.now(),
         transcript: transcript || undefined,
         toolCalls: toolCalls.length ? toolCalls : undefined,
         tokenUsage,
         contextLength,
-        thinking
+        thinking,
+        parts: parts && parts.length > 0 ? parts : undefined
       };
     } finally {
       try { unlinkSync(tmpFile); } catch {}
@@ -924,7 +957,9 @@ export class ACPClient {
     content: string; transcript: string; sessionId: string | null; errorMsg?: string;
     toolCalls: ToolCallInfo[];
     thinking?: string;
+    parts?: MessagePart[];
     tokenUsage?: TokenUsage; contextLength?: number;
+    firstEventTimestamp?: number;
   } {
     const lines = stdout.split(/\r?\n/).filter(l => l.trim());
     const texts: string[] = [];
@@ -934,6 +969,8 @@ export class ACPClient {
     // Nguồn chuẩn cho UI toolcall: mảng cấu trúc thu thập từ event tool_use GỐC,
     // tách khỏi chuỗi transcript nối chung (toolLines chỉ giữ để tương thích).
     const toolCalls: ToolCallInfo[] = [];
+    // Mảng parts xen kẽ (anti-clump thinking) theo đúng thứ tự thời gian xuất hiện của từng event
+    const chronologicalParts: MessagePart[] = [];
     let sessionId: string | null = null;
     let errorMsg: string | undefined;
     let totalCost = 0;
@@ -944,12 +981,23 @@ export class ACPClient {
     let cacheWriteTokens = 0;
     let totalTokens = 0;
     let contextLength: number | undefined;
+    // Timestamp sớm nhất trong stream (event đầu tiên có timestamp) — dùng làm mốc thời gian
+    // thực tế khi agent bắt đầu phản hồi, thay vì Date.now() lúc hoàn thành
+    let firstEventTimestamp: number | undefined;
 
     for (const line of lines) {
       let ev: any;
       try { ev = JSON.parse(line); } catch { continue; }
       if (ev.sessionID && !sessionId) sessionId = ev.sessionID;
       if (ev.sessionId && !sessionId) sessionId = ev.sessionId;
+      
+      // Extract timestamp từ event đầu tiên — dùng làm mốc thời gian thực tế khi agent bắt đầu
+      if (firstEventTimestamp === undefined) {
+        const evTs = typeof ev.timestamp === 'number'
+          ? ev.timestamp
+          : (typeof ev.part?.timestamp === 'number' ? ev.part.timestamp : undefined);
+        if (evTs) firstEventTimestamp = evTs;
+      }
 
       if (typeof ev.contextLength === 'number') contextLength = ev.contextLength;
       if (typeof ev.context_length === 'number') contextLength = ev.context_length;
@@ -985,28 +1033,51 @@ export class ACPClient {
         }
       }
 
-      switch (ev.type) {
+      const evType = String(ev.type || ev.evt || '').toLowerCase().replace(/-/g, '_');
+
+      switch (evType) {
         case 'text':
-          if (ev.part?.text) texts.push(ev.part.text);
+        case 'assistant': {
+          const txt = ev.part?.text || ev.text || ev.message || ev.content;
+          if (typeof txt === 'string' && txt) {
+            texts.push(txt);
+            const lastPart = chronologicalParts[chronologicalParts.length - 1];
+            if (lastPart && lastPart.type === 'text') {
+              lastPart.content = (lastPart.content || '') + txt;
+            } else {
+              chronologicalParts.push({ type: 'text', content: txt });
+            }
+          }
           break;
+        }
         // Suy nghĩ nội bộ của model (reasoning/thinking/thought): gom riêng,
         // KHÔNG trộn vào content — trả về trường thinking cho UI hiển thị hộp riêng.
         case 'reasoning':
         case 'thinking':
         case 'thought': {
           const rt = ev.part?.text || ev.text || ev.part?.thinking || ev.thinking;
-          if (typeof rt === 'string' && rt.trim()) thinkingParts.push(rt);
+          if (typeof rt === 'string' && rt.trim()) {
+            thinkingParts.push(rt);
+            const lastPart = chronologicalParts[chronologicalParts.length - 1];
+            if (lastPart && lastPart.type === 'thinking') {
+              lastPart.content = (lastPart.content || '') + rt;
+            } else {
+              chronologicalParts.push({ type: 'thinking', content: rt });
+            }
+          }
           break;
         }
         // Hỗ trợ cả biến thể tên event: tool_use / tool-call / tool_call
         case 'tool_use':
-        case 'tool-call':
         case 'tool_call': {
           const p = ev.part || {};
           const tool = p.tool || 'unknown';
           const title = p.state?.title || '';
-          const input = p.state?.input ? JSON.stringify(p.state.input) : '';
-          const output = p.state?.output || '';
+          const rawInput = p.state?.input ?? p.input;
+          const rawOutput = p.state?.output ?? p.output;
+          const callId = p.callID || p.call_id || p.id || p.state?.callID || p.state?.id || ev.callID || ev.id;
+          const input = rawInput ? (typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput)) : '';
+          const output = rawOutput ? (typeof rawOutput === 'string' ? rawOutput : (typeof rawOutput === 'object' ? JSON.stringify(rawOutput) : String(rawOutput))) : '';
           // Đẩy object cấu trúc gốc (nguồn cho UI), tách khỏi text transcript
           toolCalls.push({
             tool,
@@ -1018,6 +1089,35 @@ export class ACPClient {
             (input ? `\n  input: ${input}` : '') +
             (output ? `\n  output: ${output.split(/\r?\n/).slice(0, 20).join('\n  ')}` : '')
           );
+          chronologicalParts.push({
+            type: 'tool',
+            tool,
+            input: rawInput,
+            output: rawOutput,
+            ...(callId ? { callId: String(callId) } : {})
+          });
+          break;
+        }
+        case 'tool_result': {
+          const p = ev.part || {};
+          const callId = p.callID || p.call_id || p.id || p.state?.callID || p.state?.id || ev.callID || ev.id;
+          const rawOutput = p.state?.output ?? p.output ?? p.content ?? ev.data?.output;
+          // Tìm tool part tương ứng gần nhất theo callId hoặc phần tử tool cuối
+          let matchedPart: MessagePart | undefined;
+          if (callId) {
+            matchedPart = [...chronologicalParts].reverse().find(part => part.type === 'tool' && part.callId === String(callId));
+          }
+          if (!matchedPart) {
+            matchedPart = [...chronologicalParts].reverse().find(part => part.type === 'tool' && part.output === undefined);
+          }
+          if (matchedPart) {
+            matchedPart.output = rawOutput;
+          }
+          // Cập nhật toolCalls tương ứng
+          const lastTc = toolCalls[toolCalls.length - 1];
+          if (lastTc && !lastTc.output && rawOutput !== undefined) {
+            lastTc.output = typeof rawOutput === 'string' ? rawOutput : (typeof rawOutput === 'object' ? JSON.stringify(rawOutput) : String(rawOutput));
+          }
           break;
         }
         case 'error':
@@ -1068,11 +1168,13 @@ export class ACPClient {
       content,
       transcript: parts.join('\n').normalize('NFC'),
       sessionId,
-      errorMsg: errorMsg?.normalize('NFC'),
-      tokenUsage: tokenUsageObj,
-      contextLength: contextLength || undefined,
+      errorMsg,
       toolCalls,
-      thinking: thinkingParts.length ? thinkingParts.join('\n').trim().normalize('NFC') : undefined
+      thinking: thinkingParts.join('\n').trim() || undefined,
+      parts: chronologicalParts.length > 0 ? chronologicalParts : undefined,
+      tokenUsage: tokenUsageObj,
+      contextLength,
+      firstEventTimestamp
     };
   }
 

@@ -24,20 +24,20 @@ export const PROMPTS_CANDIDATE_DIRS = [
 ];
 
 export function loadPrompt(name: string): string {
-  // 1) SEA embedded
+  // 1) Filesystem: from source or release directory first
+  for (const dir of PROMPTS_CANDIDATE_DIRS) {
+    const p = join(dir, name);
+    if (existsSync(p)) {
+      try { return readFileSync(p, 'utf-8'); } catch {}
+    }
+  }
+  // 2) SEA embedded
   if (earlySeaGetAsset) {
     try {
       const key = ('src/prompts/' + name).split('\\').join('/');
       const buf = earlySeaGetAsset(key);
       if (buf) return Buffer.from(buf).toString('utf-8');
     } catch {}
-  }
-  // 2) Filesystem: from source or release directory
-  for (const dir of PROMPTS_CANDIDATE_DIRS) {
-    const p = join(dir, name);
-    if (existsSync(p)) {
-      try { return readFileSync(p, 'utf-8'); } catch {}
-    }
   }
   console.warn(`[Prompt] Not found: ${name} (tried ${PROMPTS_CANDIDATE_DIRS.join(' | ')}), using fallback`);
   return '';
@@ -93,7 +93,7 @@ CRITICAL SYNTAX RULE: Khi phát lệnh điều phối (<spawn>, <talk>, <stop>, 
 4. PARALLEL DECOMPOSITION & NON-CONFLICTING LOGIC MANDATE: Mọi bài toán/nhiệm vụ có các nhánh logic độc lập (không chỉ khác tệp, mà kể cả khi chung một tệp hoặc cùng một tầng nhưng xử lý các hàm khác nhau, endpoint khác nhau, UI component khác nhau hoặc luồng logic hoàn toàn không phụ thuộc lẫn nhau) BẮT BUỘC PHẢI PHÂN RÃ VÀ SPAWN/DISPATCH ĐỒNG LOẠT SONG SONG NGAY TỪ ĐẦU cho nhiều Coder/Specialist agents cùng làm. TUYỆT ĐỐI KHÔNG làm tuần tự khi các luồng logic không va chạm.
 5. REUSE ONLY IF IDLE: If you SPAWN a name that already exists, reuse it ONLY when that agent is currently 'idle'. If it is 'working', you MUST spawn a new name or choose another idle agent. Do not assign new work to a working agent.
 6. Orchestrator TUYỆT ĐỐI KHÔNG được xóa agent. Khi một agent không còn cần thiết, bị lỗi hoặc kẹt, Orchestrator chỉ được <stop target="..." /> agent và báo cáo/đề xuất User xóa agent trên giao diện.
-7. Instance limit rules by role: coder role is limited to a maximum of 4 active instances. researcher role is limited to a maximum of 2 active instances. All other roles (verifier, tester, reviewer, docs, planner, debugger, searcher, idea, and any custom role) are limited to a maximum of 1 active instance.
+7. Instance limit rules: Tuân thủ hạn mức thành viên và vai trò theo cấu hình hệ thống / team settings. Khi hệ thống báo đạt hạn mức hoặc nhận '[Role Limit]' / '[Team Limit]', TUYỆT ĐỐI KHÔNG spawn thêm agent mới mà phải tái sử dụng nhân lực hiện có qua thẻ <talk>.
 8. IDLE-FIRST dispatch: Before any <talk>/<spawn>, check the [TEAM] table and ONLY select agents whose status is 'idle'. If no idle agent exists for the required role, spawn a new instance. When the system sends '[Role Limit]', immediately switch to <talk target="..." /> with an available idle agent instead of spawning.
 9. RESEARCH FIRST RULE: Before implementing any changes, fixing bugs, or writing code, you MUST first research the codebase, read the relevant files, check documentation, or search online resources to gather context and understand the implementation details.
 10. Monitor progress — if an agent works > 3 minutes, use <talk target="..."> to ask for status
@@ -130,7 +130,6 @@ You are the Orchestrator. You MUST communicate with workers using:
 <stop target="<target-id>" />
 <resume target="<target-id>" />
 <create_role name="<role-name>" description="<desc>" capabilities="<c1,c2>" rules="<r1|r2>" />
-<task_update agent="<name/id>" task="<new task>" status="working|completed|idle" />
 
 Critical constraints:
 - NEVER run coding or bash commands directly. Only specialists do.

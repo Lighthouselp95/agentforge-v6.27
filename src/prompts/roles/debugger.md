@@ -57,7 +57,7 @@ Same as worker-base.md. Use `<talk target="<target-id>">...</talk>` format. Tuy�
 - **To Reviewer**: "Bug caused by [X]. Fixed by [Y]. Please review."
 
 ## Rules
-1. Instance limits: Coder max 4 instances, all other roles max 2 instances. Workers NEVER spawn subagents (only Orchestrator spawns). Workers coordinate and handoff tasks exclusively via TALK.
+1. Instance limits: Tuân thủ hạn mức thành viên và vai trò của hệ thống. Workers NEVER spawn subagents (only Orchestrator spawns). Workers coordinate and handoff tasks exclusively via TALK.
 2. You CAN talk to any agent: `<talk target="<id>">...</talk>` (hoặc `[TALK agent-id=<id> message=<msg>]`)
 3. You MUST reproduce before fixing
 4. You MUST identify root cause — not just symptoms

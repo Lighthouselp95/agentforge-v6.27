@@ -114,8 +114,11 @@ export class QueueStorage {
   }
 
   // ============ UNPROCESSED USER MESSAGES (Preserve on Abort / Stop) ============
+  // Giữ nguyên auto-continue: persist mọi message hợp lệ. Validate đầu vào —
+  // không persist khi thiếu text/target (tránh bản ghi mồ côi teamId sai).
   saveUnprocessedMessage(targetId: string, text: string): void {
-    if (!text || !text.trim()) return;
+    if (!text || !text.trim() || !targetId) return;
+    if (typeof text === 'string' && (text.trim().startsWith('[TEAM]') || text.includes('Your ID:'))) return;
     const key = targetId || 'orchestrator';
     if (!this.engine.inMemoryUnprocessedUserMessages[key]) {
       this.engine.inMemoryUnprocessedUserMessages[key] = [];
@@ -123,7 +126,8 @@ export class QueueStorage {
     const cleanText = text.trim();
     if (!this.engine.inMemoryUnprocessedUserMessages[key].includes(cleanText)) {
       this.engine.inMemoryUnprocessedUserMessages[key].push(cleanText);
-      this.engine.schedulePersist();
+      // Ghi tức thì xuống đĩa cứng (immediate = true) để không bị mất tin khi restart / kill bất ngờ
+      this.engine.schedulePersist(true);
     }
   }
 
@@ -142,11 +146,24 @@ export class QueueStorage {
     return result;
   }
 
+  removeUnprocessedMessage(targetId: string, text: string): void {
+    if (!text || !targetId) return;
+    const key = targetId || 'orchestrator';
+    if (this.engine.inMemoryUnprocessedUserMessages[key]) {
+      const cleanText = text.trim();
+      this.engine.inMemoryUnprocessedUserMessages[key] = this.engine.inMemoryUnprocessedUserMessages[key].filter(t => t !== cleanText);
+      if (this.engine.inMemoryUnprocessedUserMessages[key].length === 0) {
+        delete this.engine.inMemoryUnprocessedUserMessages[key];
+      }
+      this.engine.schedulePersist(true);
+    }
+  }
+
   clearUnprocessedMessages(targetId: string): void {
     const key = targetId || 'orchestrator';
     if (this.engine.inMemoryUnprocessedUserMessages[key]) {
       delete this.engine.inMemoryUnprocessedUserMessages[key];
-      this.engine.schedulePersist();
+      this.engine.schedulePersist(true);
     }
   }
 }

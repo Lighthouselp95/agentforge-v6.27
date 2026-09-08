@@ -1,1 +1,1 @@
-export * from './command-parser.js';
+export * from './directive-parser.js';

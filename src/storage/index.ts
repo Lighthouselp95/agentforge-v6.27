@@ -3,6 +3,7 @@ import { AgentStorage } from './agent-storage.js';
 import { MessageStorage } from './message-storage.js';
 import { QueueStorage } from './queue-storage.js';
 import { SettingsStorage } from './settings-storage.js';
+import { TeamSettingsStorage } from './team-settings.js';
 import { LogStorage } from './log-storage.js';
 import type {
   OutboxReport,
@@ -12,7 +13,10 @@ import type {
   HistoryPageOptions,
   LogFilterOptions,
   ModelSettings,
-  UpdateAgentOptions
+  UpdateAgentOptions,
+  TeamSettings,
+  SpawnGateUsage,
+  SpawnGateResult
 } from './types.js';
 
 export class AppStorage {
@@ -21,6 +25,7 @@ export class AppStorage {
   public messages: MessageStorage;
   public queues: QueueStorage;
   public settings: SettingsStorage;
+  public teamSettings: TeamSettingsStorage;
   public logs: LogStorage;
 
   constructor() {
@@ -29,6 +34,7 @@ export class AppStorage {
     this.messages = new MessageStorage(this.engine);
     this.queues = new QueueStorage(this.engine);
     this.settings = new SettingsStorage(this.engine);
+    this.teamSettings = new TeamSettingsStorage(this.engine);
     this.logs = new LogStorage(this.engine);
   }
 
@@ -159,6 +165,10 @@ export class AppStorage {
     return this.queues.getAllUnprocessedMessages();
   }
 
+  removeUnprocessedMessage(targetId: string, text: string): void {
+    this.queues.removeUnprocessedMessage(targetId, text);
+  }
+
   clearUnprocessedMessages(targetId: string): void {
     this.queues.clearUnprocessedMessages(targetId);
   }
@@ -186,6 +196,23 @@ export class AppStorage {
     agentModelOverrides?: Record<string, string>;
   }): ModelSettings {
     return this.settings.setModelSettings(settings);
+  }
+
+  // Delegate Team Settings methods (live per-team limits)
+  getTeamSettings(teamId: string): TeamSettings {
+    return this.teamSettings.getTeamSettings(teamId);
+  }
+
+  setTeamSettings(teamId: string, patch: Partial<TeamSettings> | any): TeamSettings {
+    return this.teamSettings.setTeamSettings(teamId, patch);
+  }
+
+  resetTeamSettings(teamId: string): TeamSettings {
+    return this.teamSettings.resetTeamSettings(teamId);
+  }
+
+  checkTeamSpawnGate(teamId: string, role: string, usage: SpawnGateUsage): SpawnGateResult {
+    return this.teamSettings.checkSpawnGate(this.getTeamSettings(teamId), role, usage);
   }
 
   // Delegate Log methods
@@ -268,6 +295,7 @@ export * from './agent-storage.js';
 export * from './message-storage.js';
 export * from './queue-storage.js';
 export * from './settings-storage.js';
+export * from './team-settings.js';
 export * from './log-storage.js';
 
 export default storage;

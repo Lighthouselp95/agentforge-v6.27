@@ -39,6 +39,14 @@ export function TabBar({ agents, selectedAgentId, onSelect, isMobile }: Props) {
             title={`${a.name} (${a.role})${a.status ? ` — ${a.status}` : ''}`}
             role="tab"
             aria-selected={active}
+            style={active ? {
+              boxShadow: '0 0 0 2px rgba(56, 189, 248, 0.4), 0 4px 12px rgba(56, 189, 248, 0.3)',
+              borderColor: '#38bdf8',
+              transform: 'translateY(-1px)',
+              transition: 'all 0.2s ease-in-out'
+            } : {
+              transition: 'all 0.2s ease-in-out'
+            }}
           >
             <span className={statusDotClass(a.status)} />
             <span className="af-tab-name">{a.name}</span>

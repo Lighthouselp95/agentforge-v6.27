@@ -573,3 +573,22 @@ html[data-theme='light'] .af-spawn-target-name {
   color: #581c87 !important;
 }
 
+/* Đảm bảo toàn bộ chữ bên trong Khối Nội Dung Mở Rộng Thẻ Giao Việc có màu tối tương phản tuyệt đối trên nền trắng tuyền */
+.af-directive-expanded-content,
+.af-directive-expanded-content * {
+  color: #0f172a !important;
+}
+.af-directive-expanded-content code {
+  background: #f1f5f9 !important;
+  color: #0f172a !important;
+  border-color: #cbd5e1 !important;
+}
+.af-directive-expanded-content pre {
+  background: #f8fafc !important;
+  border-color: #e2e8f0 !important;
+}
+.af-directive-expanded-content pre code {
+  background: transparent !important;
+  color: #0f172a !important;
+}
+

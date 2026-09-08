@@ -1,5 +1,6 @@
 import { Router } from 'express';
 
+// Pha 1 refactor: GET /logs + /terminal dời verbatim từ src/server.ts (HTML giữ nguyên 1:1).
 export interface TerminalRouteDeps {
   storage: any;
   logBuffer: string[];
@@ -9,12 +10,30 @@ export interface TerminalRouteDeps {
 export function createTerminalRouter(deps: TerminalRouteDeps): Router {
   const router = Router();
 
-  // GET /logs - Ring buffer console logs
+  // Helper đảm bảo dòng log luôn có timestamp chuẩn ISO nếu chưa có
+  const ensureTimestamp = (l: any): string => {
+    if (!l) return '';
+    const str = typeof l === 'string' ? l : (l.message || JSON.stringify(l));
+    if (/^\[\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}/.test(str)) {
+      return str;
+    }
+    const ts = l.timestamp ? new Date(l.timestamp).toISOString() : (l.createdAt ? new Date(l.createdAt).toISOString() : new Date().toISOString());
+    return `[${ts}] ${str}`;
+  };
+
+  // Trả toàn bộ ring buffer kèm timestamp chuẩn
   router.get('/logs', (_req, res) => {
-    res.json({ lines: [...deps.logBuffer], max: deps.maxLogBuffer, count: deps.logBuffer.length });
+    const linesWithTs = deps.logBuffer.map(ensureTimestamp);
+    res.json({ lines: linesWithTs, max: deps.maxLogBuffer, count: linesWithTs.length });
   });
 
-  // GET /terminal - realtime viewer HTML
+  // Alias /api/terminal/logs hỗ trợ client fetch trực tiếp endpoint terminal
+  router.get('/api/terminal/logs', (_req, res) => {
+    const linesWithTs = deps.logBuffer.map(ensureTimestamp);
+    res.json({ lines: linesWithTs, max: deps.maxLogBuffer, count: linesWithTs.length });
+  });
+
+  // Trang HTML nhúng xem terminal realtime: fetch /api/logs + /logs + EventSource(/api/events) lọc terminal:line / log:entry.
   router.get('/terminal', (_req, res) => {
     const html = `<!DOCTYPE html>
 <html lang="vi">
@@ -25,41 +44,185 @@ export function createTerminalRouter(deps: TerminalRouteDeps): Router {
 <style>
   * { box-sizing: border-box; }
   html, body { height:100%; margin:0; background:#090d14; color:#d4d6d9; font-family:'JetBrains Mono','Consolas','Menlo','Courier New',monospace; font-size:12.5px; }
+  /* terminal titlebar */
   #bar { position:sticky; top:0; display:flex; align-items:center; justify-content:space-between; padding:6px 12px; background:#0e131d; color:#94a3b8; border-bottom:1px solid rgba(255,255,255,0.08); user-select:none; z-index:10; }
   #bar b { color:#38bdf8; font-weight:700; }
   #actions { display:flex; align-items:center; gap:8px; }
   #cnt { font-size:11px; color:#64748b; }
   .btn-clear { background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.35); color:#f87171; border-radius:4px; padding:2px 8px; font-size:11px; font-weight:600; cursor:pointer; font-family:inherit; }
   .btn-clear:hover { background:rgba(239,68,68,0.25); color:#fca5a5; }
+  /* log area */
   #log { padding:10px 14px; white-space:pre-wrap; word-break:break-all; line-height:1.55; }
+  #log div { margin:0; padding:1px 0; }
+  #log .ts { color:#38bdf8; }        /* timestamp sáng xanh */
+  #log .err { color:#f87171; font-weight:600; }       /* lỗi đỏ */
+  #log .warn { color:#fbbf24; }      /* cảnh báo vàng */
+  #wrap { height:calc(100% - 34px); overflow-y:auto; }
+  /* prompt + blinking caret */
+  #prompt { display:flex; align-items:center; gap:6px; padding:2px 14px 10px; color:#38bdf8; white-space:nowrap; }
+  #prompt .ps { color:#4ade80; font-weight:600; }
+  #caret { display:inline-block; width:8px; height:15px; background:#4ade80; animation:blink 1s step-end infinite; vertical-align:middle; }
+  @keyframes blink { 50% { opacity:0; } }
 </style>
 </head>
 <body>
-  <div id="bar">
-    <div><b>AgentForge Terminal</b> <span id="cnt">0 lines</span></div>
-    <div id="actions"><button class="btn-clear" onclick="clearLogs()">Clear</button></div>
+<div id="bar">
+  <b>agentforge@terminal: ~</b>
+  <div id="actions">
+    <span id="cnt">0 dòng — /api/logs</span>
+    <button class="btn-clear" onclick="clearLogs()">🗑️ Clear Logs</button>
   </div>
-  <div id="log">Connecting...</div>
-  <script>
-    async function loadLogs() {
-      try {
-        const res = await fetch('/logs');
-        const data = await res.json();
-        document.getElementById('log').textContent = data.lines.join('\\n');
-        document.getElementById('cnt').textContent = data.lines.length + ' lines';
-      } catch (e) {
-        document.getElementById('log').textContent = 'Failed to load logs: ' + e.message;
+</div>
+<div id="wrap"><div id="log">đang kết nối và tải lịch sử logs…</div></div>
+<div id="prompt"><span class="ps">[agentforge@terminal ~]$</span><span id="caret"></span></div>
+<script>
+  var box = document.getElementById('log');
+  var cnt = document.getElementById('cnt');
+  var wrap = document.getElementById('wrap');
+
+  function appendLine(line, level, ts){
+    if (!line) return;
+    var d = document.createElement('div');
+    var str = String(line);
+    var hasLeadingTs = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(str);
+
+    if (!hasLeadingTs) {
+      var timeFormatted = '';
+      if (ts) {
+        try {
+          timeFormatted = '[' + new Date(ts).toLocaleTimeString() + '] ';
+        } catch(e){}
+      }
+      if (!timeFormatted) {
+        timeFormatted = '[' + new Date().toLocaleTimeString() + '] ';
+      }
+      var spanTs = document.createElement('span');
+      spanTs.className = 'ts';
+      spanTs.textContent = timeFormatted;
+      d.appendChild(spanTs);
+      d.appendChild(document.createTextNode(str));
+    } else {
+      // Tô màu timestamp có sẵn ở đầu chuỗi
+      var match = str.match(/^(\[[^\]]+\])\s*(.*)$/);
+      if (match) {
+        var spanTs = document.createElement('span');
+        spanTs.className = 'ts';
+        spanTs.textContent = match[1] + ' ';
+        d.appendChild(spanTs);
+        d.appendChild(document.createTextNode(match[2]));
+      } else {
+        d.textContent = str;
       }
     }
-    async function clearLogs() {
-      await fetch('/api/logs/clear', { method: 'POST' });
-      document.getElementById('log').textContent = '';
-      document.getElementById('cnt').textContent = '0 lines';
+
+    if (level === 'error' || str.indexOf('[ERROR]') >= 0 || str.indexOf('❌') >= 0 || str.indexOf('Error:') >= 0) {
+      d.className = 'err';
+    } else if (level === 'warn' || str.indexOf('[WARN]') >= 0 || str.indexOf('⚠️') >= 0) {
+      d.className = 'warn';
     }
-    loadLogs();
-  </script>
+    box.appendChild(d);
+    cnt.textContent = box.childElementCount + ' dòng — /api/logs';
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  function clearLogs(){
+    if (!confirm('Bạn có chắc muốn xóa toàn bộ logs?')) return;
+    fetch('/api/logs/clear', { method: 'POST' }).then(function(r){ return r.json(); }).then(function(d){
+      box.innerHTML = '';
+      appendLine('[System] Logs cleared at ' + new Date().toLocaleTimeString());
+    }).catch(function(e){
+      alert('Lỗi xóa logs: ' + e.message);
+    });
+  }
+
+  // 1. Tải log lịch sử từ /api/logs (persisted database) + fallback /logs ring buffer
+  function loadInitialLogs(){
+    box.innerHTML = '';
+    fetch('/api/logs?limit=500').then(function(r){ return r.json(); }).then(function(data){
+      box.innerHTML = '';
+      if (data && Array.isArray(data.logs) && data.logs.length > 0) {
+        data.logs.forEach(function(item){
+          var line = typeof item === 'string' ? item : (item.message || JSON.stringify(item));
+          appendLine(line, item.level, item.timestamp);
+        });
+      } else {
+        // Fallback /logs
+        fetch('/logs').then(function(r){ return r.json(); }).then(function(d){
+          box.innerHTML = '';
+          (d.lines || []).forEach(function(l){ appendLine(l); });
+          if (box.childElementCount === 0) {
+            appendLine('[System] Terminal ready. Log stream active.');
+          }
+        });
+      }
+      wrap.scrollTop = wrap.scrollHeight;
+    }).catch(function(){
+      fetch('/logs').then(function(r){ return r.json(); }).then(function(d){
+        box.innerHTML = '';
+        (d.lines || []).forEach(function(l){ appendLine(l); });
+        if (box.childElementCount === 0) {
+          appendLine('[System] Terminal ready. Log stream active.');
+        }
+        wrap.scrollTop = wrap.scrollHeight;
+      });
+    });
+  }
+
+  loadInitialLogs();
+
+  // 2. Lắng nghe log realtime qua WebSocket (chính) và EventSource (dự phòng)
+  var ws = null;
+  function connectTerminalWS(){
+    try {
+      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(proto + '//' + location.host + '/terminal?logs=1');
+      ws.onopen = function(){
+        try { ws.send(JSON.stringify({ type: 'subscribe', logs: true, channel: 'terminal' })); } catch(e){}
+      };
+      ws.onmessage = function(ev){
+        try {
+          var m = JSON.parse(ev.data);
+          if (m.type === 'terminal:line' && m.line) {
+            appendLine(m.line, undefined, m.timestamp);
+          } else if (m.type === 'log:entry' && m.entry) {
+            var txt = typeof m.entry === 'string' ? m.entry : (m.entry.message || JSON.stringify(m.entry));
+            appendLine(txt, m.entry.level, m.entry.timestamp);
+          }
+        } catch(e){}
+      };
+      ws.onclose = function(){
+        setTimeout(connectTerminalWS, 2000);
+      };
+      ws.onerror = function(){
+        try { ws.close(); } catch(e){}
+      };
+    } catch(e){
+      setTimeout(connectTerminalWS, 3000);
+    }
+  }
+
+  connectTerminalWS();
+
+  // Fallback song song EventSource nếu WebSocket bị chặn
+  var es = new EventSource('/api/events?logs=1');
+  es.onmessage = function(ev){
+    try {
+      // Nếu WS đang mở và truyền tin bình thường thì bỏ qua SSE để tránh đúp dòng log
+      if (ws && ws.readyState === 1) return;
+      var m = JSON.parse(ev.data);
+      if (m.type === 'terminal:line' && m.line) {
+        appendLine(m.line, undefined, m.timestamp);
+      } else if (m.type === 'log:entry' && m.entry) {
+        var txt = typeof m.entry === 'string' ? m.entry : (m.entry.message || JSON.stringify(m.entry));
+        appendLine(txt, m.entry.level, m.entry.timestamp);
+      }
+    } catch(e){}
+  };
+  es.onerror = function(){ /* keepalive reconnect tự động */ };
+</script>
 </body>
-</html>`;
+</html>
+`;
     res.type('html').send(html);
   });
 
