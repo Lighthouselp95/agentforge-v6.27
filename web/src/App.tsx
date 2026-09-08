@@ -1071,12 +1071,13 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     delete streamRef.current[targetId];
     delete streamRef.current['orchestrator'];
 
-    const targetAgentObj = agents.find(a => a.id === targetId);
+    const targetAgentObj = agents.find(a => a.id === targetId) || (targetId === 'orchestrator' ? agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator') : undefined);
     const targetTeamId = targetAgentObj?.teamId || (targetId === 'orchestrator' ? 'default' : `team-${targetId.slice(-8)}`);
+    const resolvedTargetId = targetAgentObj?.id || targetId;
     const userMsg: ChatMsg = {
       id: tempId,
       from: 'user',
-      to: targetId,
+      to: resolvedTargetId,
       content: trimmedText,
       timestamp: Date.now(),
       teamId: targetTeamId
@@ -1297,7 +1298,8 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
           if (isSubOrch) {
             if (isInternalMsg(m)) return false;
             const orchTeamId = sel?.teamId || (sel?.id === 'orchestrator' ? 'default' : `team-${sel?.id.slice(-8)}`);
-            if (m.teamId && m.teamId !== orchTeamId) return false;
+            const isDirectedToSelected = m.to === selectedAgentId || m.from === selectedAgentId || (sel && (m.to === sel.name || m.from === sel.name));
+            if (m.teamId && m.teamId !== orchTeamId && !isDirectedToSelected) return false;
 
             const isWorkerOpen = (m.msgType === 'opencode') && (m.from !== 'user') && (m.from !== selectedAgentId) && (m.agentRole !== 'orchestrator');
             if (isWorkerOpen) return false;
@@ -1381,7 +1383,9 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         const mainTeamId = defaultOrch?.teamId || 'default';
         // Team isolation safe: target-based check — chỉ cho phép tin từ orchestrator hiện tại hoặc gửi đến orchestrator hiện tại
         // khi teamId không match. Tránh leak talk/spawn của orchestrator khác sang team này.
-        if (m.teamId && m.teamId !== mainTeamId && m.from !== orchId && m.to !== orchId) return false;
+        // User messages có to === 'orchestrator' hoặc to === orchId hoặc teamId === 'default' luôn hợp lệ trên main view.
+        const isDirectedToMain = m.to === orchId || m.to === 'orchestrator' || m.from === orchId || m.from === 'orchestrator';
+        if (m.teamId && m.teamId !== mainTeamId && !isDirectedToMain) return false;
         // Tab Main: chỉ hiển thị snapshot 'opencode' của ROOT ORCHESTRATOR.
         // Ẩn hoàn toàn snapshots opencode của Sub-Orchestrators và Workers (msgType 'opencode', from !== orchId && from !== 'orchestrator').
         const isNotRootOrch = (m.from !== orchId) && (m.from !== 'orchestrator');
