@@ -26,29 +26,41 @@ const getMessageKey = (msg: any) => {
 };
 
 const mergeMessage = (prev: any[], incoming: any): any[] => {
-  const incomingKey = getMessageKey(incoming);
-  const incomingTime = incoming.timestamp || Date.now();
-  // 1) Exact key match: cùng ID hoặc cùng content+from+bucket trong 5s
-  let existingIdx = prev.findIndex(p => getMessageKey(p) === incomingKey && Math.abs((p.timestamp || 0) - incomingTime) < 5000);
+  const incomingId = incoming?.id ? String(incoming.id) : '';
+  const incomingTime = incoming?.timestamp || Date.now();
+  const incomingFrom = incoming?.from || 'unknown';
+  const incomingContent = normText(incoming?.content);
 
-  // 2) Fallback match: optimistic temp-* ID vs canonical UUID — so sánh from + normalized content + timestamp
-  if (existingIdx === -1 && incomingKey.startsWith('from:')) {
-    const incomingFrom = incoming.from || 'unknown';
-    const incomingContent = normText(incoming.content);
-    if (incomingContent) {
-      existingIdx = prev.findIndex(p => {
-        const pKey = getMessageKey(p);
-        const pFrom = p.from || 'unknown';
-        const pContent = normText(p.content);
-        const timeDiff = Math.abs((p.timestamp || 0) - incomingTime);
-        return pKey.startsWith('from:') && pFrom === incomingFrom && pContent === incomingContent && timeDiff < 5000;
-      });
-    }
+  // 1) Match chính xác theo ID (nếu ID không phải temp- hoặc nếu cùng ID)
+  let existingIdx = prev.findIndex(p => {
+    if (!p) return false;
+    if (incomingId && p.id === incomingId) return true;
+    return false;
+  });
+
+  // 2) Nếu là tin nhắn User hoặc tin nhắn trùng nội dung + người gửi gần nhau trong 15s (đặc biệt optimistic temp-* vs canonical id)
+  if (existingIdx === -1 && incomingContent) {
+    existingIdx = prev.findIndex(p => {
+      if (!p) return false;
+      const pFrom = p.from || 'unknown';
+      if (pFrom !== incomingFrom) return false;
+      const pContent = normText(p.content);
+      if (!pContent || pContent !== incomingContent) return false;
+      const timeDiff = Math.abs((p.timestamp || 0) - incomingTime);
+      return timeDiff < 15000;
+    });
   }
 
   if (existingIdx !== -1) {
     const updated = [...prev];
-    updated[existingIdx] = { ...updated[existingIdx], ...incoming, id: incoming.id || updated[existingIdx].id };
+    // Ưu tiên giữ ID canonical thực nếu incoming là ID server
+    const targetId = (incomingId && !incomingId.startsWith('temp-')) ? incomingId : (updated[existingIdx].id || incomingId);
+    updated[existingIdx] = {
+      ...updated[existingIdx],
+      ...incoming,
+      id: targetId,
+      timestamp: updated[existingIdx].timestamp || incomingTime
+    };
     return updated;
   }
   return [...prev, incoming];
@@ -709,48 +721,7 @@ export function App() {
           delete streamRef.current[fkey];
         }
         setAllMessages(prev => {
-          if (prev.some(p => p.id === m.id)) return prev;
-
-          if (m.from === 'user') {
-            const tempIdx = prev.findIndex(p => p.id.startsWith('temp-') && (p.content.trim() === (m.content || '').trim() || p.id === m.id));
-            if (tempIdx !== -1) {
-              const next = [...prev];
-              next[tempIdx] = {
-                id: m.id,
-                from: m.from,
-                to: m.to,
-                content: m.content,
-                timestamp: m.timestamp || Date.now(),
-                agentName: m.agentName,
-                agentRole: m.agentRole,
-                msgType: m.msgType,
-                toolCalls: m.toolCalls,
-                thinking: m.thinking || staleThinking,
-                parts: m.parts || staleParts,
-                teamId: m.teamId,
-                task: (m as any).task,
-                showOnUI: (m as any).showOnUI
-              };
-              return next;
-            }
-          }
-          const nextList = [...prev, {
-            id: m.id,
-            from: m.from,
-            to: m.to,
-            content: m.content || '',
-            timestamp: m.timestamp || Date.now(),
-            agentName: m.agentName,
-            agentRole: m.agentRole,
-            msgType: m.msgType,
-            toolCalls: m.toolCalls,
-            thinking: m.thinking || staleThinking,
-            parts: m.parts || staleParts,
-            teamId: m.teamId,
-            task: (m as any).task,
-            showOnUI: (m as any).showOnUI
-          }];
-          return nextList.length > MAX_DISPLAY_MESSAGES ? nextList.slice(-MAX_DISPLAY_MESSAGES) : nextList;
+          return mergeMessage(prev, m);
         });
       }
       // KHÔNG tắt spinner vì tin trung gian; chỉ lỗi mới tắt (spinner do agent status điều phối)
