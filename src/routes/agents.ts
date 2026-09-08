@@ -439,6 +439,98 @@ Nội dung phân công nhiệm vụ mới tại đây
   router.delete('/:id/tasks/:taskId', handleDeleteAgentTask);
   router.post('/:id/tasks/:taskId/delete', handleDeleteAgentTask);
 
+  // POST /api/agents/:id/cancel-task — Cancel a specific task (mark as cancelled, agent skips to next)
+  router.post('/:id/cancel-task', (req, res) => {
+    const agentId = req.params.id;
+    const { taskId } = req.body || {};
+    const agent = deps.agents.get(agentId);
+    if (!agent) return res.status(404).json({ ok: false, error: 'Agent not found' });
+    if (!taskId) return res.status(400).json({ ok: false, error: 'taskId is required' });
+
+    // Find the task in agent.tasks
+    if (!Array.isArray(agent.tasks) || agent.tasks.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Agent has no tasks' });
+    }
+
+    const task = agent.tasks.find((t: any) => String(t.id) === String(taskId));
+    if (!task) return res.status(404).json({ ok: false, error: `Task #${taskId} not found` });
+
+    if (task.status === 'completed' || task.status === 'cancelled') {
+      return res.status(400).json({ ok: false, error: `Task #${taskId} is already ${task.status}` });
+    }
+
+    // Mark as cancelled
+    task.status = 'cancelled' as any;
+    (task as any).completedAt = Date.now();
+    deps.storage.updateAgent(agentId, { tasks: agent.tasks });
+
+    // If the cancelled task was the currently active task, advance to next
+    if (agent.task === task.task && agent.status === 'working') {
+      const nextTask = agent.tasks.find((t: any) => t.status === 'pending' || t.status === 'working');
+      if (nextTask) {
+        agent.task = nextTask.task;
+      } else {
+        agent.task = undefined;
+        agent.status = 'idle';
+        agent.workingSince = undefined;
+        deps.storage.updateAgent(agentId, { status: 'idle', workingSince: null });
+      }
+    }
+
+    deps.broadcast('agent:updated', { agent });
+
+    // Notify via chat message
+    const noticeMsg: any = {
+      id: uuidv4(),
+      from: 'system',
+      to: 'user',
+      content: `🚫 Task #${taskId} "${task.task}" cancelled on ${agent.name}.`,
+      timestamp: Date.now(),
+      agentName: 'System',
+      agentRole: 'system',
+      teamId: agent.teamId || 'default'
+    };
+    deps.chatHistory.push(noticeMsg);
+    deps.storage.saveMessage(noticeMsg);
+    deps.broadcast('chat:message', { msg: noticeMsg });
+
+    console.log(`[CancelTask] Task #${taskId} cancelled on ${agent.name} (${agent.id})`);
+    res.json({ ok: true, cancelled: task, agent });
+  });
+
+  // POST /api/agents/:id/cancel-all-tasks — Cancel ALL pending/working tasks on an agent
+  router.post('/:id/cancel-all-tasks', (req, res) => {
+    const agentId = req.params.id;
+    const agent = deps.agents.get(agentId);
+    if (!agent) return res.status(404).json({ ok: false, error: 'Agent not found' });
+
+    let cancelledCount = 0;
+    if (Array.isArray(agent.tasks)) {
+      for (const task of agent.tasks) {
+        if (task.status === 'pending' || task.status === 'working' || (task as any).status === 'assigned') {
+          task.status = 'cancelled' as any;
+          (task as any).completedAt = Date.now();
+          cancelledCount++;
+        }
+      }
+    }
+
+    if (cancelledCount > 0) {
+      agent.task = undefined;
+      if (agent.status === 'working') {
+        agent.status = 'idle';
+        agent.workingSince = undefined;
+        // Abort running client
+        const client = deps.clients.get(agentId);
+        if (client) try { client.abort(); } catch {}
+      }
+      deps.storage.updateAgent(agentId, { status: agent.status, workingSince: agent.workingSince ?? null, task: undefined, tasks: agent.tasks });
+      deps.broadcast('agent:updated', { agent });
+    }
+
+    res.json({ ok: true, cancelledCount, agent });
+  });
+
   // POST /api/agents/:id/model — Update agent model
   router.post('/:id/model', (req, res) => {
     const { model } = req.body || {};

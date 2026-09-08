@@ -27,7 +27,7 @@ export interface RouterOptions {
   deliverTalk: (targetAgent: Agent, fromAgent: Agent, msg: { to: string; message: string; task?: string }) => Promise<void>;
   forwardToOrchestrator: (type: string, message: string, targetOrchId: string, teamId: string) => ChatMsg;
   saveMessage: (msg: ChatMsg) => void;
-  broadcast: (type: string, data: any) => void;
+  broadcast: (type: string, data: any, teamId?: string) => void;
   chatHistory: ChatMsg[];
   dispatchedCmdSigs?: Map<string, Set<string>>;
   dedupManager?: DedupManager;
@@ -99,7 +99,7 @@ export class MessageRouter {
       if (!this.dedup.isBroadcastDuplicate(reply)) {
         this.options.chatHistory.push(reply);
         this.options.saveMessage(reply);
-        this.options.broadcast('chat:message', { msg: reply }, reply.teamId || (fromAgent?.teamId) || 'default');
+        this.options.broadcast('chat:message', { msg: reply });
       } else {
         console.log(`[Route] Skip duplicate broadcast bubble from ${fromAgent.name} -> ${resolvedTo} (dedup window, content-based)`);
       }
@@ -155,7 +155,7 @@ export class MessageRouter {
               };
                this.options.chatHistory.push(errChatMsg);
                this.options.saveMessage(errChatMsg);
-               this.options.broadcast('chat:message', { msg: errChatMsg }, fromAgent.teamId || 'default');
+               this.options.broadcast('chat:message', { msg: errChatMsg });
 
               const activeOrch = this.options.findExistingOrchestrator(fromAgent.teamId) || this.options.agents.get('orchestrator');
               const targetOrch = activeOrch?.id || 'orchestrator';

@@ -8,7 +8,7 @@ export interface OutboxDispatcherOptions {
   getClient: (agent: Agent) => any;
   buildTeamPrompt: (targetAgentId: string) => string;
   workerReminder: string;
-  broadcast: (type: string, data: any) => void;
+  broadcast: (type: string, data: any, teamId?: string) => void;
   handleAgentResponse: (content: string, agent: Agent, defaultTo: string, toolCalls?: any[], thinking?: string) => Promise<void>;
   saveTranscript: (tr: any, id: string, name: string, role: string) => void;
   validateWorkerCompletion: (content: string, agent: Agent) => { valid: boolean; reason?: string };
@@ -82,7 +82,6 @@ export class OutboxDispatcher {
             status: 'working',
             createdAt: Date.now()
           });
-        }
         this.options.storage.updateAgent(targetAgent.id, { task: targetAgent.task, tasks: targetAgent.tasks });
         const teamId = targetAgent.teamId || 'default';
         this.options.broadcast('agent:updated', { agent: targetAgent }, teamId);
@@ -100,7 +99,7 @@ export class OutboxDispatcher {
       targetAgent.status = 'working';
       targetAgent.workingSince = Date.now();
       this.options.storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
-      this.options.broadcast('agent:updated', { agent: targetAgent });
+      this.options.broadcast('agent:updated', { agent: targetAgent }, teamId);
 
       this.options.storage.markOutboxInFlight(reportId);
 

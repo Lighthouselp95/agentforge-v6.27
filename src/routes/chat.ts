@@ -588,6 +588,116 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
     }
   });
 
+  // POST /api/broadcast — Broadcast a message from the user to ALL agents + orchestrator (khẩn cấp)
+  router.post('/broadcast', async (req: any, res: any) => {
+    try {
+      const rawMsg = ((req.body?.message) || '').toString().trim().normalize('NFC');
+      if (!rawMsg) {
+        return res.status(400).json({ ok: false, error: 'Message cannot be empty' });
+      }
+
+      const teamId = req.body?.teamId || 'default';
+      const now = Date.now();
+      const msgId = req.body?.messageId || uuidv4();
+
+      // Lưu tin broadcast vào chat history (từ user → broadcast)
+      const broadcastMsg: any = {
+        id: msgId,
+        from: 'user',
+        to: 'broadcast',
+        content: rawMsg,
+        timestamp: now,
+        sourceCreatedAt: now,
+        teamId,
+        isBroadcast: true
+      };
+      deps.chatHistory.push(broadcastMsg);
+      deps.storage.saveMessage(broadcastMsg);
+      (deps.storage as any).schedulePersist?.(true);
+      deps.broadcast('chat:message', { msg: broadcastMsg });
+
+      // Gửi tới TẤT CẢ agent + orchestrator thuộc team (không queue thường, gửi ngay — khẩn cấp)
+      let targetCount = 0;
+      for (const agent of deps.agents.values()) {
+        if (agent.teamId && agent.teamId !== teamId) continue;
+        if (agent.status === 'stopped') continue;
+
+        const agentMsg: any = {
+          id: `broadcast-${uuidv4()}`,
+          from: 'user',
+          to: agent.id,
+          content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+          timestamp: now,
+          sourceCreatedAt: now,
+          teamId: agent.teamId || 'default',
+          isBroadcast: true
+        };
+        deps.chatHistory.push(agentMsg);
+        deps.storage.saveMessage(agentMsg);
+
+        // Dispatch ngay (không qua queue thường) — dùng force-style
+        deps.dispatchUserChat({
+          targetAgentId: agent.id,
+          rawMsg: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+          isSlashCommand: false,
+          isRetry: false
+        }).catch((err: any) => {
+          const isAbort = err?.message && /aborted by user/i.test(err.message);
+          if (isAbort) return;
+          console.error(`[Broadcast] Error dispatching to ${agent.id}:`, err?.message || err);
+        });
+        targetCount++;
+      }
+
+      // Orchestrator cũng nhận
+      const orchMsg: any = {
+        id: `broadcast-${uuidv4()}`,
+        from: 'user',
+        to: 'orchestrator',
+        content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+        timestamp: now,
+        sourceCreatedAt: now,
+        teamId,
+        isBroadcast: true
+      };
+      deps.chatHistory.push(orchMsg);
+      deps.storage.saveMessage(orchMsg);
+      deps.dispatchUserChat({
+        targetAgentId: 'orchestrator',
+        rawMsg: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+        isSlashCommand: false,
+        isRetry: false
+      }).catch((err: any) => {
+        const isAbort = err?.message && /aborted by user/i.test(err.message);
+        if (isAbort) return;
+        console.error(`[Broadcast] Error dispatching to orchestrator:`, err?.message || err);
+      });
+      targetCount++;
+
+      // Broadcast hệ thống thông báo đã gửi
+      const doneMsg: any = {
+        id: uuidv4(),
+        from: 'system',
+        to: 'user',
+        content: `📢 Đã broadcast tin nhắn tới ${targetCount} agent + orchestrator (khẩn cấp).`,
+        timestamp: Date.now(),
+        agentName: 'System',
+        agentRole: 'system',
+        teamId
+      };
+      deps.chatHistory.push(doneMsg);
+      deps.storage.saveMessage(doneMsg);
+      deps.broadcast('chat:message', { msg: doneMsg });
+
+      res.json({ ok: true, broadcastTo: targetCount, messageId: msgId });
+    } catch (err: any) {
+      console.error('[Broadcast] Error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: err?.message || 'Broadcast failed' });
+      }
+    }
+  });
+
   // POST /api/chat/queue/remove — Xoá thật tin nhắn khỏi hàng đợi người dùng (backendUserQueues & pending queue)
   router.post('/queue/remove', (req: any, res: any) => {
     try {

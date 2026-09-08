@@ -361,6 +361,105 @@ export class AgentManager {
     return true;
   }
 
+  /**
+   * Cancel a specific task on an agent by marking it as 'cancelled'.
+   * The agent can then skip and continue with the next task.
+   * Returns true if a task was found and cancelled.
+   */
+  public cancelTask(agentId: string, taskId: string): boolean {
+    const a = this.agents.get(agentId);
+    if (!a) return false;
+
+    // Try to cancel in the agent's tasks array
+    if (Array.isArray(a.tasks) && a.tasks.length > 0) {
+      const task = a.tasks.find(t => String(t.id ?? '') === String(taskId));
+      if (task) {
+        task.status = 'cancelled' as any;
+        (task as any).completedAt = Date.now();
+        storage.updateAgent(agentId, { tasks: a.tasks });
+        if (this.onBroadcast) {
+          this.onBroadcast('agent:updated', { agent: a });
+        }
+        console.log(`[CancelTask] Task ${taskId} cancelled on agent ${a.name} (${a.id})`);
+
+        // If the cancelled task was the current task, reset agent to idle
+        if (a.task && a.task === task.task) {
+          a.task = undefined;
+          if (a.status === 'working') {
+            a.status = 'idle';
+            a.workingSince = undefined;
+            storage.updateAgent(agentId, { status: 'idle', workingSince: null, task: undefined });
+            this.onBroadcast?.('agent:updated', { agent: a });
+          }
+        }
+
+        return true;
+      }
+    }
+
+    // Fallback: check single task field
+    if (a.task && String(taskId).includes(String(a.id))) {
+      const cancelledTask: AgentTask = {
+        id: taskId,
+        task: a.task,
+        status: 'cancelled',
+        createdAt: Date.now(),
+        completedAt: Date.now()
+      };
+      if (!Array.isArray(a.tasks)) a.tasks = [];
+      a.tasks.push(cancelledTask);
+      a.task = undefined;
+      if (a.status === 'working') {
+        a.status = 'idle';
+        a.workingSince = undefined;
+        storage.updateAgent(agentId, { status: 'idle', workingSince: null, task: undefined, tasks: a.tasks });
+      } else {
+        storage.updateAgent(agentId, { task: undefined, tasks: a.tasks });
+      }
+      if (this.onBroadcast) {
+        this.onBroadcast('agent:updated', { agent: a });
+      }
+      console.log(`[CancelTask] Single task cancelled on agent ${a.name} (${a.id})`);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Cancel ALL pending/working tasks on an agent.
+   */
+  public cancelAllTasks(agentId: string): number {
+    const a = this.agents.get(agentId);
+    if (!a) return 0;
+
+    let cancelledCount = 0;
+    if (Array.isArray(a.tasks)) {
+      for (const task of a.tasks) {
+        if (task.status === 'pending' || task.status === 'working' || (task as any).status === 'assigned') {
+          task.status = 'cancelled' as any;
+          (task as any).completedAt = Date.now();
+          cancelledCount++;
+        }
+      }
+    }
+
+    if (cancelledCount > 0) {
+      a.task = undefined;
+      if (a.status === 'working') {
+        a.status = 'idle';
+        a.workingSince = undefined;
+        storage.updateAgent(agentId, { status: 'idle', workingSince: null, task: undefined, tasks: a.tasks });
+      } else {
+        storage.updateAgent(agentId, { task: undefined, tasks: a.tasks });
+      }
+      this.onBroadcast?.('agent:updated', { agent: a });
+      console.log(`[CancelAllTasks] Cancelled ${cancelledCount} tasks on agent ${a.name} (${a.id})`);
+    }
+
+    return cancelledCount;
+  }
+
   public deleteAgent(id: string): boolean {
     const a = this.agents.get(id);
     const client = this.clients.get(id);

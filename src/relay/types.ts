@@ -52,7 +52,7 @@ export interface RelayContext {
   findAgent: (identifier: string) => Agent | undefined;
   findOrchestrator: (teamId?: string) => Agent | undefined;
   saveMessage: (msg: ChatMsg) => void;
-  broadcast: (type: string, data: any) => void;
+  broadcast: (type: string, data: any, teamId?: string) => void;
   chatHistory: ChatMsg[];
   getClient?: (agent: Agent) => any;
   getOrchClient?: (orchId: string) => any;

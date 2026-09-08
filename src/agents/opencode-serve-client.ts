@@ -176,7 +176,9 @@ export class OpenCodeServeClient {
 
   constructor(config: AgentConfig, options: OpenCodeServeClientOptions = {}) {
     this.config = config;
-    this.serverUrl = options.serverUrl || process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096';
+    const envUrl = process.env.OPENCODE_SERVE_URL;
+    const storageUrl = typeof storage.getSetting === 'function' ? storage.getSetting('opencodeServeUrl') : undefined;
+    this.serverUrl = options.serverUrl || envUrl || storageUrl || 'http://127.0.0.1:4096';
     this.mode = options.mode || (process.env.OPENCODE_SERVE_MODE as ServeMode) || 'attach';
     this.autoFallbackToCli = options.autoFallbackToCli ?? true;
 

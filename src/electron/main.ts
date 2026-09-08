@@ -336,6 +336,26 @@ function createWindow(): void {
 
 // ========== CLEANUP ==========
 function cleanup(): void {
+  // Kill OpenCode Serve process
+  if (opencodeServeProcess) {
+    console.log('[Electron] Shutting down OpenCode Serve process...');
+    try {
+      if (opencodeServeProcess.pid) {
+        if (process.platform === 'win32') {
+          spawn('taskkill', ['/pid', opencodeServeProcess.pid.toString(), '/f', '/t'], { stdio: 'ignore' });
+        } else {
+          opencodeServeProcess.kill('SIGTERM');
+          setTimeout(() => {
+            try { opencodeServeProcess?.kill('SIGKILL'); } catch {}
+          }, 3000);
+        }
+      }
+    } catch (e) {
+      console.error('[Electron] OpenCode Serve kill error:', e);
+    }
+    opencodeServeProcess = null;
+  }
+
   if (serverProcess) {
     console.log('[Electron] Shutting down backend server process...');
     try {
@@ -357,6 +377,10 @@ function cleanup(): void {
 // ========== APP LIFECYCLE ==========
 app.on('ready', async () => {
   console.log(`[Electron] Mode: ${isDev() ? 'development' : 'production'}`);
+
+  // 0. Spawn OpenCode Serve on dynamic port
+  console.log('[Electron] Starting OpenCode Serve...');
+  await spawnOpenCodeServe().catch((e) => console.error('[Electron] Failed to spawn OpenCode Serve:', e?.message || e));
 
   // 1. Ensure backend is running
   await ensureServerRunning();
@@ -385,4 +409,5 @@ app.on('before-quit', cleanup);
 
 // ========== IPC ==========
 ipcMain.handle('get-port', () => SERVER_PORT);
+ipcMain.handle('get-opencode-serve-port', () => OPENCODE_SERVE_PORT);
 ipcMain.handle('is-dev', () => isDev());

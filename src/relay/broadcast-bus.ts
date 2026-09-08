@@ -2,7 +2,7 @@
 import type { WebSocket } from 'ws';
 import type { Response } from 'express';
 
-export type BroadcastHandler = (type: string, data: any) => void;
+export type BroadcastHandler = (type: string, data: any, teamId?: string) => void;
 
 export class BroadcastBus {
   private wsClients: Set<WebSocket>;
