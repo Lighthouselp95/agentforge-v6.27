@@ -27,6 +27,16 @@ const REMINDER_MESSAGES = {
     `[WATCHDOG] Agent ${agentId} has been idle for 15s. Current task: "${taskDescription}". Please provide an update or continue working.`
 };
 
+// Singleton AgentStatusManager để tránh cấp phát lặp đi lặp lại và rò rỉ bộ nhớ
+let cachedStatusManager: any = null;
+async function getStatusManagerInstance() {
+  if (!cachedStatusManager) {
+    const { AgentStatusManager } = await import('./state-machine.js');
+    cachedStatusManager = new AgentStatusManager();
+  }
+  return cachedStatusManager;
+}
+
 export class WatchdogManager {
   private streamActivityTimers = new Map<string, NodeJS.Timeout>();
   private idleTimers = new Map<string, NodeJS.Timeout>();
@@ -250,9 +260,8 @@ export class WatchdogManager {
       
       const reminderMessage = messageTemplate(agent.id, taskDescription);
 
-      // Send task_update reminder via AgentStatusManager
-      const { AgentStatusManager } = await import('./state-machine.js');
-      const statusManager = new AgentStatusManager();
+      // Send task_update reminder via singleton AgentStatusManager
+      const statusManager = await getStatusManagerInstance();
       
       const taskId = `watchdog-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       

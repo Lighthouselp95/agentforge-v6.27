@@ -155,6 +155,11 @@ export class BroadcastManager {
   }
 
   public addWSClient(ws: WebSocket, isLogSubscriber = false): void {
+    const underlyingSocket = (ws as any)._socket;
+    if (underlyingSocket && typeof underlyingSocket.setNoDelay === 'function') {
+      try { underlyingSocket.setNoDelay(true); } catch {}
+    }
+
     (ws as any).isLogSubscriber = isLogSubscriber;
     this.wsClients.add(ws);
 

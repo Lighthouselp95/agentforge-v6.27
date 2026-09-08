@@ -21,7 +21,7 @@ export const DEFAULT_ENGINE_MODE = 'attach';
 
 function createAgentClient(config: AgentConfig): AnyAgentClient {
   const engineMode = storage.getSetting('engineMode', DEFAULT_ENGINE_MODE);
-  const serverUrl = storage.getSetting('opencodeServeUrl', storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
+  const serverUrl = storage.getSetting('opencodeServeUrl', storage.getSetting('serveUrl', process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096'));
 
   if (engineMode === 'attach') {
     return new OpenCodeServeClient(config, { mode: 'attach', serverUrl });
@@ -478,6 +478,7 @@ interface ChatMsg {
   msgType?: string;
   showOnUI?: boolean;
   isQueued?: boolean;
+  isStreaming?: boolean;
   // Dữ liệu toolcall cấu trúc lấy từ event gốc của opencode (nguồn cho UI toolcall)
   toolCalls?: Array<{ tool: string; input?: string; output?: string }>;
   // Suy nghĩ nội bộ của model (reasoning/thinking) — tách khỏi content
@@ -833,7 +834,9 @@ function broadcast(type: string, data: any, filterTeamId?: string) {
         return;
       }
       const wsTeam = (ws as any).teamId;
-      if (wsTeam && broadcastTeamId && wsTeam !== broadcastTeamId) {
+      // Team isolation: Nếu WS client đặt team cụ thể khác 'default' và 'all', chỉ nhận sự kiện thuộc team đó.
+      // Nếu wsTeam là 'default' hoặc không đặt (hoặc 'all'), coi như web client chung giám sát toàn bộ hệ thống.
+      if (broadcastTeamId && wsTeam && wsTeam !== 'default' && wsTeam !== 'all' && wsTeam !== broadcastTeamId) {
         return;
       }
       ws.send(msg);
@@ -848,7 +851,8 @@ function broadcast(type: string, data: any, filterTeamId?: string) {
         return;
       }
       const sseTeam = (res as any).teamId;
-      if (sseTeam && broadcastTeamId && sseTeam !== broadcastTeamId) {
+      // Team isolation: Nếu SSE client đặt team cụ thể khác 'default' và 'all', chỉ nhận sự kiện thuộc team đó.
+      if (broadcastTeamId && sseTeam && sseTeam !== 'default' && sseTeam !== 'all' && sseTeam !== broadcastTeamId) {
         return;
       }
       res.write(sseData);
@@ -1132,8 +1136,42 @@ function stripAnsi(text: any): string {
 // - spawn: KHÔNG dispatch sớm (orchestrator-only, có role-limit/reuse logic phức tạp) → giữ final pass.
 // - stop/resume/delete/task_update: giữ final pass (parseAgentCommands).
 const dispatchTextBuf: Record<string, string> = {};
-// Live stream persistence tracker: Đảm bảo render bubble nào là DB đã lưu xuống tin đó ngay
+// Live stream persistence tracker: Lưu snapshot định kỳ xuống DB với ID cố định của turn để chống crash
 const activeLiveStreamMsgs = new Map<string, { id: string; lastSavedAt: number }>();
+// Deterministic Turn Message ID: Ánh xạ agentId -> msgId cố định duy nhất cho turn hiện tại
+const activeTurnMsgIds = new Map<string, string>();
+
+function getOrCreateTurnMsgId(agentId: string, customId?: string): string {
+  if (customId && customId.trim()) {
+    activeTurnMsgIds.set(agentId, customId.trim());
+    return customId.trim();
+  }
+  let tid = activeTurnMsgIds.get(agentId);
+  if (!tid) {
+    tid = `turn-${agentId}-${Date.now()}`;
+    activeTurnMsgIds.set(agentId, tid);
+  }
+  return tid;
+}
+
+function clearTurnMsgId(agentId: string): void {
+  activeTurnMsgIds.delete(agentId);
+  activeLiveStreamMsgs.delete(agentId);
+}
+
+function upsertChatHistoryEntry(msg: ChatMsg): void {
+  const existingIdx = chatHistory.findIndex(m => m.id === msg.id);
+  if (existingIdx !== -1) {
+    chatHistory[existingIdx] = { ...chatHistory[existingIdx], ...msg };
+  } else {
+    chatHistory.push(msg);
+  }
+  try {
+    storage.saveMessage(msg);
+  } catch (err: any) {
+    console.error(`[UpsertHistory] Failed to save message ${msg.id}:`, err?.message || err);
+  }
+}
 // Signature theo TỪNG agent gửi (fromAgentId → Set<sig>): giúp (a) không nhầm lẫn giữa các agent
 // stream song song, (b) xoá đúng sig của agent khi turn kết thúc → không chặn nhầm talk trùng lặp
 // ở turn SAU (cùng agent gửi lại nội dung giống hệt), tránh mất delivery.
@@ -1315,6 +1353,9 @@ function scanStreamForDispatch(agentId: string, accumulated: string): string {
     fromAgent.workingSince = fromAgent.workingSince || Date.now();
     storage.updateAgent(fromAgent.id, { status: 'working', workingSince: fromAgent.workingSince });
     broadcast('agent:updated', { agent: fromAgent });
+    // Hủy idle detection khi agent quay lại working
+    watchdogManager.onAgentActive(agentId);
+    taskQueueManager?.cancelIdle(agentId);
   }
 
   // Quét và thực thi tức thời các lệnh task_update nếu có trong stream
@@ -1462,6 +1503,9 @@ function scanStreamForDispatch(agentId: string, accumulated: string): string {
         targetAgent.workingSince = Date.now();
         storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
         broadcast('agent:updated', { agent: targetAgent });
+        // Hủy idle detection khi agent quay lại working
+        watchdogManager.onAgentActive(targetAgent.id);
+        taskQueueManager?.cancelIdle(targetAgent.id);
         deliverTalk(targetAgent, fromAgent, { to: resolvedTo, message: rawMessage, task }, replyId).catch(err => {
           console.error(`[StreamDispatch] deliverTalk error: ${err?.message || err}`);
         });
@@ -1502,6 +1546,7 @@ function drainDispatchState(agentId: string): void {
   delete dispatchTextBuf[agentId];
   delete streamMaskingBuf[agentId];
   dispatchedCmdSigs.delete(agentId);
+  clearTurnMsgId(agentId);
   // Tự động kiểm tra và xả queue người dùng nếu agent rảnh
   processNextBackendUserQueue(agentId);
 }
@@ -1531,6 +1576,8 @@ function broadcastOACEvent(agentId: string, ev: any) {
       currentAgent.workingSince = currentAgent.workingSince || Date.now();
       storage.updateAgent(currentAgent.id, { status: 'working', workingSince: currentAgent.workingSince });
       broadcast('agent:updated', { agent: currentAgent });
+      // Hủy idle detection khi agent quay lại working
+      taskQueueManager?.cancelIdle(agentId);
     }
 
     // Update watchdog with stream activity (resets 30s inactivity timer)
@@ -1570,7 +1617,10 @@ function broadcastOACEvent(agentId: string, ev: any) {
           ...(output !== undefined ? { output } : {})
         };
 
+        const turnMsgId = getOrCreateTurnMsgId(agentId);
         broadcast('chat:tool_call', {
+          id: turnMsgId,
+          msgId: turnMsgId,
           agentId,
           from: agentId,
           toolCall: tc,
@@ -1580,7 +1630,10 @@ function broadcastOACEvent(agentId: string, ev: any) {
       } else if (tt === 'thinking' || tt === 'reasoning' || tt === 'thought') {
         const rt = e.part?.text || e.text || e.part?.thinking || e.thinking;
         if (typeof rt === 'string' && rt.trim()) {
+          const turnMsgId = getOrCreateTurnMsgId(agentId);
           broadcast('chat:thinking', {
+            id: turnMsgId,
+            msgId: turnMsgId,
             agentId,
             from: agentId,
             thinkingText: rt,
@@ -1601,8 +1654,11 @@ function broadcastOACEvent(agentId: string, ev: any) {
 
           // ZERO-BUFFERING LIVE TOKEN STREAMING:
           // Phát rawPart trực tiếp ra WebSocket (chat:chunk) ngay khi có token từ OpenCode!
-          // Không đè nén hoặc giữ lại trong RAM để Main Orchestrator live stream 100% thời gian thực.
+          // Kèm deterministic turnMsgId để client và server đồng nhất 1 bản ghi duy nhất.
+          const turnMsgId = getOrCreateTurnMsgId(agentId);
           broadcast('chat:chunk', {
+            id: turnMsgId,
+            msgId: turnMsgId,
             agentId,
             from: agentId,
             to: agentId,
@@ -1610,10 +1666,40 @@ function broadcastOACEvent(agentId: string, ev: any) {
             teamId,
             timestamp: eventTs
           });
+
+          // Định kỳ 1.5s ghi snapshot xuống DB/WAL dưới ID cố định turnMsgId để chống mất mát dữ liệu khi server crash/tắt đột ngột
+          const now = Date.now();
+          const liveTracker = activeLiveStreamMsgs.get(agentId) || { id: turnMsgId, lastSavedAt: 0 };
+          if (now - liveTracker.lastSavedAt >= 1500) {
+            liveTracker.id = turnMsgId;
+            liveTracker.lastSavedAt = now;
+            activeLiveStreamMsgs.set(agentId, liveTracker);
+            const targetAgent = agents.get(agentId);
+            const currentLiveContent = stripCommandTags(dispatchTextBuf[agentId] || '').trim();
+            if (currentLiveContent) {
+              const liveMsg: ChatMsg = {
+                id: turnMsgId,
+                from: agentId,
+                to: 'user',
+                content: currentLiveContent,
+                timestamp: now,
+                sourceCreatedAt: now,
+                agentName: targetAgent?.name || (agentId === 'orchestrator' ? 'Orchestrator' : agentId),
+                agentRole: targetAgent?.role || (agentId === 'orchestrator' ? 'orchestrator' : 'worker'),
+                teamId,
+                isStreaming: true,
+                showOnUI: true
+              };
+              upsertChatHistoryEntry(liveMsg);
+            }
+          }
         }
       } else {
         const fallbackTxt = `◆ ${t}: ${JSON.stringify(e).slice(0, 2000)}`;
+        const turnMsgId = getOrCreateTurnMsgId(agentId);
         broadcast('chat:chunk', {
+          id: turnMsgId,
+          msgId: turnMsgId,
           agentId,
           from: agentId,
           to: agentId,
@@ -1628,33 +1714,9 @@ function broadcastOACEvent(agentId: string, ev: any) {
       if (dispatchTextBuf[agentId]) {
         dispatchTextBuf[agentId] = scanStreamForDispatch(agentId, dispatchTextBuf[agentId]);
 
-        // STREAM PERSISTENCE: Tức thời lưu bubble stream vào DB, không mất tin nếu bị ngắt quãng
-        let streamTracker = activeLiveStreamMsgs.get(agentId);
-        if (!streamTracker) {
-          const sid = `stream-${agentId}-${Date.now()}`;
-          streamTracker = { id: sid, lastSavedAt: Date.now() };
-          activeLiveStreamMsgs.set(agentId, streamTracker);
-        }
-        const nowTs = Date.now();
-        if (nowTs - streamTracker.lastSavedAt >= 1000) {
-          streamTracker.lastSavedAt = nowTs;
-          const currentText = dispatchTextBuf[agentId] || '';
-          if (currentText.trim()) {
-            const fromAg = agents.get(agentId);
-            const liveMsg: ChatMsg = {
-              id: streamTracker.id,
-              from: agentId,
-              to: 'user',
-              content: currentText,
-              timestamp: nowTs,
-              agentName: fromAg?.name || (agentId === 'orchestrator' ? 'Orchestrator' : agentId),
-              agentRole: fromAg?.role || fromAg?.type || 'worker',
-              showOnUI: true,
-              teamId: fromAg?.teamId || teamId || 'default'
-            };
-            storage.saveMessage(liveMsg);
-          }
-        }
+        // Live stream text được truyền thời gian thực qua chat:chunk tới UI.
+        // Không lưu các bản snapshot trung gian dở dang vào DB để tránh sinh ra
+        // các bản ghi trùng lặp (duplicate bubbles) trên history.
       }
     } catch (e: any) {
       console.error(`[StreamDispatch] scan error: ${e?.message || e}`);
@@ -2105,8 +2167,9 @@ WHAT I DID: <summary>
     broadcast('agent:updated', { agent });
     checkAndSynthesize(agent.id);
     
-    // Notify watchdog that agent became idle (starts 15s idle reminder timer)
+    // Notify watchdog and taskQueue that agent became idle (starts idle detection)
     watchdogManager.onAgentIdle(agent.id);
+    taskQueueManager?.onAgentIdle(agent.id);
   } catch (e: any) {
     const isAborted = e.message?.toLowerCase().includes('abort') || e.message?.toLowerCase().includes('aborted');
     if (isAborted) return;
@@ -2907,9 +2970,15 @@ Vui lòng hãy hoàn thành các task trước (sử dụng <task_update agent="
     storage.updateAgent(target.id, updates as any);
     broadcast('agent:updated', { agent: target });
     notifyTeamChanged(target.teamId || 'default');
-    // Watchdog/auto-continue: khi agent quay về idle (task_update đánh dấu xong) → bật idle detection.
+    // Watchdog/auto-continue: khi agent quay về idle → bật idle detection cho cả watchdog + taskQueue.
     if (updates.status === 'idle') {
+      watchdogManager.onAgentIdle(target.id);
       taskQueueManager?.onAgentIdle(target.id);
+    }
+    // Khi agent chuyển sang working → hủy idle detection để tránh nhầm lẫn.
+    if (updates.status === 'working') {
+      watchdogManager.onAgentActive(target.id);
+      taskQueueManager?.cancelIdle(target.id);
     }
     const resMsg = `Updated task for ${target.name} (${target.id}): task="${target.task || ''}", status="${target.status}", totalTasks=${target.tasks.length}`;
     console.log(`[${new Date().toISOString()}] [TASK_EXEC] Agent '${target.name}' (${target.id}) executing <task_update task="${targetTaskId || newTask}" status="${normStatus || newStatus}"> -> Result: ${resMsg}`);
@@ -3917,6 +3986,7 @@ Vui lòng hãy hoàn thành các task trước (sử dụng <task_update agent="
 
       clearAgentRetry(targetAgent.id);
     } finally {
+      clearTurnMsgId(targetAgent.id);
       targetAgent.status = 'idle';
       targetAgent.workingSince = undefined;
       storage.updateAgent(targetAgent.id, {
@@ -4414,7 +4484,7 @@ const talkMsg: ChatMsg = {
   agentName: 'Orchestrator',
   agentRole: 'orchestrator',
   msgType: 'talk',
-  showOnUI: false,
+  showOnUI: true,
   teamId: ta.teamId || 'default'
 };
     chatHistory.push(talkMsg);
@@ -4629,8 +4699,8 @@ app.use('/', createTerminalRouter({ storage, logBuffer, maxLogBuffer: LOG_BUFFER
 
 // ============ CHAT ============
 // ============ DISPATCH USER CHAT (dùng chung HTTP handler + retry queue) ============
-async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string; isSlashCommand: boolean; isRetry?: boolean }): Promise<{ response: string; sid: string | null; commands: string[] }> {
-  const { targetAgentId, rawMsg, isSlashCommand, isRetry } = params;
+async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string; isSlashCommand: boolean; isRetry?: boolean; customTurnId?: string }): Promise<{ response: string; sid: string | null; commands: string[] }> {
+  const { targetAgentId, rawMsg, isSlashCommand, isRetry, customTurnId } = params;
   let resolvedTargetId = targetAgentId || '';
   let targetAgent: Agent | null = (resolvedTargetId && resolvedTargetId !== 'orchestrator') ? (agents.get(resolvedTargetId) || findAgentByIdNameOrRole(resolvedTargetId) || null) : null;
   const isOrchTarget = !targetAgent || isOrchestratorLike(targetAgent) || resolvedTargetId === 'orchestrator';
@@ -4641,6 +4711,12 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
       targetAgent = existingOrch;
       orchId = existingOrch.id;
     }
+  }
+  const effectiveTurnTargetId = isOrchTarget ? orchId : (targetAgent ? targetAgent.id : resolvedTargetId);
+  if (customTurnId) {
+    getOrCreateTurnMsgId(effectiveTurnTargetId, customTurnId);
+  } else {
+    getOrCreateTurnMsgId(effectiveTurnTargetId);
   }
   let agentName = targetAgent ? targetAgent.name : 'Orchestrator';
   let agentRole = targetAgent ? targetAgent.role : 'orchestrator';
@@ -4797,11 +4873,12 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
 
   const response = result.content;
   if (!isOrchTarget && targetAgent) {
+    const turnMsgId = getOrCreateTurnMsgId(targetAgent.id);
     if (isSlashCommand) {
       let chatContent = response;
       let isInternal = false;
       const reply: ChatMsg = {
-        id: uuidv4(),
+        id: turnMsgId,
         from: targetAgent.id,
         to: 'user',
         content: chatContent,
@@ -4815,8 +4892,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         ...(result.parts && result.parts.length ? { parts: result.parts } : {})
       };
       if (!isBroadcastDuplicate(broadcastDedupKey(reply))) {
-        chatHistory.push(reply);
-        storage.saveMessage(reply);
+        upsertChatHistoryEntry(reply);
         broadcast('chat:message', { msg: reply });
       }
     } else {
@@ -4841,7 +4917,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         let chatContent = response;
         let isInternal = false;
         const reply: ChatMsg = {
-          id: uuidv4(),
+          id: turnMsgId,
           from: targetAgent.id,
           to: 'user',
           content: chatContent,
@@ -4856,8 +4932,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
           ...(result.parts && result.parts.length ? { parts: result.parts } : {})
         };
         if (!isBroadcastDuplicate(broadcastDedupKey(reply))) {
-          chatHistory.push(reply);
-          storage.saveMessage(reply);
+          upsertChatHistoryEntry(reply);
           broadcast('chat:message', { msg: reply });
         }
 
@@ -4886,14 +4961,16 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
     storage.updateAgent(targetAgent.id, { status: 'idle', sessionId: targetAgent.sessionId, workingSince: null });
     broadcast('agent:updated', { agent: targetAgent });
     storage.clearUnprocessedMessages(targetKey);
+    drainDispatchState(targetAgent.id);
     processNextBackendUserQueue(targetAgent.id);
   } else {
+    const turnMsgId = getOrCreateTurnMsgId(orchId);
     if (isSlashCommand) {
       const stripped = stripCommandTags(response).trim();
       const isInternal = !stripped;
       const now = Date.now();
       const aMsg: ChatMsg = {
-        id: uuidv4(),
+        id: turnMsgId,
         from: orchId,
         to: 'user',
         content: stripped,
@@ -4908,8 +4985,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         ...(result.parts && result.parts.length ? { parts: result.parts } : {})
       };
       if (!isBroadcastDuplicate(broadcastDedupKey(aMsg))) {
-        chatHistory.push(aMsg);
-        storage.saveMessage(aMsg);
+        upsertChatHistoryEntry(aMsg);
         broadcast('chat:message', { msg: aMsg });
       }
     } else {
@@ -4922,7 +4998,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
       const isInternal = !stripped;
       const now = Date.now();
       const aMsg: ChatMsg = {
-        id: uuidv4(), from: orchId, to: 'user', content: stripped,
+        id: turnMsgId, from: orchId, to: 'user', content: stripped,
         timestamp: now, sourceCreatedAt: now, agentName, agentRole,
         msgType: isInternal ? 'orchestrator_internal' : undefined,
         showOnUI: !isInternal,
@@ -4932,7 +5008,7 @@ async function dispatchUserChat(params: { targetAgentId: string; rawMsg: string;
         ...(result.parts && result.parts.length ? { parts: result.parts } : {})
       };
       if (!isBroadcastDuplicate(broadcastDedupKey(aMsg))) {
-        chatHistory.push(aMsg); storage.saveMessage(aMsg);
+        upsertChatHistoryEntry(aMsg);
         broadcast('chat:message', { msg: aMsg });
       }
       // Chạy sau khi đã persist/broadcast text-user để các spawn/talk msg đứng sau text.
@@ -4994,7 +5070,8 @@ async function processChatRetryQueue() {
         continue;
       }
       try {
-        await dispatchUserChat({ targetAgentId: item.targetAgentId, rawMsg: item.rawMsg, isSlashCommand: item.isSlashCommand, isRetry: true });
+        const retryTurnId = `turn-${item.targetAgentId}-${item.id}`;
+        await dispatchUserChat({ targetAgentId: item.targetAgentId, rawMsg: item.rawMsg, isSlashCommand: item.isSlashCommand, isRetry: true, customTurnId: retryTurnId });
         storage.removeChatQueueItem(item.id);
         const okMsg: ChatMsg = createChatMsg('user', 'system',
           `✅ Đã gửi lại tin nhắn thành công khi backend sẵn sàng: "${item.rawMsg.slice(0, 80)}${item.rawMsg.length > 80 ? '...' : ''}"`,
@@ -5135,9 +5212,9 @@ async function getAvailableModels(forceRefresh = false): Promise<string[]> {
       isFetchingModels = false;
       const raw = (stdout || stderr || '').trim();
       if (err || !raw) {
-        // Fallback: Thử lấy danh sách provider từ OpenCode Serve (nếu đang chạy trên port 4096)
         try {
-          const r = await fetch('http://127.0.0.1:4096/config/providers', { signal: AbortSignal.timeout(2000) });
+          const OPENCODE_BASE_URL = process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096';
+          const r = await fetch(`${OPENCODE_BASE_URL}/config/providers`, { signal: AbortSignal.timeout(2000) });
           if (r.ok) {
             const data: any = await r.json();
             const list: string[] = [];

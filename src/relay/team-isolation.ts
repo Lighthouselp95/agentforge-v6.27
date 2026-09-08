@@ -147,13 +147,17 @@ export function findAgentByIdNameOrRole(
     return undefined;
   }
 
-  // Ưu tiên 2: Fallback tìm toàn cục (khi preferredTeamId undefined hoặc target là orchestrator)
-  for (const [, agent] of agents) {
-    if (String(agent.name || '').toLowerCase() === idLower) return agent;
+  // Ưu tiên 2: Fallback tìm khi target là orchestrator
+  if (isOrchTarget) {
+    for (const [, agent] of agents) {
+      if (String(agent.name || '').toLowerCase() === idLower) return agent;
+    }
+    for (const [, agent] of agents) {
+      if (String(agent.role || '').toLowerCase() === idLower) return agent;
+    }
   }
-  for (const [, agent] of agents) {
-    if (String(agent.role || '').toLowerCase() === idLower) return agent;
-  }
+  // Khi preferredTeamId undefined và không phải target orchestrator:
+  // Tuyệt đối không quét bừa cross-team để tránh gửi nhầm lệnh/tin nhắn xuyên team.
   return undefined;
 }
 

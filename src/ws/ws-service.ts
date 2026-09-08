@@ -13,7 +13,7 @@ export class WebSocketService {
   constructor(wss: WebSocketServer, wsClients: Set<WebSocket>, options: WebSocketServiceOptions = {}) {
     this.wss = wss;
     this.wsClients = wsClients;
-    this.heartbeatIntervalMs = options.heartbeatIntervalMs || 30000;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs || 45000;
   }
 
   public init(): void {
@@ -22,8 +22,16 @@ export class WebSocketService {
     });
 
     this.wss.on('connection', (ws: WebSocket, req: any) => {
+      // Ép tắt Nagle algorithm để truyền gói tin thời gian thực không độ trễ
+      const underlyingSocket = (ws as any)._socket || req?.socket;
+      if (underlyingSocket && typeof underlyingSocket.setNoDelay === 'function') {
+        try { underlyingSocket.setNoDelay(true); } catch {}
+      }
+
       this.wsClients.add(ws);
       (ws as any)._isAlive = true;
+      (ws as any)._connectedAt = Date.now();
+      (ws as any)._clientIp = req?.socket?.remoteAddress || 'unknown';
 
       // Extract teamId and log subscriber flag from query params e.g. ws://host/?teamId=xyz&logs=1
       try {
@@ -76,6 +84,9 @@ export class WebSocketService {
     this.heartbeatTimer = setInterval(() => {
       this.wss.clients.forEach((c: any) => {
         if (c._isAlive === false) {
+          const durationSec = c._connectedAt ? Math.round((Date.now() - c._connectedAt) / 1000) : 0;
+          const clientInfo = `ip=${c._clientIp || 'unknown'}, teamId=${c.teamId || 'unknown'}, duration=${durationSec}s`;
+          console.warn(`[WS Heartbeat] Terminating inactive connection (${clientInfo}) - missing pong`);
           try {
             c.terminate();
           } catch {}
@@ -108,7 +119,8 @@ export class WebSocketService {
         if (isLogMsg && !(ws as any).isLogSubscriber) {
           continue;
         }
-        if (filterTeamId && (ws as any).teamId && (ws as any).teamId !== filterTeamId) {
+        const wsTeam = (ws as any).teamId;
+        if (filterTeamId && wsTeam && wsTeam !== 'default' && wsTeam !== 'all' && wsTeam !== filterTeamId) {
           continue;
         }
         try {

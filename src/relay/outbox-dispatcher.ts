@@ -64,6 +64,7 @@ export class OutboxDispatcher {
       const needReinject = tc.getNeedPromptReinject() || !targetAgent.sessionId;
       if (needReinject) tc.setNeedPromptReinject(false);
 
+      const teamId = targetAgent.teamId || 'default';
       const explicitTask = msg.task && msg.task.trim() ? msg.task.trim() : '';
       if (explicitTask) {
         if (!targetAgent.tasks) targetAgent.tasks = [];
@@ -82,8 +83,8 @@ export class OutboxDispatcher {
             status: 'working',
             createdAt: Date.now()
           });
+        }
         this.options.storage.updateAgent(targetAgent.id, { task: targetAgent.task, tasks: targetAgent.tasks });
-        const teamId = targetAgent.teamId || 'default';
         this.options.broadcast('agent:updated', { agent: targetAgent }, teamId);
       }
 
@@ -99,7 +100,8 @@ export class OutboxDispatcher {
       targetAgent.status = 'working';
       targetAgent.workingSince = Date.now();
       this.options.storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
-      this.options.broadcast('agent:updated', { agent: targetAgent }, teamId);
+      const agentTeamId = targetAgent.teamId;
+      this.options.broadcast('agent:updated', { agent: targetAgent }, agentTeamId);
 
       this.options.storage.markOutboxInFlight(reportId);
 
@@ -115,7 +117,7 @@ export class OutboxDispatcher {
         tokenUsage: targetAgent.tokenUsage,
         contextLength: targetAgent.contextLength
       });
-      this.options.broadcast('agent:updated', { agent: targetAgent });
+      this.options.broadcast('agent:updated', { agent: targetAgent }, teamId);
 
       this.options.storage.markOutboxDelivered(reportId);
 

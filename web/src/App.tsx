@@ -376,7 +376,7 @@ export function App() {
   };
 
   // Tạo/lấy tin nhắn stream của 1 agent rồi mutate nội dung (dùng cho chat:chunk / chat:tool_call / chat:thinking)
-  const upsertStreamMsg = (key: string, mut: (m: ChatMsg) => ChatMsg, teamId?: string, isNewTurn?: boolean) => {
+  const upsertStreamMsg = (key: string, mut: (m: ChatMsg) => ChatMsg, teamId?: string, isNewTurn?: boolean, customMsgId?: string) => {
     const now = Date.now();
     const lastActive = lastChunkAtRef.current[key] || 0;
     // Tự động phân tách turn stream mới nếu server gắn cờ isNewTurn hoặc gián đoạn > 10 giây
@@ -386,12 +386,12 @@ export function App() {
     lastChunkAtRef.current[key] = now;
 
     setAllMessages(prev => {
-      let sid = streamRef.current[key];
+      let sid = customMsgId || streamRef.current[key];
       let list = prev;
       const existing = sid ? prev.find(p => p.id === sid) : undefined;
 
       if (!existing) {
-        sid = `stream-${key}-${Date.now()}`;
+        sid = sid || `stream-${key}-${Date.now()}`;
         streamRef.current[key] = sid;
         const targetAgent = agents.find(a => a.id === key || a.name === key);
         const agentRole = targetAgent?.role || targetAgent?.type || (key === 'orchestrator' ? 'orchestrator' : undefined);
@@ -421,6 +421,7 @@ export function App() {
 
         list = [...prev, mutated];
       } else {
+        if (sid) streamRef.current[key] = sid;
         return list.map(m => m.id === sid ? mut(m) : m);
       }
 
@@ -531,6 +532,7 @@ export function App() {
         return next;
       });
       const delta = msg.textDelta;
+      const turnMsgId = msg.msgId || msg.id;
       upsertStreamMsg(key, m => {
         const newParts = [...(m.parts || [])];
         const lastPart = newParts.length > 0 ? newParts[newParts.length - 1] : null;
@@ -544,10 +546,11 @@ export function App() {
         }
         return {
           ...m,
+          ...(turnMsgId ? { id: turnMsgId } : {}),
           content: (m.content || '') + delta,
           parts: newParts
         };
-      }, msg.teamId, msg.isNewTurn);
+      }, msg.teamId, msg.isNewTurn, turnMsgId);
     }
 
     // Thinking realtime: chat:thinking { agentId?, from?, thinkingText } — hiện hộp thinking live
@@ -577,6 +580,7 @@ export function App() {
         return next;
       });
       const thinkingDelta = msg.thinkingText;
+      const turnMsgId = msg.msgId || msg.id;
       upsertStreamMsg(key, m => {
         const newParts = [...(m.parts || [])];
         const lastPart = newParts.length > 0 ? newParts[newParts.length - 1] : null;
@@ -592,10 +596,11 @@ export function App() {
         }
         return {
           ...m,
+          ...(turnMsgId ? { id: turnMsgId } : {}),
           thinking: (m.thinking ? m.thinking + '\n' : '') + thinkingDelta,
           parts: newParts
         };
-      }, msg.teamId, msg.isNewTurn);
+      }, msg.teamId, msg.isNewTurn, turnMsgId);
     }
 
     // Tool call realtime: chat:tool_call { agentId?, toolCall? | tool/input/output }
@@ -614,6 +619,7 @@ export function App() {
         ...(callId ? { callId } : {})
       };
 
+      const turnMsgId = msg.msgId || msg.id;
       upsertStreamMsg(key, m => {
         const existingList = Array.isArray(m.toolCalls) ? [...m.toolCalls] : [];
         // Tìm xem toolcall này đã có chưa (theo callId hoặc match toolName đang chờ output)
@@ -650,10 +656,11 @@ export function App() {
 
         return {
           ...m,
+          ...(turnMsgId ? { id: turnMsgId } : {}),
           toolCalls: existingList,
           parts: existingParts
         };
-      });
+      }, msg.teamId, false, turnMsgId);
     }
 
     // Chấp nhận nhiều tên sự kiện: chat:message (chuẩn server), message:new / message (tương thích)
@@ -664,19 +671,18 @@ export function App() {
       const m = msg.msg || msg.message;
        console.log('received chat:message content:', m.content);
       const fkey = String(m.from || '');
+      let mergedIntoStream = false;
       let staleThinking: string | undefined;
       let staleParts: any[] | undefined;
       // Single Stream-Message Flow: Bất kể tin chứa directive hay text thường,
-      // nếu caller đang có stream active thì LUÔN merge/finalize trực tiếp vào streamRef đó.
-      if (fkey && streamRef.current[fkey]) {
-        const staleId = streamRef.current[fkey];
-        // Stream-First Finalization: Tin cuối (canonical final) có content đầy đủ
-        // TUYỆT ĐỐI KHÔNG xóa bản stream (không dùng prev.filter(x => x.id !== staleId))
-        // mà cập nhật trực tiếp tại chỗ bản stream đang chứa parts xen kẽ (thinking, tool, text)
-        delete streamRef.current[fkey];
+      // nếu caller đang có stream active thì LUÔN merge/finalize trực tiếp vào streamRef đó hoặc match theo m.id.
+      const staleId = (fkey && streamRef.current[fkey]) ? streamRef.current[fkey] : undefined;
+      const hasExistingMsg = allMessages.some(x => x.id === m.id || (staleId && x.id === staleId));
+      if (staleId || hasExistingMsg) {
+        if (fkey) delete streamRef.current[fkey];
         mergedIntoStream = true;
         setAllMessages(prev => prev.map(x => {
-          if (x.id !== staleId) return x;
+          if (x.id !== staleId && x.id !== m.id) return x;
           return {
             ...x,
             id: m.id,
@@ -936,17 +942,34 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
 
     connectWS();
 
-    // An toàn kép: quay lại tab / mạng trở lại -> kéo lịch sử mới nhất,
-    // phòng trường hợp lỡ mất event trong khoảng chờ reconnect.
-    const safeRefresh = () => { try { fetchAgents(); fetchHistory(); } catch {} };
+    // An toàn kép: quay lại tab / mạng trở lại / mobile resume từ sleep -> kéo lịch sử mới nhất
+    // và kiểm tra nếu WebSocket đã bị ngắt ngầm trên điện thoại thì tự chủ động kết nối lại
+    const safeRefresh = () => {
+      try {
+        fetchAgents();
+        fetchHistory();
+        if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+          connectWS();
+        }
+      } catch {}
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        safeRefresh();
+      }
+    };
+
     window.addEventListener('focus', safeRefresh);
     window.addEventListener('online', safeRefresh);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       isCleanedUp = true;
       clearTimeout(reconnectTimer);
       window.removeEventListener('focus', safeRefresh);
       window.removeEventListener('online', safeRefresh);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (ws) ws.close();
       if (es) es.close();
     };
@@ -1061,6 +1084,10 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     
     // Streamline Queue: Luôn gửi thẳng request POST /api/chat lên server ngay lập tức
     // Không chặn bởi state React (isTargetBusy / hasPendingQueue / inflightTargetRef)
+    // Hiển thị ngay lập tức tin nhắn của User lên UI (Optimistic update)
+    lastSendAtRef.current = Date.now();
+    setAllMessages(prev => mergeMessage(prev, userMsg));
+
     setLoading(true);
 
     try {
@@ -1120,10 +1147,6 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
           return updated;
         });
       }
-
-      // Hiển thị ngay tin nhắn người dùng vào bóng chat (qua mergeMessage để triệt tiêu dup)
-      lastSendAtRef.current = Date.now();
-      setAllMessages(prev => mergeMessage(prev, userMsg));
 
       if (!data || data.error) {
         setAllMessages(prev => mergeMessage(prev, {
@@ -1673,10 +1696,10 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
               >
                 {theme === 'dark' ? '☀️' : '🌙'}
               </button>
-              {/* Settings icon: always visible on mobile to access Settings view (activity bar hidden on mobile) */}
+              {/* Settings icon: toggle giữa Settings và Agents view */}
               <button
-                onClick={() => setActiveView('settings')}
-                title="Cài đặt / Settings"
+                onClick={() => setActiveView(activeView === 'settings' ? 'agents' : 'settings')}
+                title={activeView === 'settings' ? 'Về danh sách Agent' : 'Cài đặt / Settings'}
                 aria-label="Settings"
                 aria-current={activeView === 'settings' ? 'page' : undefined}
                 style={{
@@ -2066,36 +2089,40 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
           ☰
         </button>
       )}
-      {/* Settings button always visible on mobile (nằm ngoài drawer) */}
+      {/* Nút chuyển đổi View Cài đặt / Agents trên mobile */}
       {isMobile && (
         <button
           onClick={() => {
-            setActiveView('settings');
-            setSidebarOpen(false); // Close drawer when selecting settings
+            if (activeView === 'settings') {
+              setActiveView('agents');
+            } else {
+              setActiveView('settings');
+              setSidebarOpen(true);
+            }
           }}
-          aria-label="Cài đặt"
-          title="Cài đặt / Settings"
+          aria-label={activeView === 'settings' ? 'Đóng cài đặt, về danh sách Agent' : 'Cài đặt'}
+          title={activeView === 'settings' ? 'Về danh sách Agent' : 'Cài đặt'}
           style={{
             position: 'fixed',
-            top: 10,
-            right: 10,
-            zIndex: 55,
-            width: 44,
-            height: 44,
-            borderRadius: 10,
+            top: 8,
+            right: 8,
+            zIndex: 60,
+            width: 36,
+            height: 36,
+            borderRadius: 8,
             border: activeView === 'settings' ? '1px solid var(--accent)' : '1px solid #334155',
-            background: activeView === 'settings' ? 'var(--accent-soft)' : '#111827',
-            color: activeView === 'settings' ? 'var(--accent)' : '#f8fafc',
-            fontSize: 18,
+            background: activeView === 'settings' ? 'var(--accent)' : '#1e293b',
+            color: '#f8fafc',
+            fontSize: 15,
             cursor: 'pointer',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
             transition: 'all 0.2s'
           }}
         >
-          ⚙️
+          {activeView === 'settings' ? '✕' : '⚙️'}
         </button>
       )}
 

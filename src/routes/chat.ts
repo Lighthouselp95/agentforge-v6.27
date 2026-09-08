@@ -25,7 +25,7 @@ export interface ChatRouteDeps {
   updateOrchStateSafe: (orchId: string, status: 'idle' | 'working' | 'error', taskDesc?: string) => void;
   isRetriableError: (err: any) => boolean;
   getEffectiveTaskLimit: (teamId?: string) => number;
-  dispatchUserChat: (params: { targetAgentId: string; rawMsg: string; isSlashCommand: boolean; isRetry?: boolean }) => Promise<{ response: string; sid: string | null; commands: string[] }>;
+  dispatchUserChat: (params: { targetAgentId: string; rawMsg: string; isSlashCommand: boolean; isRetry?: boolean; customTurnId?: string }) => Promise<{ response: string; sid: string | null; commands: string[] }>;
   processNextBackendUserQueue?: (rawTargetId: string) => void;
 }
 
@@ -304,7 +304,18 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
         return res.json({ ok: true, queued: true, messageId: userMsg.id, message: 'Message queued in server for execution as soon as agent becomes idle.' });
       }
 
-      const { response, sid, commands: commandResults } = await deps.dispatchUserChat({ targetAgentId: targetIdKey, rawMsg, isSlashCommand, isRetry: false });
+      // Bật ngay trạng thái working cho targetAgent trên UI trước khi dispatch
+      if (targetAgent) {
+        targetAgent.status = 'working';
+        targetAgent.workingSince = targetAgent.workingSince || Date.now();
+        deps.storage.updateAgent(targetAgent.id, { status: 'working', workingSince: targetAgent.workingSince });
+        deps.broadcast('agent:updated', { agent: targetAgent });
+      } else if (isTargetOrch) {
+        deps.updateOrchStateSafe(targetIdKey, 'working', 'Đang phân tích yêu cầu & xử lý');
+      }
+
+      const turnResponseId = `turn-${targetIdKey}-${userMsg.id}`;
+      const { response, sid, commands: commandResults } = await deps.dispatchUserChat({ targetAgentId: targetIdKey, rawMsg, isSlashCommand, isRetry: false, customTurnId: turnResponseId });
       if (!res.headersSent) {
         res.json({ ok: true, response, sessionId: sid, commands: commandResults });
       }
@@ -543,11 +554,13 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
       res.json({ ok: true, aborted: wasAborted, targetId, mode: mode || 'single' });
 
       // 5. Spawn tiến trình mới chạy đúng nội dung gửi ngay thông qua dispatchUserChat
+      const forceTurnId = `turn-${targetId}-${messageId || Date.now()}`;
       deps.dispatchUserChat({
         targetAgentId: targetId,
         rawMsg,
         isSlashCommand: rawMsg.startsWith('/'),
-        isRetry: false
+        isRetry: false,
+        customTurnId: forceTurnId
       }).catch(err => {
         const isAbort = err?.message && /agent operation aborted by user|aborted by user/i.test(err.message);
         if (isAbort) {
@@ -589,6 +602,7 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
   });
 
   // POST /api/broadcast — Broadcast a message from the user to ALL agents + orchestrator (khẩn cấp)
+  // Gửi đến TẤT CẢ agent trên server (không phân team, không queue — gửi ngay)
   router.post('/broadcast', async (req: any, res: any) => {
     try {
       const rawMsg = ((req.body?.message) || '').toString().trim().normalize('NFC');
@@ -596,9 +610,9 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
         return res.status(400).json({ ok: false, error: 'Message cannot be empty' });
       }
 
-      const teamId = req.body?.teamId || 'default';
       const now = Date.now();
       const msgId = req.body?.messageId || uuidv4();
+      const teamId = req.body?.teamId || 'default';
 
       // Lưu tin broadcast vào chat history (từ user → broadcast)
       const broadcastMsg: any = {
@@ -616,12 +630,63 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
       (deps.storage as any).schedulePersist?.(true);
       deps.broadcast('chat:message', { msg: broadcastMsg });
 
-      // Gửi tới TẤT CẢ agent + orchestrator thuộc team (không queue thường, gửi ngay — khẩn cấp)
-      let targetCount = 0;
-      for (const agent of deps.agents.values()) {
-        if (agent.teamId && agent.teamId !== teamId) continue;
-        if (agent.status === 'stopped') continue;
+      // Gửi tới TẤT CẢ agent đang có trên server (không phân team)
+      // Kiểm tra client tồn tại trước khi dispatch
+      let successCount = 0;
+      let failCount = 0;
+      const failedAgents: string[] = [];
 
+      for (const agent of deps.agents.values()) {
+        // Bỏ orchestrator — xử lý riêng bên dưới
+        if (agent.id === 'orchestrator' || agent.type === 'orchestrator') continue;
+
+        // Bỏ agent đã dừng (không thể nhận tin)
+        if (agent.status === 'stopped') {
+          // Vẫn lưu tin nhắn vào history cho reference
+          const agentMsg: any = {
+            id: `broadcast-${uuidv4()}`,
+            from: 'user',
+            to: agent.id,
+            content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+            timestamp: now,
+            sourceCreatedAt: now,
+            teamId: agent.teamId,
+            isBroadcast: true,
+            status: 'stopped'
+          };
+          deps.chatHistory.push(agentMsg);
+          deps.storage.saveMessage(agentMsg);
+          continue;
+        }
+
+        // Kiểm tra client tồn tại
+        const client = deps.clients?.get(agent.id);
+        if (!client) {
+          // Agent không có client — lưu tin nhắn vào storage để xử lý khi agent khởi động lại
+          const agentMsg: any = {
+            id: `broadcast-${uuidv4()}`,
+            from: 'user',
+            to: agent.id,
+            content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+            timestamp: now,
+            sourceCreatedAt: now,
+            teamId: agent.teamId,
+            isBroadcast: true,
+            status: 'no_client'
+          };
+          deps.chatHistory.push(agentMsg);
+          deps.storage.saveMessage(agentMsg);
+          // Lưu vào unprocessed messages để xử lý khi agent có session
+          try {
+            deps.storage.saveUnprocessedMessage(agent.id, `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`);
+          } catch {}
+          failCount++;
+          failedAgents.push(`${agent.name}(${agent.id})-no_client`);
+          console.warn(`[Broadcast] Agent ${agent.name} (${agent.id}) has no client — saved to unprocessed`);
+          continue;
+        }
+
+        // Lưu tin nhắn vào chat history
         const agentMsg: any = {
           id: `broadcast-${uuidv4()}`,
           from: 'user',
@@ -629,67 +694,122 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
           content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
           timestamp: now,
           sourceCreatedAt: now,
-          teamId: agent.teamId || 'default',
+          teamId: agent.teamId,
           isBroadcast: true
         };
         deps.chatHistory.push(agentMsg);
         deps.storage.saveMessage(agentMsg);
 
-        // Dispatch ngay (không qua queue thường) — dùng force-style
+        // Dispatch ngay (không queue thường — khẩn cấp)
+        // Force set agent status to 'working' trước khi dispatch
+        const prevStatus = agent.status;
+        agent.status = 'working';
+        agent.workingSince = Date.now();
+        deps.storage.updateAgent(agent.id, { status: 'working', workingSince: agent.workingSince });
+        deps.broadcast('agent:updated', { agent });
+
+        const bcastTurnId = `turn-${agent.id}-${agentMsg.id}`;
         deps.dispatchUserChat({
           targetAgentId: agent.id,
           rawMsg: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
           isSlashCommand: false,
-          isRetry: false
+          isRetry: false,
+          customTurnId: bcastTurnId
+        }).then(() => {
+          successCount++;
+          console.log(`[Broadcast] ✅ Đã gửi tới ${agent.name} (${agent.id})`);
         }).catch((err: any) => {
+          failCount++;
+          failedAgents.push(`${agent.name}(${agent.id})`);
           const isAbort = err?.message && /aborted by user/i.test(err.message);
-          if (isAbort) return;
-          console.error(`[Broadcast] Error dispatching to ${agent.id}:`, err?.message || err);
+          if (isAbort) {
+            console.log(`[Broadcast] ⏭️ Agent ${agent.name} (${agent.id}) aborted (expected)`);
+          } else {
+            console.error(`[Broadcast] ❌ Error dispatching to ${agent.name} (${agent.id}):`, err?.message || err);
+            // Lưu vào unprocessed messages
+            try {
+              deps.storage.saveUnprocessedMessage(agent.id, `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`);
+            } catch {}
+          }
+        }).finally(() => {
+          // Restore status if needed
+          if (prevStatus === 'idle' || prevStatus === 'error') {
+            agent.status = prevStatus as any;
+            agent.workingSince = undefined;
+            deps.storage.updateAgent(agent.id, { status: prevStatus, workingSince: null });
+            deps.broadcast('agent:updated', { agent });
+          }
         });
-        targetCount++;
       }
 
-      // Orchestrator cũng nhận
-      const orchMsg: any = {
-        id: `broadcast-${uuidv4()}`,
-        from: 'user',
-        to: 'orchestrator',
-        content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
-        timestamp: now,
-        sourceCreatedAt: now,
-        teamId,
-        isBroadcast: true
-      };
-      deps.chatHistory.push(orchMsg);
-      deps.storage.saveMessage(orchMsg);
-      deps.dispatchUserChat({
-        targetAgentId: 'orchestrator',
-        rawMsg: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
-        isSlashCommand: false,
-        isRetry: false
-      }).catch((err: any) => {
-        const isAbort = err?.message && /aborted by user/i.test(err.message);
-        if (isAbort) return;
-        console.error(`[Broadcast] Error dispatching to orchestrator:`, err?.message || err);
-      });
-      targetCount++;
+      // Dispatch tới orchestrator (luôn luôn, bất kể team)
+      const orchAgent = deps.agents.get('orchestrator') || (() => {
+        // Tìm orchestrator trong agents map
+        for (const [, a] of deps.agents) {
+          if (a.type === 'orchestrator' || a.id === 'orchestrator' || a.role === 'orchestrator') return a;
+        }
+        return null;
+      })();
 
-      // Broadcast hệ thống thông báo đã gửi
+      if (orchAgent) {
+        const orchMsg: any = {
+          id: `broadcast-${uuidv4()}`,
+          from: 'user',
+          to: 'orchestrator',
+          content: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+          timestamp: now,
+          sourceCreatedAt: now,
+          teamId,
+          isBroadcast: true
+        };
+        deps.chatHistory.push(orchMsg);
+        deps.storage.saveMessage(orchMsg);
+
+        const orchClient = deps.clients?.get('orchestrator');
+        if (orchClient) {
+          const orchTurnId = `turn-orchestrator-${orchMsg.id}`;
+          deps.dispatchUserChat({
+            targetAgentId: 'orchestrator',
+            rawMsg: `[🚨 USER BROADCAST (khẩn cấp)] ${rawMsg}`,
+            isSlashCommand: false,
+            isRetry: false,
+            customTurnId: orchTurnId
+          }).then(() => {
+            successCount++;
+            console.log(`[Broadcast] ✅ Đã gửi tới orchestrator`);
+          }).catch((err: any) => {
+            failCount++;
+            failedAgents.push(`orchestrator`);
+            console.error(`[Broadcast] ❌ Error dispatching to orchestrator:`, err?.message || err);
+          });
+        } else {
+          failCount++;
+          failedAgents.push('orchestrator-no_client');
+          console.warn(`[Broadcast] Orchestrator has no client`);
+        }
+      }
+
+      const totalTargets = successCount + failCount;
+
+      // Broadcast hệ thống thông báo kết quả
       const doneMsg: any = {
         id: uuidv4(),
         from: 'system',
         to: 'user',
-        content: `📢 Đã broadcast tin nhắn tới ${targetCount} agent + orchestrator (khẩn cấp).`,
+        content: `📢 Đã broadcast tin nhắn tới ${totalTargets} target (${successCount} thành công, ${failCount} thất bại).`,
         timestamp: Date.now(),
         agentName: 'System',
         agentRole: 'system',
         teamId
       };
+      if (failedAgents.length > 0) {
+        doneMsg.content += ` Thất bại: ${failedAgents.join(', ')}.`;
+      }
       deps.chatHistory.push(doneMsg);
       deps.storage.saveMessage(doneMsg);
       deps.broadcast('chat:message', { msg: doneMsg });
 
-      res.json({ ok: true, broadcastTo: targetCount, messageId: msgId });
+      res.json({ ok: true, broadcastTo: totalTargets, successCount, failCount, failedAgents, messageId: msgId });
     } catch (err: any) {
       console.error('[Broadcast] Error:', err);
       if (!res.headersSent) {

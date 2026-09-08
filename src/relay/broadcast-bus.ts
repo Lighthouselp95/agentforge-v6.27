@@ -47,7 +47,7 @@ export class BroadcastBus {
             return;
           }
           const wsTeam = (ws as any).teamId;
-          if (wsTeam && broadcastTeamId && wsTeam !== broadcastTeamId) {
+          if (wsTeam && wsTeam !== 'default' && wsTeam !== 'all' && broadcastTeamId && wsTeam !== broadcastTeamId) {
             return;
           }
           ws.send(msg);
@@ -63,7 +63,7 @@ export class BroadcastBus {
           return;
         }
         const sseTeam = (res as any).teamId;
-        if (sseTeam && broadcastTeamId && sseTeam !== broadcastTeamId) {
+        if (sseTeam && sseTeam !== 'default' && sseTeam !== 'all' && broadcastTeamId && sseTeam !== broadcastTeamId) {
           return;
         }
         res.write(sseData);

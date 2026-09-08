@@ -112,30 +112,17 @@ export abstract class StreamController extends EventEmitter {
     // Notify watchdog of stream activity (resets 30s inactivity timer)
     watchdogManager.onStreamActivity(agentId);
     
-    // LIVE STREAM CHUNK-BY-CHUNK: nếu payload là text, tách từng ký tự để stream realtime
-    if (payload.kind === 'text' && payload.text && payload.text.length > 1) {
-      for (const char of payload.text) {
-        const charChunk: StreamChunk = {
-          type: StreamEventType.CHUNK,
-          agentId,
-          timestamp: Date.now(),
-          source: this.source,
-          raw: char,
-          payload: { kind: 'text', text: char }
-        };
-        this.broadcast(StreamEventType.CHUNK, charChunk);
-      }
-    } else {
-      const chunk: StreamChunk = {
-        type: StreamEventType.CHUNK,
-        agentId,
-        timestamp: Date.now(),
-        source: this.source,
-        raw,
-        payload
-      };
-      this.broadcast(StreamEventType.CHUNK, chunk);
-    }
+    // LIVE STREAM CHUNK: gửi nguyên text chunk thay vì loop tách từng ký tự làm flood WebSocket
+    const chunk: StreamChunk = {
+      type: StreamEventType.CHUNK,
+      agentId,
+      timestamp: Date.now(),
+      source: this.source,
+      raw,
+      payload
+    };
+    this.broadcast(StreamEventType.CHUNK, chunk);
+
     if (this.stableStatusSet.has(agentId)) {
       this.scheduleIdle(agentId, 500);
     }
@@ -157,6 +144,7 @@ export abstract class StreamController extends EventEmitter {
       `<task_update agent="${agentId}" task="stream" status="completed" />`
     );
     this.clearIdleTimeout(agentId);
+    this.removeAllListeners();
   }
 
   protected scheduleIdle(agentId: string, delay: number): void {
@@ -251,7 +239,7 @@ export class AttachStreamController extends StreamController {
       const { OpenCodeServeClient } = await import('./opencode-serve-client.js');
       this.client = new OpenCodeServeClient(
         { id: agentId, name: agentId, role: 'worker', type: 'worker' },
-        { mode: 'attach', serverUrl: 'http://127.0.0.1:4096' }
+        { mode: 'attach', serverUrl: process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096' }
       );
 
       // Wrap client.parseJsonlEvents để emit chunks
@@ -313,7 +301,7 @@ export class CliStreamController extends StreamController {
     const args = ['run', '--session', sessionId || agentId];
     const opts: any = {
       cwd: this.projectDir || process.cwd(),
-      env: { ...process.env, OPENCODE_SERVER_URL: 'http://127.0.0.1:4096' },
+       env: { ...process.env, OPENCODE_SERVER_URL: process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096' },
       stdio: ['pipe', 'pipe', 'pipe']
     };
 
@@ -395,7 +383,7 @@ export class HttpStreamController extends StreamController {
     agentStatusManager: AgentStatusManager,
     broadcast: (type: string, data: any) => void,
     storage: any,
-    private baseUrl = 'http://127.0.0.1:4096'
+    private baseUrl = process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096'
   ) {
     super(agentStatusManager, broadcast, storage);
   }

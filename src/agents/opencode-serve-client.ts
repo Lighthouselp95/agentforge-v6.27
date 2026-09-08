@@ -66,7 +66,7 @@ export class OpenCodeServeClient {
   // ============ HTTP STATIC HELPERS (OPENCODE SERVE REST API) ============
 
   /** Kiểm tra trạng thái máy chủ OpenCode Serve qua endpoint GET /global/health */
-  static async checkServeHealth(serverUrl: string = 'http://127.0.0.1:4096'): Promise<{ healthy: boolean; version?: string }> {
+  static async checkServeHealth(serverUrl: string = process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096'): Promise<{ healthy: boolean; version?: string }> {
     try {
       const url = `${serverUrl.replace(/\/$/, '')}/global/health`;
       const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
@@ -79,7 +79,7 @@ export class OpenCodeServeClient {
   }
 
   /** Lấy danh sách session hiện hữu từ OpenCode Serve (GET /session) */
-  static async getSessionsHttp(serverUrl: string = 'http://127.0.0.1:4096'): Promise<any[]> {
+  static async getSessionsHttp(serverUrl: string = process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096'): Promise<any[]> {
     try {
       const url = `${serverUrl.replace(/\/$/, '')}/session`;
       const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
@@ -93,7 +93,7 @@ export class OpenCodeServeClient {
   }
 
   /** Tạo session mới qua HTTP (POST /session) */
-  static async createSessionHttp(serverUrl: string = 'http://127.0.0.1:4096', params?: { title?: string; directory?: string }): Promise<string> {
+  static async createSessionHttp(serverUrl: string = process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096', params?: { title?: string; directory?: string }): Promise<string> {
     const url = `${serverUrl.replace(/\/$/, '')}/session`;
     const res = await fetch(url, {
       method: 'POST',
@@ -178,7 +178,7 @@ export class OpenCodeServeClient {
     this.config = config;
     const envUrl = process.env.OPENCODE_SERVE_URL;
     const storageUrl = typeof storage.getSetting === 'function' ? storage.getSetting('opencodeServeUrl') : undefined;
-    this.serverUrl = options.serverUrl || envUrl || storageUrl || 'http://127.0.0.1:4096';
+    this.serverUrl = options.serverUrl || envUrl || storageUrl || process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096';
     this.mode = options.mode || (process.env.OPENCODE_SERVE_MODE as ServeMode) || 'attach';
     this.autoFallbackToCli = options.autoFallbackToCli ?? true;
 
@@ -418,13 +418,14 @@ export class OpenCodeServeClient {
 
     const utf8Env = {
       ...process.env,
-      PYTHONIOENCODING: 'utf-8',
-      PYTHONUTF8: '1',
+      NODE_NO_WARNINGS: '1',
+      FORCE_COLOR: '0',
       NODE_OPTIONS: '--enable-source-maps',
       LANG: 'en_US.UTF-8',
       LC_ALL: 'en_US.UTF-8'
     };
 
+    let spawnCmd = isWin ? 'powershell.exe' : 'sh';
     let cmdArgs: string[] = [];
     if (isSlash) {
       const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
@@ -447,7 +448,7 @@ export class OpenCodeServeClient {
 
       const stdout = await new Promise<string>((resolve, reject) => {
         const proc = spawn(
-          isWin ? 'powershell.exe' : 'sh',
+          spawnCmd,
           cmdArgs,
           {
             cwd: projectDir,
@@ -502,7 +503,7 @@ export class OpenCodeServeClient {
 
           if (code !== 0 && code !== null) {
             const errDetails = stderrStr.trim() || stdoutStr.trim();
-            const e: any = new Error(`Attach command failed (${code}): ${errDetails || 'Process exited with error'}`);
+            const e: any = new Error(errDetails || `Attach command failed with exit code ${code}`);
             e.stdout = stdoutStr; e.stderr = stderrStr; e.code = code;
             reject(e);
           } else {
@@ -647,14 +648,10 @@ export class OpenCodeServeClient {
   private pushOACEvent(ev: { kind: 'in' | 'out'; prompt?: string; event?: any }) {
     if (!this.onEvent) return;
     const item = { seq: ++this.eventSeq, ...ev };
-    this.eventBuf.push(item);
-    if (!this.eventTimer) {
-      this.eventTimer = setTimeout(() => {
-        const flushed = this.eventBuf.splice(0);
-        this.eventTimer = null;
-        for (const it of flushed) this.onEvent?.(it);
-      }, 50);
-    }
+    // ZERO-LATENCY: Bỏ debounce 50ms, phát trực tiếp ngay khi stdout có event
+    try {
+      this.onEvent(item);
+    } catch {}
   }
 
   private stopOACEvents() {

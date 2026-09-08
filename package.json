@@ -1,6 +1,6 @@
 {
   "name": "agentforge",
-  "version": "7.0.55",
+  "version": "7.0.63",
   "main": "dist-electron/main.js",
   "bin": "dist/server.js",
   "description": "ACP Multi-Agent Orchestrator with GUI",
@@ -10,7 +10,7 @@
     "dev:watch": "tsx watch --exclude \"data/**/*\" src/server.ts",
     "build": "tsc && vite build --config web/vite.config.ts && tsc -p tsconfig.electron.json",
     "build:electron": "npm run build && npm run build:exe && electron-builder --win portable",
-    "build:exe": "npm run build && node scripts/build-sea-bundle.mjs && node scripts/gen-sea-assets.mjs && node --experimental-sea-config sea-config.json && node -e \"const fs=require('fs');fs.mkdirSync('release',{recursive:true});fs.copyFileSync(process.execPath,'release/agentforge-web.exe')\" && node \"C:/Users/Hai Dang/agentforge/node_modules/postject/dist/cli.js\" release/agentforge-web.exe NODE_SEA_BLOB dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite",
+    "build:exe": "npm run build && node scripts/build-sea-bundle.mjs && node scripts/gen-sea-assets.mjs && node --experimental-sea-config sea-config.json && node -e \"const fs=require('fs');fs.mkdirSync('release',{recursive:true});fs.copyFileSync(process.execPath,'release/agentforge-web.exe')\" && node \"C:/Users/Hai Dang/agentforge/node_modules/postject/dist/cli.js\" release/agentforge-web.exe NODE_SEA_BLOB dist/sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite && node -e \"const fs=require('fs');const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));fs.copyFileSync('release/agentforge-web.exe', `release/agentforge-web-v${pkg.version}.exe`);console.log(`Copied to release/agentforge-web-v${pkg.version}.exe`);\"",
     "electron:dev": "concurrently -n server,web,electron -c blue,green,magenta \"npm run dev:watch\" \"npm run dev:web\" \"wait-on http://localhost:4001 && npx electron dist-electron/main.js\"",
     "start": "tsx src/server.ts",
     "dev:web": "vite --config web/vite.config.ts",

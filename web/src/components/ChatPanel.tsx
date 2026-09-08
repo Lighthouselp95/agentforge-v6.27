@@ -1776,7 +1776,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   const hasActiveDirectives = activeDirectives.some(d => d.type === 'talk' || d.type === 'spawn');
   const hasDuplicateIndependentTalk = hasDirectiveInItems && !hasActiveDirectives;
 
-  const isOrchestratorTask = isEligibleOrchSender && (
+  const isOrchestratorTask = (
     (msg.msgType === 'talk' && msg.to && msg.to !== 'user' && msg.to !== 'broadcast') ||
     hasActiveDirectives
   );
@@ -2504,15 +2504,15 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
             // Kiểm tra xem segment này có chứa thẻ điều phối (<spawn> hoặc <talk>) không
             const hasDirectiveInPart = /(?:\[(?:TALK|SPAWN|TASK)\]|<\s*(?:talk|spawn)\b)/i.test(segText);
 
-            if (hasDirectiveInPart && isEligibleOrchSender) {
+            if (hasDirectiveInPart) {
               const items = extractAllDirectivesAndText(segText);
 
               return (
                 <React.Fragment key={'pt-' + i}>
                   {items.map((item, subIdx) => {
                     if (item.type === 'text') {
-                      const cleanT = stripTalkTags(item.text).trim();
-                      if (!cleanT) return null;
+                      const cleanT = item.text || '';
+                      if (!cleanT.trim()) return null;
                       return (
                         <div
                           key={`pt-${i}-txt-${subIdx}`}
@@ -2774,8 +2774,8 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
               </button>
               {activeDirectives.map((dir, dIdx) => {
                 if (dir.type === 'text') {
-                  const cleanT = stripSystemTaskTags(stripTalkTags(dir.text || dir.data?.raw || '')).trim();
-                  if (!cleanT) return null;
+                  const cleanT = stripSystemTaskTags(dir.text || dir.data?.raw || '');
+                  if (!cleanT.trim()) return null;
                   return (
                     <div key={`msg-dir-txt-${dIdx}`} style={{ width: '100%', lineHeight: 1.55, color: isOrchestratorTask ? '#0f172a' : textColor }}>
                       <MarkdownRenderer content={cleanT} isMobile={isMobile} />

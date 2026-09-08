@@ -21,6 +21,7 @@ export type DispatchUserChatFn = (params: {
   rawMsg: string;
   isSlashCommand: boolean;
   isRetry?: boolean;
+  customTurnId?: string;
 }) => Promise<any>;
 
 export interface UserQueueOptions {
@@ -197,11 +198,14 @@ export class UserQueueManager {
 
           console.log(`[UserQueueManager] Auto-dispatching queued user message(s) (${userMsgsToCombine.length} msg(s)) for ${targetId}: "${combinedUserMsg.slice(0, 80)}"`);
           try {
+            const firstMsgId = userMsgsToCombine[0]?.messageId;
+            const turnResponseId = firstMsgId ? `turn-${targetId}-${firstMsgId}` : undefined;
             await this.options.dispatchUserChat({
               targetAgentId: targetId,
               rawMsg: combinedUserMsg,
               isSlashCommand: userMsgsToCombine.length === 1 ? userMsgsToCombine[0].isSlash : false,
-              isRetry: false
+              isRetry: false,
+              customTurnId: turnResponseId
             });
           } catch (err: any) {
             dispatchFailed = true;
