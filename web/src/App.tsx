@@ -1500,7 +1500,11 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     const agentId = selectedAgentId || 'orchestrator';
 
     try {
-      await fetch(`${API}/api/agents/${agentId}/abort`, { method: 'POST' });
+      const res = await fetch(`${API}/api/agents/${agentId}/abort`, { method: 'POST' });
+      const data = await res.json().catch(() => null);
+      if (data && data.ok) {
+        setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'idle', workingSince: undefined } : a));
+      }
       setLoading(false);
     } catch (e) {
       console.error('Failed to abort agent:', e);

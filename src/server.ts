@@ -4953,7 +4953,8 @@ app.use('/api', createApiRouter({
     getAgentsByTeam,
     getAgentsByRole,
     forwardToOrchestrator,
-    notifyTeamChanged
+    notifyTeamChanged,
+    drainDispatchState
   },
   chat: {
     agents,

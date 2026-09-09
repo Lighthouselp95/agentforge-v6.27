@@ -27,6 +27,7 @@ export interface AgentsRouteDeps {
   getAgentsByRole: (role: string, teamId?: string) => any[];
   forwardToOrchestrator: (type: string, message: string, targetOrchId: string, teamId?: string) => any;
   notifyTeamChanged: (teamId?: string) => void;
+  drainDispatchState?: (agentId: string) => void;
 }
 
 export function createAgentsRouter(deps: AgentsRouteDeps): Router {
@@ -332,6 +333,9 @@ Nội dung phân công nhiệm vụ mới tại đây
         } else {
           deps.broadcast('agent:updated', { agent: { id: 'orchestrator', status: 'idle' } } as any);
         }
+        if (typeof deps.drainDispatchState === 'function') {
+          try { deps.drainDispatchState('orchestrator'); } catch {}
+        }
         res.json({ ok: true, killed });
       } catch (err: any) {
         console.error(`[Abort] Error aborting orchestrator:`, err);
@@ -356,6 +360,9 @@ Nội dung phân công nhiệm vụ mới tại đây
 
       // Auto-drain backendUserQueues khi abort agent: gửi tiếp các tin đang chờ
       // và broadcast chat:queue:dispatched để UI xóa sạch khay hàng đợi
+      if (typeof deps.drainDispatchState === 'function') {
+        try { deps.drainDispatchState(a.id); } catch {}
+      }
       const abortQueueKey = a.id;
       const pendingQueue = deps.backendUserQueues[abortQueueKey];
       if (pendingQueue && pendingQueue.length > 0) {
