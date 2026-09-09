@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from 'child_process';
 import net from 'net';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import { assignProcessToJob } from './job-object.js';
 import { storage } from '../storage.js';
 
@@ -369,9 +371,95 @@ function forceKillForRestart(): void {
 export function getOpenCodeServerStatus(): { running: boolean; port: number; url: string; restartCount: number; pid: number | null } {
   return {
     running: adoptedServePort !== null || (!!opencodeProcess && !opencodeProcess.killed),
-    port: currentServePort,
-    url: `http://127.0.0.1:${currentServePort}`,
+    port: adoptedServePort || currentServePort,
+    url: `http://127.0.0.1:${adoptedServePort || currentServePort}`,
     restartCount,
-    pid: opencodeProcess?.pid ?? null
+    pid: opencodeProcess?.pid || null
   };
+}
+
+export interface SpawnOpencodeRunOptions {
+  agentName?: string;
+  sessionId?: string | null;
+  model?: string;
+  projectDir?: string;
+  attachUrl?: string;
+  isSlash?: boolean;
+  slashCleanCmd?: string;
+  slashArgsRest?: string;
+  promptTmpFile?: string;
+  extraEnv?: Record<string, string>;
+}
+
+/**
+ * Hàm tập trung duy nhất để spawn tiến trình `opencode run` cho toàn bộ AgentForge.
+ * Ghi log chi tiết 100% câu lệnh thực tế được spawn, cờ session, model, pid.
+ */
+export function spawnOpencodeRunProcess(options: SpawnOpencodeRunOptions): { proc: ChildProcess; cmdLineLogged: string } {
+  const isWin = process.platform === 'win32';
+  const projectDir = options.projectDir || process.cwd();
+  const sessionFlag = options.sessionId ? ` --session "${options.sessionId}"` : '';
+  const modelFlag = options.model ? ` --model "${options.model}"` : '';
+  const attachArgs = options.attachUrl ? `--attach "${options.attachUrl}" --dir "${projectDir}"` : '';
+
+  let spawnCmd = isWin ? 'powershell.exe' : 'sh';
+  let cmdArgs: string[] = [];
+  let displayCmd = '';
+
+  if (options.isSlash) {
+    const cleanCmd = options.slashCleanCmd || '';
+    const messageArg = options.slashArgsRest ? ` "${options.slashArgsRest.replace(/"/g, '`"')}"` : '';
+    const attachPart = attachArgs ? ` ${attachArgs}` : '';
+    const fullCmd = `opencode run${messageArg}${attachPart} --command "${cleanCmd}"${sessionFlag}${modelFlag} --thinking --auto --format json`;
+    displayCmd = fullCmd;
+    cmdArgs = isWin
+      ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; ${fullCmd}`]
+      : ['-c', fullCmd];
+  } else {
+    const safeTmpPath = (options.promptTmpFile || '').replace(/'/g, "''");
+    const agentFlag = options.agentName ? ` --agent ${options.agentName}` : '';
+    const attachPart = attachArgs ? ` ${attachArgs}` : '';
+    displayCmd = `Get-Content -Raw '${options.promptTmpFile}' | opencode run${attachPart}${sessionFlag}${modelFlag} --thinking --auto --format json${agentFlag}`;
+    cmdArgs = isWin
+      ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run${attachPart}${sessionFlag}${modelFlag} --thinking --auto --format json${agentFlag}`]
+      : ['-c', `cat "${options.promptTmpFile}" | opencode run${attachPart}${sessionFlag}${modelFlag} --thinking --auto --format json${agentFlag}`];
+  }
+
+  console.log(`[SPAWN-LOG] 🚀 Spawn opencode run:`);
+  console.log(`  - Agent: ${options.agentName || '(none)'}`);
+  console.log(`  - SessionId: ${options.sessionId || '(NONE - SẼ TỰ SINH SESSION MỚI NẾU KHÔNG CÓ)'}`);
+  console.log(`  - Model: ${options.model || '(default)'}`);
+  console.log(`  - Attach: ${options.attachUrl || '(none)'}`);
+  console.log(`  - Command: ${displayCmd}`);
+
+  const utf8Env = {
+    ...process.env,
+    NODE_NO_WARNINGS: '1',
+    FORCE_COLOR: '0',
+    NODE_OPTIONS: '--enable-source-maps',
+    LANG: 'en_US.UTF-8',
+    LC_ALL: 'en_US.UTF-8',
+    ...(options.extraEnv || {})
+  };
+
+  const proc = spawn(spawnCmd, cmdArgs, {
+    cwd: projectDir,
+    env: utf8Env,
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  if (proc.pid) {
+    console.log(`  - Spawned PID: ${proc.pid}`);
+    assignProcessToJob(proc.pid);
+  }
+
+  const logEntry = `[${new Date().toISOString()}] [SPAWN] PID=${proc.pid || 'unknown'} Agent="${options.agentName || ''}" SessionId="${options.sessionId || ''}" Model="${options.model || ''}" Attach="${options.attachUrl || ''}"\nCMD: ${displayCmd}\n------------------------------------------------------------\n`;
+  try {
+    const logDir = path.join(process.cwd(), 'logs');
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(path.join(logDir, 'opencode-spawn.log'), logEntry, 'utf8');
+  } catch {}
+
+  return { proc, cmdLineLogged: displayCmd };
 }

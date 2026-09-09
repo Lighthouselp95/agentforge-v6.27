@@ -9,7 +9,7 @@ import http from 'http';
 import { StringDecoder } from 'string_decoder';
 import type { AgentConfig, AgentMessage, MessagePart, TokenUsage, ToolCallInfo } from './types.js';
 import { storage } from '../storage.js';
-import { assignProcessToJob } from '../process/job-object.js';
+import { spawnOpencodeRunProcess } from '../process/opencode-spawner.js';
 
 const execAsync = promisify(exec);
 const isWin = process.platform === 'win32';
@@ -500,43 +500,25 @@ export class OpenCodeServeClient {
       LC_ALL: 'en_US.UTF-8'
     };
 
-    let spawnCmd = isWin ? 'powershell.exe' : 'sh';
-    let cmdArgs: string[] = [];
-    if (isSlash) {
-      const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
-      const modelFlag = modelToUse ? ` --model "${modelToUse}"` : '';
-      const messageArg = cmdArgsRest ? ` "${cmdArgsRest.replace(/"/g, '`"')}"` : '';
-      const fullCmd = `opencode run${messageArg} ${attachArgs} --command "${cleanCmd}"${sessionFlag}${modelFlag} --thinking --auto --format json`;
-      cmdArgs = isWin
-        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; ${fullCmd}`]
-        : ['-c', fullCmd];
-    } else {
-      const safeTmpPath = tmpFile.replace(/'/g, "''");
-      const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
-      cmdArgs = isWin
-        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run ${attachArgs}${sessionFlag} --auto --format json${agentFlag}`]
-        : ['-c', `cat "${tmpFile}" | opencode run ${attachArgs}${sessionFlag} --auto --format json${agentFlag}`];
-    }
-
     try {
       this.lineBuf = '';
       this.pushOACEvent({ kind: 'in', prompt: prompt.length > 4000 ? prompt.slice(0, 4000) + '\n…(truncated)' : prompt });
 
       const stdout = await new Promise<string>((resolve, reject) => {
-        const proc = spawn(
-          spawnCmd,
-          cmdArgs,
-          {
-            cwd: projectDir,
-            env: utf8Env,
-            windowsHide: true,
-            stdio: ['pipe', 'pipe', 'pipe']
-          }
-        );
+        const { proc } = spawnOpencodeRunProcess({
+          agentName,
+          sessionId: this.sessionId,
+          model: modelToUse,
+          projectDir,
+          attachUrl: this.serverUrl,
+          isSlash,
+          slashCleanCmd: cleanCmd,
+          slashArgsRest: cmdArgsRest,
+          promptTmpFile: tmpFile
+        });
         this.proc = proc as any;
         if (proc.pid) {
           OpenCodeServeClient.activeChildPids.add(proc.pid);
-          assignProcessToJob(proc.pid);
         }
 
         proc.stdin?.on('error', () => {

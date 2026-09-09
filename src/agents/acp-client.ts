@@ -11,6 +11,7 @@ import { StringDecoder } from 'string_decoder';
 import type { AgentConfig, AgentMessage, MessagePart, TokenUsage, ToolCallInfo } from './types.js';
 import { storage } from '../storage.js';
 import { assignProcessToJob } from '../process/job-object.js';
+import { spawnOpencodeRunProcess } from '../process/opencode-spawner.js';
 
 const execAsync = promisify(exec);
 const isWin = process.platform === 'win32';
@@ -437,48 +438,29 @@ export class ACPClient {
       let agentFlag = ` --agent ${agentName} --session "${this.sessionId}" --thinking --auto --format json --model "${injectModel}"`;
 
       const isSlash = prompt.trim().startsWith('/');
-      let cmdArgs: string[] = [];
+      let cleanCmd = '';
+      let cmdArgsRest = '';
 
       if (isSlash) {
         const slashParts = prompt.trim().replace(/^\//, '').trim().split(/\s+/);
-        const cleanCmd = slashParts[0] || '';
-        const cmdArgsRest = slashParts.slice(1).join(' ').trim();
-        const messageArg = cmdArgsRest ? ` "${cmdArgsRest.replace(/"/g, '`"')}"` : '';
-        const modelFlag = ` --model "${injectModel}"`;
-        const fullCmd = `opencode run${messageArg} --command "${cleanCmd}" --session "${this.sessionId}"${modelFlag} --thinking --auto --format json`;
-        cmdArgs = isWin
-          ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; ${fullCmd}`]
-          : ['-c', fullCmd];
-      } else {
-        const safeTmpPath = tmpFile.replace(/'/g, "''");
-        cmdArgs = isWin
-          ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run${agentFlag}`]
-          : ['-c', `cat "${tmpFile}" | opencode run${agentFlag}`];
+        cleanCmd = slashParts[0] || '';
+        cmdArgsRest = slashParts.slice(1).join(' ').trim();
       }
 
-      const utf8Env = {
-        ...process.env,
-        PYTHONIOENCODING: 'utf-8',
-        PYTHONUTF8: '1',
-        LANG: 'en_US.UTF-8',
-        LC_ALL: 'en_US.UTF-8'
-      };
-
-      const injectProc = spawn(
-        isWin ? 'powershell.exe' : 'sh',
-        cmdArgs,
-        {
-          cwd: projectDir,
-          env: utf8Env,
-          windowsHide: true,
-          stdio: ['pipe', 'pipe', 'pipe'] // Gắn stdin pipe từ Node: khi Node thoát/đóng pipe, process con tự exit
-        }
-      );
+      const { proc: injectProc } = spawnOpencodeRunProcess({
+        agentName,
+        sessionId: this.sessionId,
+        model: injectModel,
+        projectDir,
+        isSlash,
+        slashCleanCmd: isSlash ? cleanCmd : undefined,
+        slashArgsRest: isSlash ? cmdArgsRest : undefined,
+        promptTmpFile: tmpFile
+      });
 
       const pid = injectProc.pid;
       if (pid) {
         ACPClient.activeChildPids.add(pid);
-        assignProcessToJob(pid);
       }
 
       injectProc.stdin?.on('error', () => {
@@ -720,43 +702,25 @@ export class ACPClient {
       LC_ALL: 'en_US.UTF-8'
     };
 
-    let cmdArgs: string[] = [];
-    if (isSlash) {
-      const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
-      const modelFlag = modelToUse ? ` --model "${modelToUse}"` : '';
-      const messageArg = cmdArgsRest ? ` "${cmdArgsRest.replace(/"/g, '`"')}"` : '';
-      const fullCmd = `opencode run${messageArg} --command "${cleanCmd}"${sessionFlag}${modelFlag} --thinking --auto --format json`;
-      cmdArgs = isWin 
-        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; ${fullCmd}`]
-        : ['-c', fullCmd];
-    } else {
-      const safeTmpPath = tmpFile.replace(/'/g, "''");
-      const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
-      cmdArgs = isWin 
-        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run${sessionFlag} --auto --format json${agentFlag}`]
-        : ['-c', `cat "${tmpFile}" | opencode run${sessionFlag} --auto --format json${agentFlag}`];
-    }
-
     try {
       // Reset buffer & phát sự kiện INPUT (prompt gửi cho opencode) lên UI
       this.lineBuf = '';
       this.pushOACEvent({ kind: 'in', prompt: prompt.length > 4000 ? prompt.slice(0, 4000) + '\n…(truncated)' : prompt });
 
       const stdout = await new Promise<string>((resolve, reject) => {
-        const proc = spawn(
-          isWin ? 'powershell.exe' : 'sh',
-          cmdArgs,
-          {
-            cwd: projectDir,
-            env: utf8Env,
-            windowsHide: true,
-            stdio: ['pipe', 'pipe', 'pipe']
-          }
-        );
+        const { proc } = spawnOpencodeRunProcess({
+          agentName,
+          sessionId: this.sessionId,
+          model: modelToUse,
+          projectDir,
+          isSlash,
+          slashCleanCmd: cleanCmd,
+          slashArgsRest: cmdArgsRest,
+          promptTmpFile: tmpFile
+        });
         this.proc = proc as any;
         if (proc.pid) {
           ACPClient.activeChildPids.add(proc.pid);
-          assignProcessToJob(proc.pid);
         }
 
         // Listener: khi stream stdin lỗi hoặc pipe đóng bất thường, tự động kill child process
