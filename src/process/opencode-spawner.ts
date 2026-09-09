@@ -36,6 +36,7 @@ export function findFreePortFrom(startPort = 4096, maxAttempts = 100): Promise<n
       }
       const srv = net.createServer();
       srv.once('error', () => {
+        console.log(`[OpenCodeSpawner] Port ${port} bận/đang có tiến trình khác sử dụng -> tăng port lên ${port + 1}...`);
         tryPort(port + 1, remaining - 1);
       });
       srv.once('listening', () => {
@@ -45,6 +46,7 @@ export function findFreePortFrom(startPort = 4096, maxAttempts = 100): Promise<n
         srv.listen(port, '0.0.0.0');
       } catch {
         try { srv.close(); } catch {}
+        console.log(`[OpenCodeSpawner] Port ${port} không listen được -> tăng port lên ${port + 1}...`);
         tryPort(port + 1, remaining - 1);
       }
     };
@@ -220,12 +222,8 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; url: strin
     return { port: currentServePort, url: `http://127.0.0.1:${currentServePort}` };
   }
 
-  // REUSE-FIRST: trước khi spawn mới, thử adopt serve healthy đang chạy sẵn
-  const adopted = await tryAdoptExistingServe();
-  if (adopted) {
-    restartCount = 0;
-    return adopted;
-  }
+  // CHÍNH SÁCH: Không tái sử dụng tiến trình opencode đang chạy bên ngoài.
+  // Luôn tìm port trống mới (nếu port bận thì tự động tăng +1) và tự spawn tiến trình riêng.
 
   isSpawning = true;
   try {
