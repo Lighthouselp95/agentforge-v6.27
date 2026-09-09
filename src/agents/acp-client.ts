@@ -650,6 +650,20 @@ export class ACPClient {
       }
     }
 
+    if (!this.sessionId) {
+      const reg = ACPClient.agentSessions.get(this.config.id);
+      if (reg) {
+        this.sessionId = reg;
+      } else {
+        const stored = storage.getAgent(this.config.id);
+        const sid = stored?.sessionId || stored?.session_id;
+        if (sid) {
+          this.sessionId = sid;
+          ACPClient.registerSession(this.config.id, sid);
+        }
+      }
+    }
+
     // Write prompt to safe OS temp directory with UTF-8 encoding (NFC normalized)
     const tmpBaseDir = getAgentForgeTmpDir();
     const tmpFile = join(tmpBaseDir, `prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);

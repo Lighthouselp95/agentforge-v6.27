@@ -447,6 +447,20 @@ export class OpenCodeServeClient {
 
   private async runAttachCli(prompt: string, attempt = 0): Promise<AgentMessage> {
     const projectDir = this.config.projectDir || process.cwd();
+    if (!this.sessionId) {
+      const reg = OpenCodeServeClient.agentSessions.get(this.config.id);
+      if (reg) {
+        this.sessionId = reg;
+      } else {
+        const stored = storage.getAgent(this.config.id);
+        const sid = stored?.sessionId || stored?.session_id;
+        if (sid) {
+          this.sessionId = sid;
+          OpenCodeServeClient.registerSession(this.config.id, sid);
+        }
+      }
+    }
+
     const isSlash = prompt.startsWith('/');
     let cleanCmd = '';
     let cmdArgsRest = '';
