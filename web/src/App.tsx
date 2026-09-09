@@ -305,6 +305,31 @@ export function App() {
   // Fetch settings
   const fetchSettings = async () => {
     try {
+      const res = await fetch(`${API}/api/settings`);
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data.enableWatchdog === 'boolean') setEnableWatchdog(data.enableWatchdog);
+        if (typeof data.autoContinue === 'boolean') setAutoContinue(data.autoContinue);
+        if (typeof data.smartClarifyEnabled === 'boolean') setSmartModeEnabled(data.smartClarifyEnabled);
+        
+        // Kiểm tra xem hệ thống đã được start chưa (hoặc người dùng đã chọn bỏ qua modal)
+        const skipStartup = localStorage.getItem('af-skip-startup-modal') === 'true';
+        if (!data.isSystemStarted && !skipStartup) {
+          setStartupInitialSettings({
+            engineMode: data.engineMode || 'attach',
+            enableWatchdog: data.enableWatchdog ?? true,
+            autoContinue: data.autoContinue ?? true,
+            smartClarifyEnabled: data.smartClarifyEnabled ?? false,
+            watchdogStreamTimeoutSec: data.watchdogStreamTimeoutSec || 45,
+            taskQueueIdleCheckSec: data.taskQueueIdleCheckSec || 30
+          });
+          setShowStartupModal(true);
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch general settings:', e);
+    }
+    try {
       const res = await fetch(`${API}/api/settings/watchdog`);
       const data = await res.json();
       if (typeof data.enableWatchdog === 'boolean') {
@@ -2488,6 +2513,46 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
           </>
         );
       })()}
+
+      {/* Floating Broadcast Bar */}
+      <FloatingBroadcastBar
+        agentsCount={agents.length}
+        onSendBroadcast={async (message) => {
+          const res = await fetch(`${API}/api/broadcast`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message })
+          });
+          if (!res.ok) throw new Error('Broadcast request failed');
+        }}
+      />
+
+      {/* Startup Modal */}
+      <StartupModal
+        isOpen={showStartupModal}
+        initialSettings={startupInitialSettings}
+        onStart={async (settings) => {
+          if (settings.rememberChoice) {
+            localStorage.setItem('af-skip-startup-modal', 'true');
+          }
+          await fetch(`${API}/api/settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              engineMode: settings.engineMode,
+              enableWatchdog: settings.enableWatchdog,
+              autoContinue: settings.autoContinue,
+              smartClarifyEnabled: settings.smartClarifyEnabled,
+              watchdogStreamTimeoutSec: settings.watchdogStreamTimeoutSec,
+              taskQueueIdleCheckSec: settings.taskQueueIdleCheckSec
+            })
+          });
+          await fetch(`${API}/api/settings/start-system`, { method: 'POST' });
+          setShowStartupModal(false);
+          fetchAgents();
+          fetchSettings();
+        }}
+      />
 
       {/* Spawn Dialog */}
       {showSpawn && (
