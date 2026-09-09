@@ -2059,10 +2059,20 @@ function getClient(agent: Agent): AnyAgentClient {
   if (agent.projectDir) {
     syncOpencodeAgents(agent.projectDir);
   }
+  // Đồng bộ sessionId giữa memory agent và storage nếu có
+  if (!agent.sessionId) {
+    const stored = storage.getAgent(agent.id);
+    if (stored?.sessionId || stored?.session_id) {
+      agent.sessionId = stored.sessionId || stored.session_id;
+    }
+  }
   // Mỗi lượt gọi đều resolve lại model theo hierarchy 6 tầng -> opencode run luôn đúng
   const model = resolveModelForAgent(agent);
   if (!clients.has(agent.id)) {
     const c = createAgentClient({ id: agent.id, name: agent.name, role: agent.role, type: 'worker', projectDir: agent.projectDir, model });
+    if (agent.sessionId) {
+      c.setSession(agent.sessionId);
+    }
     c.setOnEvent((ev: any) => broadcastOACEvent(agent.id, ev));
     c.setOnStatusChange((busy) => {
       const cur = agents.get(agent.id);

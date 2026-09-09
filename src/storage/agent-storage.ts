@@ -5,7 +5,14 @@ export class AgentStorage {
   constructor(private engine: StorageEngine) {}
 
   saveAgent(agent: any): void {
-    this.engine.inMemoryAgents.set(agent.id, { ...agent });
+    const norm = {
+      ...agent,
+      sessionId: agent.sessionId || agent.session_id || null,
+      session_id: agent.session_id || agent.sessionId || null,
+      sessionTitle: agent.sessionTitle || agent.session_title || null,
+      session_title: agent.session_title || agent.sessionTitle || null
+    };
+    this.engine.inMemoryAgents.set(agent.id, norm);
     this.engine.schedulePersist(true);
   }
 
@@ -14,8 +21,10 @@ export class AgentStorage {
     const updated = {
       ...existing,
       status: 'status' in updates ? updates.status : existing.status,
-      session_id: 'sessionId' in updates ? (updates.sessionId !== undefined ? updates.sessionId : null) : existing.session_id,
+      sessionId: 'sessionId' in updates ? (updates.sessionId !== undefined ? updates.sessionId : null) : (existing.sessionId || existing.session_id),
+      session_id: 'sessionId' in updates ? (updates.sessionId !== undefined ? updates.sessionId : null) : (existing.session_id || existing.sessionId),
       session_title: 'sessionTitle' in updates ? (updates.sessionTitle !== undefined ? updates.sessionTitle : null) : existing.session_title,
+      sessionTitle: 'sessionTitle' in updates ? (updates.sessionTitle !== undefined ? updates.sessionTitle : null) : (existing.sessionTitle || existing.session_title),
       model: 'model' in updates ? (updates.model !== undefined ? updates.model : null) : existing.model,
       working_since: 'workingSince' in updates ? (updates.workingSince !== undefined ? updates.workingSince : null) : existing.working_since,
       token_usage: 'tokenUsage' in updates ? (updates.tokenUsage !== undefined ? updates.tokenUsage : null) : existing.token_usage,

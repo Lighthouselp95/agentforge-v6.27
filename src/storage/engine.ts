@@ -103,6 +103,10 @@ export class StorageEngine {
           } else if (a.status === 'working' && autoContinue) {
             a.workingSince = Date.now();
           }
+          if (a.sessionId || a.session_id) {
+            a.sessionId = a.sessionId || a.session_id;
+            a.session_id = a.session_id || a.sessionId;
+          }
           this.inMemoryAgents.set(a.id, a);
         }
       }
