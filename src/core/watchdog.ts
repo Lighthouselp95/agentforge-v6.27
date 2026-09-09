@@ -99,6 +99,9 @@ export class WatchdogManager {
    * Call when agent becomes idle (starts 15s idle timer)
    */
   public onAgentIdle(agentId: string): void {
+    const isWatchdogEnabled = storage.getSetting('enableWatchdog', false) === true;
+    if (!isWatchdogEnabled) return;
+
     // Clear existing idle timer
     const idleTimer = this.idleTimers.get(agentId);
     if (idleTimer) {
@@ -155,6 +158,9 @@ export class WatchdogManager {
    * Check all agents for reminder conditions
    */
   private async checkAllAgents(): Promise<void> {
+    const isWatchdogEnabled = storage.getSetting('enableWatchdog', false) === true;
+    if (!isWatchdogEnabled) return;
+
     const agents = storage.getAllAgents() || [];
     
     for (const agent of agents) {
