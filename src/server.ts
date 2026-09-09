@@ -975,8 +975,7 @@ function initTaskQueueManager(): void {
     }
   });
 }
-// Khởi tạo ngay lập tức khi load module để watchdog không bị miss callback
-initTaskQueueManager();
+// Chỉ cấu hình callback, KHÔNG tự ý start ngầm khi người dùng chưa bấm Start
 
 interface CommandErrorInfo {
   type: 'SPAWN_ROLE_LIMIT' | 'SPAWN_PARSE_FAIL' | 'SPAWN_TASK_LONG' | 'SPAWN_EMPTY_TASK' | 'TALK_PARSE_FAIL' | 'TALK_AGENT_NOT_FOUND' | 'TASK_BARRIER_VIOLATION' | 'CREATE_ROLE_LIMIT' | 'TASK_UPDATE_ERROR';
@@ -6259,6 +6258,8 @@ function triggerSystemStart() {
 
     scheduleBackendQueueWatchdog();
     initTaskQueueManager();
+    watchdogManager.start();
+    taskQueueManager?.start();
   } catch (e: any) {
     console.error(`[BackendQueue] Restore & drain unprocessed messages failed: ${e.message}`);
   }

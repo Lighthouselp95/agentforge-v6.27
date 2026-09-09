@@ -61,6 +61,11 @@ export class WatchdogManager {
       this.onDeliverReminder = onDeliverReminder;
     }
     // Start periodic check every 5s to evaluate conditions
+    // this.checkInterval = setInterval(() => this.checkAllAgents(), 5000);
+  }
+
+  public start(): void {
+    if (this.checkInterval) return;
     this.checkInterval = setInterval(() => this.checkAllAgents(), 5000);
   }
 

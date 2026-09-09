@@ -46,7 +46,7 @@ export class TaskQueueManager {
   private readonly statusDebounce = new Map<string, NodeJS.Timeout>();
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
   private readonly retryAttempts = new Map<string, number>();
-  private readonly taskCheckTimer?: NodeJS.Timeout;
+  private taskCheckTimer?: NodeJS.Timeout;
   private readonly broadcastFn: (type: string, data: any) => void;
   private onAssignTask?: (task: SimpleTask) => void | Promise<void>;
   private readonly retryScheduleMs: number[];
@@ -63,6 +63,11 @@ export class TaskQueueManager {
     this.onAssignTask = onAssignTask;
     this.retryScheduleMs = retryScheduleMs || DEFAULT_RETRY_SCHEDULE_MS;
     // bắt đầu timer kiểm tra task queue định kỳ (ví dụ: mỗi 1 phút)
+    // Sẽ được kích hoạt qua start() khi hệ thống được người dùng start
+  }
+
+  public start(): void {
+    if (this.taskCheckTimer) return;
     if (this.config.taskCheckIntervalMs > 0) {
       this.taskCheckTimer = setInterval(() => this.checkAndAssignTask(), this.config.taskCheckIntervalMs);
     }
