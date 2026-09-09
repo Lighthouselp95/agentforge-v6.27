@@ -364,13 +364,23 @@ function forceKillForRestart(): void {
 }
 
 /**
+ * Lấy URL động chính xác của OpenCode Serve đang chạy
+ */
+export function getOpenCodeServerUrl(): string {
+  const port = adoptedServePort || currentServePort;
+  return process.env.OPENCODE_SERVE_URL || `http://127.0.0.1:${port}`;
+}
+
+/**
  * Get current server status (for monitoring / API)
  */
 export function getOpenCodeServerStatus(): { running: boolean; port: number; url: string; restartCount: number; pid: number | null } {
+  const url = getOpenCodeServerUrl();
+  const port = adoptedServePort || currentServePort;
   return {
     running: adoptedServePort !== null || (!!opencodeProcess && !opencodeProcess.killed),
-    port: adoptedServePort || currentServePort,
-    url: `http://127.0.0.1:${adoptedServePort || currentServePort}`,
+    port,
+    url,
     restartCount,
     pid: opencodeProcess?.pid || null
   };

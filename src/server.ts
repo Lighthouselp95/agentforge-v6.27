@@ -21,7 +21,7 @@ export const DEFAULT_ENGINE_MODE = 'attach';
 
 function createAgentClient(config: AgentConfig): AnyAgentClient {
   const engineMode = storage.getSetting('engineMode', DEFAULT_ENGINE_MODE);
-  const serverUrl = storage.getSetting('opencodeServeUrl', storage.getSetting('serveUrl', process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096'));
+  const serverUrl = getOpenCodeServerUrl();
 
   if (engineMode === 'attach') {
     return new OpenCodeServeClient(config, { mode: 'attach', serverUrl });
@@ -6307,7 +6307,7 @@ process.on('unhandledRejection', (reason) => {
   try { ACPClient.killAllChildProcesses(); } catch {}
 });
 
-import { ensureOpenCodeServer, killOpenCodeServer, getOpenCodeServerStatus } from './process/opencode-spawner.js';
+import { ensureOpenCodeServer, killOpenCodeServer, getOpenCodeServerStatus, getOpenCodeServerUrl } from './process/opencode-spawner.js';
 
 // Mỗi khi server Node.js khởi động lại (mới boot), reset flag isSystemStarted về false để UI hiện StartupModal
 storage.setSetting('isSystemStarted', false);

@@ -9,7 +9,7 @@ import http from 'http';
 import { StringDecoder } from 'string_decoder';
 import type { AgentConfig, AgentMessage, MessagePart, TokenUsage, ToolCallInfo } from './types.js';
 import { storage } from '../storage.js';
-import { spawnOpencodeRunProcess } from '../process/opencode-spawner.js';
+import { spawnOpencodeRunProcess, getOpenCodeServerUrl } from '../process/opencode-spawner.js';
 
 const execAsync = promisify(exec);
 const isWin = process.platform === 'win32';
@@ -519,12 +519,13 @@ export class OpenCodeServeClient {
       this.pushOACEvent({ kind: 'in', prompt: prompt.length > 4000 ? prompt.slice(0, 4000) + '\n…(truncated)' : prompt });
 
       const stdout = await new Promise<string>((resolve, reject) => {
+        const dynamicServeUrl = getOpenCodeServerUrl();
         const { proc } = spawnOpencodeRunProcess({
           agentName,
           sessionId: this.sessionId,
           model: modelToUse,
           projectDir,
-          attachUrl: this.serverUrl,
+          attachUrl: dynamicServeUrl,
           isSlash,
           slashCleanCmd: cleanCmd,
           slashArgsRest: cmdArgsRest,
