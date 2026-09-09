@@ -838,6 +838,10 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
        smartRuleRegistry.setMasterEnabled(msg.smartClarifyEnabled);
      }
 
+     if (msg.type === 'settings:updated' && typeof msg.smartClarifyPromptTemplate === 'string') {
+       smartRuleRegistry.setPromptTemplate(msg.smartClarifyPromptTemplate);
+     }
+
     if (msg.type === 'agent:created' || msg.type === 'agent:updated' || msg.type === 'agent:deleted') {
       if (msg.type === 'agent:deleted') {
         const deletedId = msg.id || msg.agentId;
