@@ -512,9 +512,10 @@ export class OpenCodeServeClient {
         : ['-c', fullCmd];
     } else {
       const safeTmpPath = tmpFile.replace(/'/g, "''");
+      const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
       cmdArgs = isWin
-        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run ${attachArgs} --auto --format json${agentFlag}`]
-        : ['-c', `cat "${tmpFile}" | opencode run ${attachArgs} --auto --format json${agentFlag}`];
+        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run ${attachArgs}${sessionFlag} --auto --format json${agentFlag}`]
+        : ['-c', `cat "${tmpFile}" | opencode run ${attachArgs}${sessionFlag} --auto --format json${agentFlag}`];
     }
 
     try {

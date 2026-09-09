@@ -731,9 +731,10 @@ export class ACPClient {
         : ['-c', fullCmd];
     } else {
       const safeTmpPath = tmpFile.replace(/'/g, "''");
-      cmdArgs = isWin
-        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run --auto --format json${agentFlag}`]
-        : ['-c', `cat "${tmpFile}" | opencode run --auto --format json${agentFlag}`];
+      const sessionFlag = this.sessionId ? ` --session "${this.sessionId}"` : '';
+      cmdArgs = isWin 
+        ? ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', `$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.Encoding]::UTF8; Get-Content -Raw -Encoding utf8 '${safeTmpPath}' | opencode run${sessionFlag} --auto --format json${agentFlag}`]
+        : ['-c', `cat "${tmpFile}" | opencode run${sessionFlag} --auto --format json${agentFlag}`];
     }
 
     try {
