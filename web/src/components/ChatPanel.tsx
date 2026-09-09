@@ -1733,7 +1733,10 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   const isOrchView = isSelectedOrch;
   const isIncomingToOrch = (isOrchView && !isOrchestrator && !isUser) ||
     (isSubOrchView ? (msg.to === 'orchestrator' && !isUser && !isFromCurrentSubOrch) : (msg.to === 'orchestrator' && !isOrchestrator && !isUser));
-  const effectiveShowToolBlocks = showToolBlocks && !isIncomingToOrch;
+  // FIX: toolCalls ALWAYS visible regardless of isIncomingToOrch.
+  // isIncomingToOrch only affects header styling, NOT toolCall rendering.
+  // This prevents the Sub-Orchestrator ToolCall Drop Bug (v8-routes-research §3.2.4).
+  const effectiveShowToolBlocks = showToolBlocks;
 
   // QUY TẮC CĂN LỀ THỐNG NHẤT BẤT BIẾN:
   // 1. DUY NHẤT User (isUser === true): LUÔN CĂN PHẢI (isAlignRight = true).

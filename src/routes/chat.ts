@@ -47,6 +47,11 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
       const agent = deps.agents.get(qAgentId);
       if (agent) teamFilter = agent.teamId || 'default';
     }
+    // Backend-Enforced Team Isolation: nếu client KHÔNG cung cấp teamId lẫn agentId → mặc định
+    // chỉ trả lịch sử của team 'default' (không trả toàn bộ cross-team, tránh leak dữ liệu team khác).
+    if (teamFilter === undefined) {
+      teamFilter = 'default';
+    }
     const history = deps.storage.getHistoryPage({
       limit: Number.isFinite(qLimit) ? qLimit : undefined,
       beforeId: qBeforeId,
@@ -65,14 +70,14 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
     res.json(sanitized);
   });
 
-  // GET /api/messages
+  // GET /api/messages — v8 strict team isolation:
+  // Bắt buộc truyền teamId để lọc, nếu không → CHỈ trả về 'default' team messages.
+  // Không còn trả toàn bộ chatHistory (tránh leak cross-team, research §3.2.2).
   router.get('/messages', (req, res) => {
     const qTeamId = req.query.teamId as string | undefined;
-    if (qTeamId) {
-      const filtered = deps.chatHistory.filter(m => (m.teamId || 'default') === qTeamId);
-      return res.json(filtered);
-    }
-    res.json(deps.chatHistory);
+    const filterTeamId = qTeamId || 'default';
+    const filtered = deps.chatHistory.filter(m => (m.teamId || 'default') === filterTeamId);
+    return res.json(filtered);
   });
 
   // POST /api/chat

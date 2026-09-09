@@ -109,10 +109,29 @@ export class WebSocketService {
   }
 
   /**
-   * Broadcast payload tới tất cả kết nối WS hoặc có lọc theo teamId
+   * Broadcast payload tới tất cả kết nối WS hoặc có lọc theo teamId.
+   * Team Isolation (khớp semantics src/server.ts broadcast):
+   * - Nếu event có teamId (filterTeamId > data.teamId > data.msg.teamId): 
+   *   client team-specific chỉ nhận event đúng team; client 'default'/'all' (supervisor) nhận tất cả.
+   * - Nếu event KHÔNG có teamId → chặn (tránh leak cross-team), trừ system events global.
    */
   public broadcast(type: string, data: any, filterTeamId?: string): void {
     const isLogMsg = type === 'terminal:line' || type === 'log:entry';
+
+    // Resolve effective teamId từ filterTeamId > data.teamId > data.msg.teamId
+    let effectiveTeamId = filterTeamId || data?.teamId;
+    if (!effectiveTeamId && data?.msg?.teamId) effectiveTeamId = data.msg.teamId;
+    if (!effectiveTeamId && data?.agent?.teamId) effectiveTeamId = data.agent.teamId;
+
+    // System events (system:started, agent:updated, team-settings) được phép broadcast broad (không teamId)
+    const isSystemBroad = type.startsWith('system:') || type === 'agent:updated' || type === 'team-settings:updated';
+
+    // Chặn event thường thiếu teamId (same policy as server.ts broadcast line 841)
+    if (!effectiveTeamId && !isSystemBroad) {
+      console.log(`[WS] Bỏ qua broadcast không có teamId (tránh leak): type=${type}`);
+      return;
+    }
+
     const payload = JSON.stringify({ type, data, timestamp: Date.now() });
     for (const ws of this.wsClients) {
       if (ws.readyState === 1) { // WebSocket.OPEN = 1
@@ -120,7 +139,9 @@ export class WebSocketService {
           continue;
         }
         const wsTeam = (ws as any).teamId;
-        if (filterTeamId && wsTeam && wsTeam !== 'default' && wsTeam !== 'all' && wsTeam !== filterTeamId) {
+        // Giữ nguyên semantics: 'default' và 'all' client = supervisor nhận toàn bộ system.
+        // Client team-specific (wsTeam !== default/all) chỉ nhận event đúng team của mình.
+        if (effectiveTeamId && wsTeam && wsTeam !== 'default' && wsTeam !== 'all' && wsTeam !== effectiveTeamId) {
           continue;
         }
         try {

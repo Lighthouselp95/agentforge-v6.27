@@ -451,7 +451,14 @@ export function App() {
   // Fetch history from DB — merge (not overwrite) to avoid race with WS messages arriving during fetch
   const fetchHistory = async (agentId?: string | null) => {
     try {
-      const targetParam = agentId ? `&agentId=${encodeURIComponent(agentId)}` : '';
+      // Truyền teamId tường minh (backend ép team isolation — không còn fallback 'default' ngầm):
+      // - Có agentId → backend tự resolve teamId theo agent.
+      // - Không agentId (main view) → gửi đúng teamId của main orchestrator (defaultOrch?.teamId || 'default').
+      const mainOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+      const mainTeamId = mainOrch?.teamId || 'default';
+      const targetParam = agentId
+        ? `&agentId=${encodeURIComponent(agentId)}`
+        : `&teamId=${encodeURIComponent(mainTeamId)}`;
       const res = await fetch(`${API}/api/history?limit=${HISTORY_FETCH_LIMIT}${targetParam}`);
       const data: ChatMsg[] = await res.json();
       if (!Array.isArray(data)) return;

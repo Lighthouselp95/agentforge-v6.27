@@ -11,6 +11,7 @@ export interface SystemRouteDeps {
   agents: Map<string, any>;
   storage: any;
   logBuffer: string[];
+  getOpenCodeStatus?: () => { running: boolean; port: number; url: string; restartCount: number; pid: number | null };
 }
 
 export function createSystemRouter(deps: SystemRouteDeps): Router {
@@ -24,6 +25,12 @@ export function createSystemRouter(deps: SystemRouteDeps): Router {
       cwd: process.cwd(),
       version: deps.appVersion
     });
+  });
+
+  // GET /api/opencode-status — trạng thái OpenCode serve (dynamic spawner / auto-restart)
+  router.get('/opencode-status', (_req, res) => {
+    const status = deps.getOpenCodeStatus ? deps.getOpenCodeStatus() : { running: false, port: 0, url: '', restartCount: 0, pid: null };
+    res.json({ ok: true, ...status });
   });
 
   // GET /api/logs
