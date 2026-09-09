@@ -33,7 +33,15 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
   const [engineMode, setEngineMode] = useState<'run' | 'attach' | 'http'>('run');
   const [serveUrl, setServeUrl] = useState('http://127.0.0.1:4096');
   const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(false);
-  const [smartClarifyEnabled, setSmartClarifyEnabled] = useState(true);
+  const [activeTab, setActiveTab] = useState<'models' | 'automation' | 'prompts'>('models');
+  const [enableWatchdog, setEnableWatchdog] = useState(true);
+  const [autoContinue, setAutoContinue] = useState(true);
+  const [watchdogSec, setWatchdogSec] = useState(45);
+  const [idleSec, setIdleSec] = useState(30);
+  const [taskUpdateThrottleMs, setTaskUpdateThrottleMs] = useState(600);
+  const [smartClarifyTimeoutSec, setSmartClarifyTimeoutSec] = useState(120);
+  const [smartClarifyPromptTemplate, setSmartClarifyPromptTemplate] = useState('Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.');
+  const [workerReminderPrompt, setWorkerReminderPrompt] = useState('=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />\n(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)');
   const [models, setModels] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem('af-models-cache');
@@ -83,7 +91,7 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           ? Promise.resolve(null)
           : fetch(`${API}/api/models`).then(r => r.ok ? r.json() : null).catch(() => null);
 
-        const fetchSettingsPromise = fetch(`${API}/api/settings/models`)
+        const fetchSettingsPromise = fetch(`${API}/api/settings`)
           .then(r => r.ok ? r.json() : null)
           .catch(() => null);
 
@@ -132,9 +140,19 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
         }
 
         if (settingsData) {
-          setOrchestratorModel(settingsData.orchestratorModel || '');
-          setDefaultSubagentModel(settingsData.defaultSubagentModel || '');
-          setAgentModelOverrides(settingsData.agentModelOverrides || {});
+          const mod = settingsData.models || settingsData;
+          setOrchestratorModel(mod.orchestratorModel || '');
+          setDefaultSubagentModel(mod.defaultSubagentModel || '');
+          setAgentModelOverrides(mod.agentModelOverrides || {});
+          if (typeof settingsData.enableWatchdog === 'boolean') setEnableWatchdog(settingsData.enableWatchdog);
+          if (typeof settingsData.autoContinue === 'boolean') setAutoContinue(settingsData.autoContinue);
+          if (typeof settingsData.watchdogStreamTimeoutSec === 'number') setWatchdogSec(settingsData.watchdogStreamTimeoutSec);
+          if (typeof settingsData.taskQueueIdleCheckSec === 'number') setIdleSec(settingsData.taskQueueIdleCheckSec);
+          if (typeof settingsData.taskUpdateThrottleMs === 'number') setTaskUpdateThrottleMs(settingsData.taskUpdateThrottleMs);
+          if (typeof settingsData.smartClarifyEnabled === 'boolean') setSmartClarifyEnabled(settingsData.smartClarifyEnabled);
+          if (typeof settingsData.smartClarifyTimeoutSec === 'number') setSmartClarifyTimeoutSec(settingsData.smartClarifyTimeoutSec);
+          if (settingsData.smartClarifyPromptTemplate) setSmartClarifyPromptTemplate(settingsData.smartClarifyPromptTemplate);
+          if (settingsData.workerReminderPrompt) setWorkerReminderPrompt(settingsData.workerReminderPrompt);
         }
 
         if (engineData) {
@@ -216,10 +234,25 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ defaultExpandToolcalls })
         }),
+        fetch(`${API}/api/settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enableWatchdog,
+            autoContinue,
+            watchdogStreamTimeoutSec: watchdogSec,
+            taskQueueIdleCheckSec: idleSec,
+            taskUpdateThrottleMs,
+            smartClarifyEnabled,
+            smartClarifyTimeoutSec,
+            smartClarifyPromptTemplate,
+            workerReminderPrompt
+          })
+        }),
         fetch(`${API}/api/settings/smartClarify`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ smartClarifyEnabled, smartClarifyTimeoutSec: 30 })
+          body: JSON.stringify({ smartClarifyEnabled, smartClarifyTimeoutSec, smartClarifyPromptTemplate })
         })
       ]);
 
@@ -290,7 +323,192 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           </button>
         </div>
 
-        {/* 0. Engine Mode — luôn hiện ngay đầu dialog, không ẩn sau loading */}
+        {/* Tab Navigation */}
+        <div style={{ display: 'flex', gap: 8, borderBottom: '1px solid var(--bg-inset)', paddingBottom: 8 }}>
+          {[
+            { id: 'models', label: '🤖 Models & Engine' },
+            { id: 'automation', label: '⏱️ Thời gian & Tự động hoá' },
+            { id: 'prompts', label: '📝 Mẫu Prompt Tuỳ biến' }
+          ].map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setActiveTab(t.id as any)}
+              style={{
+                background: activeTab === t.id ? 'var(--accent)' : 'transparent',
+                color: activeTab === t.id ? '#fff' : 'var(--text-secondary)',
+                border: 'none',
+                borderRadius: 8,
+                padding: '6px 14px',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer'
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === 'automation' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
+                ⏱️ Cấu hình Thời gian Watchdog & TaskQueue
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                    Watchdog Stream Inactivity (giây)
+                  </label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={3600}
+                    value={watchdogSec}
+                    onChange={(e) => setWatchdogSec(Number(e.target.value))}
+                    style={{
+                      width: '100%',
+                      background: 'var(--bg-panel)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--af-border-strong)',
+                      borderRadius: 6,
+                      padding: '6px 10px',
+                      fontSize: 12
+                    }}
+                  />
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Thời gian ngưng stream tối đa trước khi tự abort & nhắc lại việc (mặc định: 45s)</span>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                    Idle Task Check Delay (giây)
+                  </label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={3600}
+                    value={idleSec}
+                    onChange={(e) => setIdleSec(Number(e.target.value))}
+                    style={{
+                      width: '100%',
+                      background: 'var(--bg-panel)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--af-border-strong)',
+                      borderRadius: 6,
+                      padding: '6px 10px',
+                      fontSize: 12
+                    }}
+                  />
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Thời gian agent ở trạng thái idle trước khi tự động quét và nhắc làm tiếp task (mặc định: 30s)</span>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                    Ngưỡng gom lệnh Task Update / Throttle (mili-giây)
+                  </label>
+                  <input
+                    type="number"
+                    min={100}
+                    max={5000}
+                    step={50}
+                    value={taskUpdateThrottleMs}
+                    onChange={(e) => setTaskUpdateThrottleMs(Number(e.target.value))}
+                    style={{
+                      width: '100%',
+                      background: 'var(--bg-panel)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--af-border-strong)',
+                      borderRadius: 6,
+                      padding: '6px 10px',
+                      fontSize: 12
+                    }}
+                  />
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Khoảng thời gian tối thiểu debounce / gom nhóm các lệnh task_update liên tiếp (mặc định: 600ms)</span>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
+                    Smart Clarify Inactivity Timeout (giây)
+                  </label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={3600}
+                    value={smartClarifyTimeoutSec}
+                    onChange={(e) => setSmartClarifyTimeoutSec(Number(e.target.value))}
+                    style={{
+                      width: '100%',
+                      background: 'var(--bg-panel)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--af-border-strong)',
+                      borderRadius: 6,
+                      padding: '6px 10px',
+                      fontSize: 12
+                    }}
+                  />
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Thời gian người dùng không chat trước khi tự động kích hoạt rule hỏi lại (mặc định: 30s)</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'prompts' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
+                💬 Mẫu Prompt Smart Clarify
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+                Sử dụng biến <code>{'{content}'}</code> đại diện cho nội dung người dùng nhập.
+              </div>
+              <textarea
+                value={smartClarifyPromptTemplate}
+                onChange={(e) => setSmartClarifyPromptTemplate(e.target.value)}
+                rows={3}
+                style={{
+                  width: '100%',
+                  background: 'var(--bg-panel)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid var(--af-border-strong)',
+                  borderRadius: 6,
+                  padding: '8px 10px',
+                  fontSize: 12,
+                  boxSizing: 'border-box'
+                }}
+              />
+            </div>
+
+            <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
+                🛡️ Mẫu Worker System Reminder
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+                Đoạn nhắc nhở quy chuẩn cuối mỗi turn gửi cho worker agent.
+              </div>
+              <textarea
+                value={workerReminderPrompt}
+                onChange={(e) => setWorkerReminderPrompt(e.target.value)}
+                rows={5}
+                style={{
+                  width: '100%',
+                  background: 'var(--bg-panel)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid var(--af-border-strong)',
+                  borderRadius: 6,
+                  padding: '8px 10px',
+                  fontSize: 12,
+                  boxSizing: 'border-box'
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'models' && (
+          <>
         <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
             ⚡ Chế độ thực thi (Engine Mode)
@@ -541,6 +759,8 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
               </div>
             )}
           </div>
+        )}
+        </>
         )}
 
         {/* Footer actions */}

@@ -12,10 +12,20 @@ export class InactivityClarifyRule implements SmartRule {
   public description = 'Tự động yêu cầu agent xác minh và hỏi lại nếu người dùng không chat trong hơn 30s';
   public enabled = true;
   public timeoutSec = 30;
+  public promptTemplate = 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.';
 
-  constructor(enabled: boolean = true, timeoutSec: number = 30) {
+  constructor(enabled: boolean = true, timeoutSec: number = 30, promptTemplate?: string) {
     this.enabled = enabled;
     this.timeoutSec = timeoutSec;
+    if (promptTemplate && promptTemplate.trim()) {
+      this.promptTemplate = promptTemplate;
+    }
+  }
+
+  public setPromptTemplate(template: string): void {
+    if (template && template.trim()) {
+      this.promptTemplate = template;
+    }
   }
 
   public shouldApply(context: SmartRuleContext): boolean {
@@ -31,7 +41,9 @@ export class InactivityClarifyRule implements SmartRule {
       return { modified: false, text: context.rawText };
     }
 
-    const transformedText = `người dùng nói rằng "${trimmed}" bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa`;
+    const transformedText = this.promptTemplate.includes('{content}')
+      ? this.promptTemplate.replace('{content}', trimmed)
+      : (this.promptTemplate.includes('{xx}') ? this.promptTemplate.replace('{xx}', trimmed) : `${this.promptTemplate}: "${trimmed}"`);
 
     return {
       modified: true,

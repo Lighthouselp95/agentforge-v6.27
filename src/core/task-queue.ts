@@ -95,11 +95,13 @@ export class TaskQueueManager {
       return;
     }
 
-    // Đợi debounce thời gian idleDetectionMs để tránh nháy trạng thái
+    // Đợi debounce thời gian idleDetectionMs để tránh nháy trạng thái (hỗ trợ tuỳ biến từ Settings)
+    const customIdleSec = Number(storage.getSetting('taskQueueIdleCheckSec', 30)) || 30;
+    const idleMs = Math.max(5000, customIdleSec * 1000);
     const timeout = setTimeout(() => {
       this.lastIdleCheckTime = Date.now();
       this.checkAndAssignTask().catch(() => {});
-    }, this.config.idleDetectionMs);
+    }, idleMs);
     this.statusDebounce.set(agentId, timeout);
   }
 

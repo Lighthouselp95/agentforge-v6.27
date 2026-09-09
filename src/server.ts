@@ -315,17 +315,28 @@ You are the Orchestrator. You MUST communicate with workers using:
 <stop target="<target-id>" />
 <resume target="<target-id>" />
 
+(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ XML/bracket trong nội dung văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)
+
 Always decompose tasks before spawning. Do NOT do the work yourself. Orchestrator CANNOT delete agents; use <stop target="..." /> and ask the user to delete if necessary. Respond to the user in a clear, concise way.`;
 
 const WORKER_REMINDER = `\n\n=== SYSTEM REMINDER ===
 Use <talk target="<target-id>">your message</talk> for communications.
 Khi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />
-Khi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />`;
+Khi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />
+(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)`;
+
+function getWorkerReminder(): string {
+  const custom = storage.getSetting('workerReminderPrompt');
+  if (custom && typeof custom === 'string' && custom.trim()) {
+    return `\n\n${custom.trim()}`;
+  }
+  return WORKER_REMINDER;
+}
 
 function buildWorkerPrompt(role?: string, agent?: Agent, isInitial?: boolean): string {
   // Kiến trúc SSoT: Toàn bộ Base Rules, Role Rules và Formats đã được đồng bộ sẵn vào .opencode/agents/<role>.md.
   // Mỗi turn chỉ cần reminder ngắn gọn để tối ưu token payload và giảm độ trễ tối đa.
-  return WORKER_REMINDER;
+  return getWorkerReminder();
 }
 
 // ============ SSoT PROMPT SYNC TO .OPENCODE/AGENTS ============
@@ -744,8 +755,9 @@ function loadState() {
         sessionEntries.push({ agentId: row.id, sessionId: sid });
       }
     }
-    // Restore ACPClient.agentSessions map for all agents
+    // Restore agentSessions static map for all agents cho cả ACPClient và OpenCodeServeClient
     ACPClient.restoreAgentSessions(sessionEntries);
+    OpenCodeServeClient.restoreAgentSessions(sessionEntries);
     
     // Mọi Orchestrator đều ngang hàng: CHỈ tạo orchestrator khởi đầu nếu DB hoàn toàn chưa có bất kỳ agent nào
     const hasAnyOrchestrator = Array.from(agents.values()).some(a => a.type === 'orchestrator' || a.role === 'orchestrator');
@@ -1223,6 +1235,8 @@ const dispatchThinkingBuf: Record<string, string> = {};
 const dispatchPartsBuf: Record<string, MessagePart[]> = {};
 // Live stream persistence tracker: Lưu snapshot định kỳ xuống DB với ID cố định của turn để chống crash
 const activeLiveStreamMsgs = new Map<string, { id: string; lastSavedAt: number }>();
+// Throttle timer cho task_update trong stream
+const lastStreamTaskUpdateAt = new Map<string, number>();
 // Deterministic Turn Message ID: Ánh xạ agentId -> msgId cố định duy nhất cho turn hiện tại
 const activeTurnMsgIds = new Map<string, string>();
 
@@ -1444,10 +1458,17 @@ function scanStreamForDispatch(agentId: string, accumulated: string): string {
   }
 
   // Quét và thực thi tức thời các lệnh task_update nếu có trong stream
+  // DEBOUNCE / THROTTLE: Đọc cấu hình taskUpdateThrottleMs từ setting (mặc định 600ms)
   if (accumulated.includes('<task_update') || accumulated.includes('[TASK_UPDATE')) {
-    parseAgentCommands(accumulated, agentId).catch(err => {
-      console.error(`[StreamDispatch] parseAgentCommands error: ${err?.message || err}`);
-    });
+    const throttleMs = Math.max(100, Number(storage.getSetting('taskUpdateThrottleMs', 600)) || 600);
+    const lastAt = lastStreamTaskUpdateAt.get(agentId) || 0;
+    const now = Date.now();
+    if (now - lastAt >= throttleMs) {
+      lastStreamTaskUpdateAt.set(agentId, now);
+      parseAgentCommands(accumulated, agentId).catch(err => {
+        console.error(`[StreamDispatch] parseAgentCommands error: ${err?.message || err}`);
+      });
+    }
   }
 
   // 1. Trích lệnh TALK hoàn chỉnh (bracket + xml), bỏ qua tag trong code block/quoted.
@@ -1995,7 +2016,7 @@ async function syncSessionTitle(agent: Agent, client: AnyAgentClient, _retries =
 
     if (shouldBroadcast) {
       agent.sessionId = sid;
-      ACPClient.registerSession(agent.id, sid);
+      registerAgentSession(agent.id, sid);
       storage.updateAgent(agent.id, { 
         sessionId: sid, 
         sessionTitle: agent.sessionTitle,
@@ -2014,7 +2035,7 @@ async function syncSessionTitle(agent: Agent, client: AnyAgentClient, _retries =
     const defaultTitle = `Session ${sid.slice(-6)}`;
     agent.sessionTitle = defaultTitle;
     agent.sessionId = sid;
-    ACPClient.registerSession(agent.id, sid);
+    registerAgentSession(agent.id, sid);
     storage.updateAgent(agent.id, { sessionId: sid, sessionTitle: agent.sessionTitle });
     broadcast('agent:updated', { agent });
   }
@@ -2026,6 +2047,12 @@ function resolveOrchestratorModel(targetOrch?: Agent | string): string {
 
 function resolveModelForAgent(agent: Agent): string {
   return resolveModelForAgentCore(agent, { storage, agents });
+}
+
+function registerAgentSession(agentId: string, sessionId: string) {
+  if (!agentId || !sessionId) return;
+  try { ACPClient.registerSession(agentId, sessionId); } catch {}
+  try { OpenCodeServeClient.registerSession(agentId, sessionId); } catch {}
 }
 
 function getClient(agent: Agent): AnyAgentClient {
@@ -2057,6 +2084,9 @@ function getClient(agent: Agent): AnyAgentClient {
   const client = clients.get(agent.id)!;
   if (client.getSessionId() !== (agent.sessionId || null)) {
     client.setSession(agent.sessionId || null);
+  }
+  if (agent.sessionId) {
+    registerAgentSession(agent.id, agent.sessionId);
   }
   return client;
 }
@@ -2117,6 +2147,27 @@ End your reply with one or more routing lines, each on its own line:
 - To message another agent, use its exact ID from the Members list.
 - NEVER spawn subagents. Only the Orchestrator spawns.
 ====================================`;
+
+function buildAgentTasksHeader(a: Agent): string {
+  if (!a) return '';
+  const lines: string[] = ['[YOUR TASKS STATUS]'];
+  if (Array.isArray(a.tasks) && a.tasks.length > 0) {
+    a.tasks.forEach((t, idx) => {
+      const num = t.id || String(idx + 1);
+      const status = t.status || 'pending';
+      const tNorm = (t.task || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+      const text = tNorm.length > 120 ? tNorm.slice(0, 117) + '...' : tNorm;
+      lines.push(`- #${num} [${status}] ${text}`);
+    });
+  } else if (a.task) {
+    const rawTask = a.task.normalize('NFC').replace(/\s+/g, ' ').trim();
+    lines.push(`- #1 [${a.status || 'working'}] ${rawTask.length > 120 ? rawTask.slice(0, 117) + '...' : rawTask}`);
+  } else {
+    lines.push('- (Danh sách trống)');
+  }
+  lines.push('[/YOUR TASKS STATUS]');
+  return lines.join('\n');
+}
 
 // Helper: truncate task to first line, strip leading markdown headers, max 100 chars (15-18 words)
 function truncateTask(task: string): string {
@@ -3181,6 +3232,31 @@ Vui lòng hãy hoàn thành các task trước (sử dụng <task_update agent="
     const resMsg = `Updated task for ${target.name} (${target.id}): task="${target.task || ''}", status="${target.status}", totalTasks=${target.tasks.length}`;
     console.log(`[${new Date().toISOString()}] [TASK_EXEC] Agent '${target.name}' (${target.id}) executing <task_update task="${targetTaskId || newTask}" status="${normStatus || newStatus}"> -> Result: ${resMsg}`);
     results.push(resMsg);
+
+  }
+
+  // GOM NHÓM PHẢN HỒI THÀNH CÔNG: Nếu trong 1 response có 1 hoặc nhiều task_update thành công,
+  // gom lại thành 1 thông báo duy nhất sau vòng lặp để tránh spam deliverTalk nhiều lần.
+  if (fromAgent && fromAgent.id !== 'orchestrator' && results.some(r => r.startsWith('Updated task for'))) {
+    const taskListSummary = fromAgent.tasks && fromAgent.tasks.length > 0
+      ? fromAgent.tasks.map((t, idx) => `#${t.id || (idx + 1)} [${t.status}] ${t.task}`).join('; ')
+      : '(Trống)';
+    const successMsg = `[TASK_UPDATE_SUCCESS] Các lệnh cập nhật task của bạn đã được hệ thống thực thi thành công.\nDanh sách tasks hiện tại của bạn:\n${taskListSummary}\nTrạng thái agent: ${fromAgent.status}.`;
+    const sysAgent: Agent = {
+      id: 'system',
+      name: 'System',
+      role: 'system',
+      type: 'orchestrator',
+      status: 'idle',
+      teamId: fromAgent.teamId || 'default',
+      createdAt: Date.now()
+    };
+    deliverTalk(fromAgent, sysAgent, {
+      to: fromAgent.id,
+      message: successMsg
+    }).catch(e => {
+      console.error(`[TaskUpdate] Failed to notify agent ${fromAgent.name} of success:`, e?.message || e);
+    });
   }
 
   return results;
@@ -4134,7 +4210,8 @@ Vui lòng hãy hoàn thành các task trước (sử dụng <task_update agent="
 
     const isFromOrch = isOrchestratorLike(fromAgent);
     const teamBlock = isFromOrch ? `[TEAM]\n${buildTeam(targetAgent.id)}\n[/TEAM]\n\n` : '';
-    const talkPrompt = `${teamBlock}${talkHeader}\n${msg.message}\n\n${WORKER_REMINDER}`;
+    const tasksBlock = `${buildAgentTasksHeader(targetAgent)}\n\n`;
+    const talkPrompt = `${tasksBlock}${teamBlock}${talkHeader}\n${msg.message}\n\n${getWorkerReminder()}`;
     // WORKING NGAY TRƯỚC ENQUEUE: badge worker trên UI nhảy sang Working tức thì,
     // không phụ thuộc caller có set hay không (cover cả đường replay outbox).
     targetAgent.status = 'working';
@@ -4154,7 +4231,7 @@ Vui lòng hãy hoàn thành các task trước (sử dụng <task_update agent="
         targetAgent.tokenUsage = tr.tokenUsage;
       }
       if (tr.contextLength) targetAgent.contextLength = tr.contextLength;
-      if (targetAgent.sessionId) ACPClient.registerSession(targetAgent.id, targetAgent.sessionId);
+      if (targetAgent.sessionId) registerAgentSession(targetAgent.id, targetAgent.sessionId);
       storage.updateAgent(targetAgent.id, {
         sessionId: targetAgent.sessionId,
         tokenUsage: targetAgent.tokenUsage,
@@ -4386,7 +4463,7 @@ Vui lòng hãy hoàn thành các task trước (sử dụng <task_update agent="
             const needReinject = tc.getNeedPromptReinject() || !existing.sessionId;
             if (needReinject) tc.setNeedPromptReinject(false);
             const spawnTeam = buildTeam(existing.id);
-            const prompt = `[TASK] ${task}\n[TEAM]\n${spawnTeam}\n[/TEAM]\n\n=== INCOMING MESSAGE ===\nFROM: Orchestrator (ID: orchestrator)\nTO: ${existing.name} (ID: ${existing.id}, Role: ${existing.role})\n=== MESSAGE ===\n${task}\n\n${WORKER_REMINDER}`;
+            const prompt = `[TASK] ${task}\n[TEAM]\n${spawnTeam}\n[/TEAM]\n\n=== INCOMING MESSAGE ===\nFROM: Orchestrator (ID: orchestrator)\nTO: ${existing.name} (ID: ${existing.id}, Role: ${existing.role})\n=== MESSAGE ===\n${task}\n\n${getWorkerReminder()}`;
             const tr = await tc.enqueue(prompt);
             const newSid = tc.getSessionId();
             const isNewSession = !!(newSid && newSid !== existing.sessionId);
@@ -4708,7 +4785,7 @@ const talkMsg: ChatMsg = {
         if (needReinject) tc.setNeedPromptReinject(false);
         const talkHeader = `=== INCOMING MESSAGE ===\nFROM: Orchestrator (orchestrator)\nTO: ${ta.name} (ID: ${ta.id}, Role: ${ta.role})\n=== MESSAGE ===`;
         // Direct talk từ Orchestrator chính luôn là isFromOrch = true
-        const talkPrompt = `[TEAM]\n${buildTeam(ta.id)}\n[/TEAM]\n\n${talkHeader}\n${message}\n\n${WORKER_REMINDER}`;
+        const talkPrompt = `[TEAM]\n${buildTeam(ta.id)}\n[/TEAM]\n\n${talkHeader}\n${message}\n\n${getWorkerReminder()}`;
         const tr = await tc.enqueue(talkPrompt);
         const newSid = tc.getSessionId();
         const isNewSession = Boolean(newSid && newSid !== ta.sessionId);
@@ -4837,7 +4914,12 @@ app.use('/api', createApiRouter({
     broadcast,
     agents,
     clients,
-    resolveModelForAgent
+    resolveModelForAgent,
+    triggerSystemStart: () => {
+      if (typeof (globalThis as any).__triggerSystemStart === 'function') {
+        (globalThis as any).__triggerSystemStart();
+      }
+    }
   },
   models: {
     getAvailableModels,
@@ -6086,113 +6168,103 @@ function startServerWithPortFallback(port: number) {
       } catch {}
     }
 
-    // Sau 1s để orchestrator client kịp init trước khi chạy các bước boot sequence
-    setTimeout(async () => {
-      // Khởi chạy nền OpenCode Serve (non-blocking) ngay sau khi Web Server đã mở
-      ensureOpenCodeServer().catch((err: any) => {
-        console.error(`[Server] Lỗi khởi chạy OpenCode Serve nền:`, err?.message || err);
-      });
+let isSystemStarted = false;
 
-      console.log('[BootSequence] Khởi chạy các bước Boot Sequence chuẩn xác...');
+function triggerSystemStart() {
+  if (isSystemStarted) return;
+  isSystemStarted = true;
+  storage.setSetting('isSystemStarted', true);
+  console.log('[SystemGate] 🚀 Người dùng xác nhận khởi động — Kích hoạt toàn bộ Boot Sequence & Auto-reminders...');
 
-      // Bước 3: Đảm bảo 100% agent chuyển trạng thái idle trước khi nhận việc
-      try {
-        console.log('[BootSequence] Bước 3: Chuẩn hóa 100% trạng thái agent về idle...');
-        for (const [, a] of agents) {
-          // Khi server vừa khởi động lại, chắc chắn không có tiến trình ACPClient thật nào đang chạy
-          const cl = clients.get(a.id);
-          const hasRealProcess = cl ? cl.isBusy() : false;
-          if (!hasRealProcess) {
-            if (a.status !== 'idle') {
-              console.log(`[BootReconcile] Reset trạng thái agent ${a.name} (${a.id}) từ ${a.status} về idle.`);
-            }
-            a.status = 'idle';
-            a.workingSince = undefined;
-            // Đồng bộ chuyển các task working dở dang về pending để tránh zombie task
-            if (a.tasks) {
-              a.tasks = a.tasks.map(t => t.status === 'working' ? { ...t, status: 'pending' } : t);
-            }
-            storage.updateAgent(a.id, { status: 'idle', workingSince: null, tasks: a.tasks } as any);
-            broadcast('agent:updated', { agent: a });
+  // Khởi chạy nền OpenCode Serve (non-blocking)
+  ensureOpenCodeServer().catch((err: any) => {
+    console.error(`[Server] Lỗi khởi chạy OpenCode Serve nền:`, err?.message || err);
+  });
+
+  // Bước 3: Chuẩn hóa 100% trạng thái agent về idle
+  try {
+    console.log('[BootSequence] Bước 3: Chuẩn hóa 100% trạng thái agent về idle...');
+    for (const [, a] of agents) {
+      const cl = clients.get(a.id);
+      const hasRealProcess = cl ? cl.isBusy() : false;
+      if (!hasRealProcess) {
+        if (a.status !== 'idle') {
+          console.log(`[BootReconcile] Reset trạng thái agent ${a.name} (${a.id}) từ ${a.status} về idle.`);
+        }
+        a.status = 'idle';
+        a.workingSince = undefined;
+        if (a.tasks) {
+          a.tasks = a.tasks.map(t => t.status === 'working' ? { ...t, status: 'pending' } : t);
+        }
+        storage.updateAgent(a.id, { status: 'idle', workingSince: null, tasks: a.tasks } as any);
+        broadcast('agent:updated', { agent: a });
+      }
+    }
+  } catch (err: any) {
+    console.error('[BootSequence] Bước 3 lỗi:', err?.message || err);
+  }
+
+  // Bước 4: Replay outbox theo đúng thứ tự FIFO
+  try {
+    console.log('[BootSequence] Bước 4: Replay outbox theo đúng thứ tự FIFO...');
+    replayPendingReports().then(() => {
+      autoResumeWorkingAgents();
+      processChatRetryQueue();
+      scheduleChatRetry();
+      scheduleOutboxRetry();
+    }).catch(err => {
+      console.error('[BootSequence] Bước 4 replay failed:', err?.message || err);
+    });
+  } catch (err: any) {
+    console.error('[BootSequence] Bước 4 lỗi:', err?.message || err);
+  }
+
+  // Bước 5: Xả backendUserQueues cho user
+  try {
+    console.log('[BootSequence] Bước 5: Xả backendUserQueues cho user...');
+    const unprocessedAll = storage.getAllUnprocessedMessages();
+    for (const [targetKey, msgs] of Object.entries(unprocessedAll)) {
+      if (Array.isArray(msgs) && msgs.length > 0) {
+        backendUserQueues[targetKey] = backendUserQueues[targetKey] || [];
+        for (const m of msgs) {
+          if (!m || !m.trim() || !targetKey) continue;
+          if (typeof m === 'string' && (m.trim().startsWith('[TEAM]') || m.includes('Your ID:'))) continue;
+          if (!backendUserQueues[targetKey].some(item => item.rawMsg === m)) {
+            backendUserQueues[targetKey].push({
+              targetId: targetKey,
+              rawMsg: m,
+              isSlash: m.startsWith('/'),
+              timestamp: Date.now()
+            });
           }
         }
-      } catch (err: any) {
-        console.error('[BootSequence] Bước 3 lỗi:', err?.message || err);
+        console.log(`[BackendQueue] Restored ${msgs.length} unprocessed messages from disk for target ${targetKey}.`);
       }
+    }
 
-      // Bước 4: Replay outbox theo đúng thứ tự FIFO
-      try {
-        console.log('[BootSequence] Bước 4: Replay outbox theo đúng thứ tự FIFO...');
-        await replayPendingReports();
-        // Chạy autoResume cho các agent thực sự có task dở dang cần tiếp tục
-        await autoResumeWorkingAgents();
-        await processChatRetryQueue();
-        scheduleChatRetry();
-        // ACK-based: vòng quét định kỳ retry các report failed/in_flight treo khi mạng khôi phục
-        scheduleOutboxRetry();
-      } catch (err: any) {
-        console.error('[BootSequence] Bước 4 lỗi:', err?.message || err);
-      }
-
-      // Bước 5: Xả backendUserQueues cho user
-      try {
-        console.log('[BootSequence] Bước 5: Xả backendUserQueues cho user...');
-        const unprocessedAll = storage.getAllUnprocessedMessages();
-        for (const [targetKey, msgs] of Object.entries(unprocessedAll)) {
-          if (Array.isArray(msgs) && msgs.length > 0) {
-            // FIX (v7.0.55): Gán UNCONDITIONAL để set trap kích hoạt setQueue → persist vào manager.
-            // `if (!backendUserQueues[targetKey]) = []` không bao giờ chạy vì get() trả `|| []` (truthy)
-            // → push vào array rác → in-memory queue rỗng → drain boot không xả được queue.
-            backendUserQueues[targetKey] = backendUserQueues[targetKey] || [];
-            for (const m of msgs) {
-              // Validate trước restore: bỏ qua entry thiếu nội dung/target
-              if (!m || !m.trim() || !targetKey) {
-                console.log(`[QueueGuard] Bỏ qua restore entry rỗng cho target ${targetKey}.`);
-                continue;
-              }
-              if (typeof m === 'string' && (m.trim().startsWith('[TEAM]') || m.includes('Your ID:'))) {
-                console.log(`[BackendQueue] Bỏ qua remnant team table cũ cho target ${targetKey}`);
-                continue;
-              }
-              // Tránh trùng lặp nếu đã có trong memory
-              if (!backendUserQueues[targetKey].some(item => item.rawMsg === m)) {
-                backendUserQueues[targetKey].push({
-                  targetId: targetKey,
-                  rawMsg: m,
-                  isSlash: m.startsWith('/'),
-                  timestamp: Date.now()
-                });
-              }
-            }
-            console.log(`[BackendQueue] Restored ${msgs.length} unprocessed messages from disk for target ${targetKey}.`);
-          }
+    for (const targetKey of Object.keys(backendUserQueues)) {
+      if (backendUserQueues[targetKey] && backendUserQueues[targetKey].length > 0) {
+        console.log(`[BootSequence] Tự động kích hoạt drain queue cho target ${targetKey} (${backendUserQueues[targetKey].length} tin)...`);
+        const ag = agents.get(targetKey) || (targetKey === 'orchestrator' ? findExistingOrchestrator() : null);
+        if (ag && ag.status === 'working') {
+          ag.status = 'idle';
+          ag.workingSince = undefined;
+          storage.updateAgent(ag.id, { status: 'idle', workingSince: null });
+          broadcast('agent:updated', { agent: ag });
         }
-
-        // Tự động kích hoạt xả hàng đợi (drain queue) cho tất cả các target có tin tồn đọng
-        for (const targetKey of Object.keys(backendUserQueues)) {
-          if (backendUserQueues[targetKey] && backendUserQueues[targetKey].length > 0) {
-            console.log(`[BootSequence] Tự động kích hoạt drain queue cho target ${targetKey} (${backendUserQueues[targetKey].length} tin)...`);
-            const ag = agents.get(targetKey) || (targetKey === 'orchestrator' ? findExistingOrchestrator() : null);
-            if (ag && ag.status === 'working') {
-              ag.status = 'idle';
-              ag.workingSince = undefined;
-              storage.updateAgent(ag.id, { status: 'idle', workingSince: null });
-              broadcast('agent:updated', { agent: ag });
-            }
-            processNextBackendUserQueue(targetKey);
-          }
-        }
-
-        // Bước 6: Bật watchdog quét queue định kỳ — safety net chống kẹt vĩnh viễn
-        // kể cả khi các trigger rời rạc (deliverTalk/dispatchUserChat/chat-route) bị bỏ lỡ.
-        scheduleBackendQueueWatchdog();
-
-        // Khởi động TaskQueueManager để watchdog/auto-continue hoạt động trên production legacy (sau khi storage & agents đã tải đủ)
-        initTaskQueueManager();
-      } catch (e: any) {
-        console.error(`[BackendQueue] Restore & drain unprocessed messages failed: ${e.message}`);
+        processNextBackendUserQueue(targetKey);
       }
-    }, 1000);
+    }
+
+    scheduleBackendQueueWatchdog();
+    initTaskQueueManager();
+  } catch (e: any) {
+    console.error(`[BackendQueue] Restore & drain unprocessed messages failed: ${e.message}`);
+  }
+
+  broadcast('system:started', { ok: true, timestamp: Date.now() });
+}
+(globalThis as any).__triggerSystemStart = triggerSystemStart;
   });
 }
 

@@ -55,6 +55,14 @@ export class OpenCodeServeClient {
     OpenCodeServeClient.agentSessions.set(agentId, sessionId);
   }
 
+  static restoreAgentSessions(entries: Array<{ agentId: string; sessionId: string }>) {
+    for (const e of entries) {
+      if (e.agentId && e.sessionId) {
+        OpenCodeServeClient.agentSessions.set(e.agentId, e.sessionId);
+      }
+    }
+  }
+
   static getRegisteredSession(agentId: string): string | undefined {
     return OpenCodeServeClient.agentSessions.get(agentId);
   }

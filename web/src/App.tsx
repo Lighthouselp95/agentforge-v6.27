@@ -6,6 +6,8 @@ import { ModelSettingsDialog } from './components/ModelSettingsDialog';
 import { TeamSettingsDialog } from './components/TeamSettingsDialog';
 import { smartRuleRegistry } from './utils/smartClarify';
 import { TabBar } from './components/TabBar';
+import { StartupModal } from './components/StartupModal';
+import { FloatingBroadcastBar } from './components/FloatingBroadcastBar';
 import { parseAgentTaskList, renderAgentTaskList, ParsedAgentTask } from './utils/taskUtils';
 
 const API = window.location.port === '5173' ? '' : (window.location.origin.startsWith('http') ? window.location.origin : 'http://localhost:4001');
@@ -151,6 +153,8 @@ export function App() {
   const [spawnParentId, setSpawnParentId] = useState<string | null>(null);
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showTeamSettings, setShowTeamSettings] = useState(false);
+  const [showStartupModal, setShowStartupModal] = useState(false);
+  const [startupInitialSettings, setStartupInitialSettings] = useState<any>({});
   const [connected, setConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'disconnected'>('disconnected');
   const [disconnectedAt, setDisconnectedAt] = useState<number | null>(null);

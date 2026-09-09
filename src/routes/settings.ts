@@ -6,6 +6,7 @@ export interface SettingsRouteDeps {
   agents: Map<string, any>;
   clients: Map<string, any>;
   resolveModelForAgent: (agent: any) => string | undefined;
+  triggerSystemStart?: () => void;
 }
 
 export function createSettingsRouter(deps: SettingsRouteDeps): Router {
@@ -21,13 +22,35 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
       serveUrl: opencodeServeUrl,
       autoContinue: deps.storage.getSetting('autoContinue', false) === true,
       enableWatchdog: deps.storage.getSetting('enableWatchdog', false) === true,
+      watchdogStreamTimeoutSec: Number(deps.storage.getSetting('watchdogStreamTimeoutSec', 45)) || 45,
+      taskQueueIdleCheckSec: Number(deps.storage.getSetting('taskQueueIdleCheckSec', 30)) || 30,
+      taskUpdateThrottleMs: Number(deps.storage.getSetting('taskUpdateThrottleMs', 600)) || 600,
+      smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false) === true,
+      smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 120)) || 120,
+      smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.'),
+      workerReminderPrompt: deps.storage.getSetting('workerReminderPrompt', '=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />\n(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)'),
+      isSystemStarted: deps.storage.getSetting('isSystemStarted', false) === true,
       models: deps.storage.getModelSettings()
     });
   });
 
   // POST /api/settings
   router.post('/', (req, res) => {
-    const { engineMode, opencodeServeUrl, serveUrl, autoContinue } = req.body || {};
+    const {
+      engineMode,
+      opencodeServeUrl,
+      serveUrl,
+      autoContinue,
+      enableWatchdog,
+      watchdogStreamTimeoutSec,
+      taskQueueIdleCheckSec,
+      taskUpdateThrottleMs,
+      smartClarifyEnabled,
+      smartClarifyTimeoutSec,
+      smartClarifyPromptTemplate,
+      workerReminderPrompt,
+      isSystemStarted
+    } = req.body || {};
     const validModes = ['run', 'attach', 'http'];
     let changed = false;
 
@@ -46,6 +69,33 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     if (autoContinue !== undefined) {
       deps.storage.setSetting('autoContinue', Boolean(autoContinue));
     }
+    if (enableWatchdog !== undefined) {
+      deps.storage.setSetting('enableWatchdog', Boolean(enableWatchdog));
+    }
+    if (watchdogStreamTimeoutSec !== undefined) {
+      deps.storage.setSetting('watchdogStreamTimeoutSec', Math.max(5, Number(watchdogStreamTimeoutSec) || 45));
+    }
+    if (taskQueueIdleCheckSec !== undefined) {
+      deps.storage.setSetting('taskQueueIdleCheckSec', Math.max(5, Number(taskQueueIdleCheckSec) || 30));
+    }
+    if (taskUpdateThrottleMs !== undefined) {
+      deps.storage.setSetting('taskUpdateThrottleMs', Math.max(100, Number(taskUpdateThrottleMs) || 600));
+    }
+    if (smartClarifyEnabled !== undefined) {
+      deps.storage.setSetting('smartClarifyEnabled', Boolean(smartClarifyEnabled));
+    }
+    if (smartClarifyTimeoutSec !== undefined) {
+      deps.storage.setSetting('smartClarifyTimeoutSec', Math.max(5, Number(smartClarifyTimeoutSec) || 120));
+    }
+    if (smartClarifyPromptTemplate !== undefined && typeof smartClarifyPromptTemplate === 'string') {
+      deps.storage.setSetting('smartClarifyPromptTemplate', smartClarifyPromptTemplate);
+    }
+    if (workerReminderPrompt !== undefined && typeof workerReminderPrompt === 'string') {
+      deps.storage.setSetting('workerReminderPrompt', workerReminderPrompt);
+    }
+    if (isSystemStarted !== undefined) {
+      deps.storage.setSetting('isSystemStarted', Boolean(isSystemStarted));
+    }
 
     if (changed) {
       deps.clients.clear();
@@ -54,20 +104,43 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     const currentMode = deps.storage.getSetting('engineMode', 'attach');
     const currentUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
 
-    deps.broadcast('settings:updated', {
+    const updatedPayload = {
       engineMode: currentMode,
       opencodeServeUrl: currentUrl,
       serveUrl: currentUrl,
-      autoContinue: deps.storage.getSetting('autoContinue', false)
-    });
+      autoContinue: deps.storage.getSetting('autoContinue', false),
+      enableWatchdog: deps.storage.getSetting('enableWatchdog', false),
+      watchdogStreamTimeoutSec: Number(deps.storage.getSetting('watchdogStreamTimeoutSec', 45)),
+      taskQueueIdleCheckSec: Number(deps.storage.getSetting('taskQueueIdleCheckSec', 30)),
+      smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false),
+      smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 30)),
+      smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', ''),
+      workerReminderPrompt: deps.storage.getSetting('workerReminderPrompt', ''),
+      isSystemStarted: deps.storage.getSetting('isSystemStarted', false)
+    };
+
+    deps.broadcast('settings:updated', updatedPayload);
 
     res.json({
       ok: true,
       success: true,
-      engineMode: currentMode,
-      opencodeServeUrl: currentUrl,
-      serveUrl: currentUrl
+      ...updatedPayload
     });
+  });
+
+  // POST /api/settings/start-system — Trigger boot sequence sau khi user bấm OK ở popup
+  router.post('/start-system', (req, res) => {
+    try {
+      if (typeof (deps as any).triggerSystemStart === 'function') {
+        (deps as any).triggerSystemStart();
+      } else {
+        deps.storage.setSetting('isSystemStarted', true);
+        deps.broadcast('system:started', { ok: true, timestamp: Date.now() });
+      }
+      res.json({ success: true, message: 'System started successfully' });
+    } catch (e: any) {
+      res.status(500).json({ success: false, error: e?.message || e });
+    }
   });
 
   // GET /api/settings/watchdog
@@ -102,19 +175,24 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
   router.get('/smartClarify', (_req, res) => {
     res.json({
       smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false) === true,
-      smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 30)) || 30
+      smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 120)) || 120,
+      smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.')
     });
   });
 
   // POST /api/settings/smartClarify
   router.post('/smartClarify', (req, res) => {
-    const { smartClarifyEnabled, smartClarifyTimeoutSec } = req.body || {};
+    const { smartClarifyEnabled, smartClarifyTimeoutSec, smartClarifyPromptTemplate } = req.body || {};
     const enabled = smartClarifyEnabled !== undefined ? Boolean(smartClarifyEnabled) : true;
-    const timeoutSec = Math.max(5, Number(smartClarifyTimeoutSec) || 30);
+    const timeoutSec = Math.max(5, Number(smartClarifyTimeoutSec) || 120);
     deps.storage.setSetting('smartClarifyEnabled', enabled);
     deps.storage.setSetting('smartClarifyTimeoutSec', timeoutSec);
-    deps.broadcast('settings:updated', { smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec });
-    res.json({ success: true, smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec });
+    if (smartClarifyPromptTemplate !== undefined && typeof smartClarifyPromptTemplate === 'string') {
+      deps.storage.setSetting('smartClarifyPromptTemplate', smartClarifyPromptTemplate);
+    }
+    const template = deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.');
+    deps.broadcast('settings:updated', { smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec, smartClarifyPromptTemplate: template });
+    res.json({ success: true, smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec, smartClarifyPromptTemplate: template });
   });
 
   // GET /api/settings/defaultExpandToolcalls

@@ -210,7 +210,9 @@ export class WatchdogManager {
     if (!lastActivity) return;
 
     const inactiveFor = Date.now() - lastActivity;
-    if (inactiveFor >= 45000) { // 45s theo yêu cầu mới
+    const configuredTimeoutSec = Number(storage.getSetting('watchdogStreamTimeoutSec', 45)) || 45;
+    const thresholdMs = Math.max(5000, configuredTimeoutSec * 1000);
+    if (inactiveFor >= thresholdMs) {
       // Check if we already sent a reminder recently (avoid spam)
       const lastReminder = this.getLastReminderTime(agent.id, 'stream');
       if (!lastReminder || (Date.now() - lastReminder) > 60000) { // 1min cooldown

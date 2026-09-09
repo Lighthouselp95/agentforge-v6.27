@@ -79,6 +79,21 @@ export class SmartRuleRegistry {
     return defaultRule?.timeoutSec ?? 30;
   }
 
+  public setPromptTemplate(template: string) {
+    const defaultRule = this.rules.get('inactivity-clarify') as any;
+    if (defaultRule && typeof defaultRule.setPromptTemplate === 'function') {
+      defaultRule.setPromptTemplate(template);
+      try {
+        localStorage.setItem('agentforge_smart_clarify_template', template);
+      } catch {}
+    }
+  }
+
+  public getPromptTemplate(): string {
+    const defaultRule = this.rules.get('inactivity-clarify') as any;
+    return defaultRule?.promptTemplate || 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.';
+  }
+
   public recordMessageActivity() {
     this.lastUserSendTimestamp = Date.now();
   }

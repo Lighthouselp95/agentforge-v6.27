@@ -588,7 +588,7 @@ export class ACPClient {
       }
     }
 
-    const reminder = `\n\n=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> or [TO: <target-id>] <message> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />`;
+    const reminder = `\n\n=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> or [TO: <target-id>] <message> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />\n(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)`;
     const combinedBody = messages.join('\n\n---\n\n');
     return `${contextPrefix ? contextPrefix + '\n\n' : ''}${header}\n${combinedBody}${reminder}`;
   }
