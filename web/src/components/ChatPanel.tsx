@@ -2,6 +2,7 @@
 import { UnifiedDirectiveCard } from './chat/UnifiedDirectiveCard';
 import { MarkdownRenderer, renderInlineMarkdown, splitMarkdownSections } from './chat/MarkdownRenderer';
 import { CodeBlock, clampToolLines } from './chat/CodeBlock';
+import { highlight, isSupportedLang } from '../utils/highlight';
 import {
   extractAllDirectivesAndText,
   parseXmlAttributes,
@@ -9,6 +10,8 @@ import {
   splitReportAndConversation,
   DirectiveItem
 } from '../utils/directiveParser';
+
+const MAX_TOOL_LINES = 90;
 
 interface Message {
   id: string;
@@ -139,6 +142,12 @@ function stripTalkTags(text: string): string {
   for (let i = 0; i < codeBlocks.length; i++) out = out.replace(`__AF_CODE_BLOCK_${i}__`, codeBlocks[i]);
 
   return out.replace(/^\s+/, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Strip prefix trích dẫn copy Markdown (> 🕒 [hh:mm:ss] **You**:\n\n) khi so sánh nội dung hoặc hiển thị
+function stripCopyQuoteHeader(text: string): string {
+  if (!text) return '';
+  return String(text).replace(/^>\s*(?:🕒\s*)?\[\d{1,2}:\d{2}(?::\d{2})?\]\s*(?:\*\*[^*]+\*\*|__[^_]+__|[^\n:]+):\s*\n*/iu, '').trim();
 }
 
 function formatTimestamp(timestamp?: number | string): string {
@@ -748,156 +757,84 @@ function BashCommandViewer({ input, output }: { input?: string; output?: string 
   // USER: giới hạn tối đa 90 dòng hiển thị (cắt output trước khi render ANSI)
   const outText = clampToolLines(rawOutText).text;
 
-  return (
-    <div
-      className="af-toolblock"
-      style={{
-      display: 'block',
+  return outText ? (
+    <div style={{
+      maxHeight: 600,
+      overflowY: 'auto',
+      overflowX: 'auto',
       width: '100%',
+      maxWidth: '100%',
       boxSizing: 'border-box',
-      borderRadius: 10,
-      border: '1px solid var(--toolblock-border, var(--af-border))',
-      background: 'var(--toolblock-bg, var(--bg-card))',
-      boxShadow: 'var(--toolblock-shadow, 0 4px 20px rgba(0, 0, 0, 0.35))',
-      overflow: 'hidden',
-      marginBottom: 6
+      background: 'var(--toolblock-code-bg, var(--bg-inset))',
+      padding: '8px 12px',
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
+      fontSize: 11.5,
+      fontWeight: 500,
+      lineHeight: 1.48,
+      letterSpacing: '0.2px',
+      WebkitFontSmoothing: 'antialiased',
+      color: 'var(--text-primary)'
     }}>
-      {/* Header Prompt bar */}
-      <div style={{
-        padding: '5px 9px',
-        background: 'var(--toolblock-head-bg, var(--bg-input))',
-        borderBottom: '1px solid var(--toolblock-head-border, var(--af-border))',
-        color: '#4ade80',
-        fontWeight: 600,
-        fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
-        fontSize: 11.5,
-        wordBreak: 'break-all'
-      }}>
-        <span style={{ color: '#4ade80', fontWeight: 600, fontSize: 11 }}>$</span> <span style={{ color: 'var(--text-primary)', fontWeight: 500, fontSize: 11.5 }}>{command}</span>
-      </div>
-      {/* Output: giữ màu ANSI trên nền tối sâu, scroll tối đa 600px */}
-      {outText && (
-        <div style={{
-          maxHeight: 600,
-          overflowY: 'auto',
-          overflowX: 'auto',
-          width: '100%',
-          maxWidth: '100%',
-          boxSizing: 'border-box',
-          background: 'var(--toolblock-code-bg, var(--bg-inset))',
-          padding: '8px 12px',
-          fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
-          fontSize: 11.5,
-          fontWeight: 500,
-          lineHeight: 1.48,
-          letterSpacing: '0.2px',
-          WebkitFontSmoothing: 'antialiased',
-          color: 'var(--text-primary)'
-        }}>
-          <AnsiRenderer text={outText} />
-        </div>
-      )}
+      <AnsiRenderer text={outText} />
     </div>
-  );
+  ) : null;
 }
 
 // ============ SEARCH COMMAND VIEWER (glob / grep / searcher) ============
-// GitHub-style: header 🔍 TOOL pattern + danh sách kết quả tách số dòng/nội dung gọn gàng.
+// GitHub-style: danh sách kết quả tách số dòng/nội dung gọn gàng.
 function SearchCommandViewer({ tool, input, output }: { tool: string; input?: string; output?: string }) {
   const rawInp = typeof input === 'string' ? stripAnsi(input) : '';
   const rawOut = typeof output === 'string' ? output : '';
-
-  // Parse pattern / path / include từ input JSON (hoặc chuỗi trần làm pattern)
-  let pattern = '', sPath = '', include = '';
-  const obj = parseToolInputObject(rawInp);
-  if (obj) {
-    if (typeof obj.pattern === 'string') pattern = obj.pattern;
-    else if (typeof obj.query === 'string') pattern = obj.query;
-    if (typeof obj.path === 'string') sPath = obj.path;
-    if (typeof obj.include === 'string') include = obj.include;
-  }
-  if (!pattern && rawInp.trim()) pattern = rawInp.trim();
 
   const allRows = rawOut.split(/\r?\n/)
     .map(l => l.replace(ANSI_NOISE_RE, '').replace(/[\u001b\u009b]/g, ''))
     .filter(l => l.trim() !== '');
   // USER: giới hạn tối đa 90 dòng hiển thị kết quả tìm kiếm
   const rows = allRows.slice(0, MAX_TOOL_LINES);
-  const rowCut = allRows.length - rows.length;
 
   return (
-    <div
-      className="af-toolblock"
-      style={{
-      display: 'block',
+    <div style={{
+      maxHeight: 600,
+      overflowY: 'auto',
+      overflowX: 'auto',
       width: '100%',
       maxWidth: '100%',
       boxSizing: 'border-box',
-      borderRadius: 10,
-      border: '1px solid var(--toolblock-border, var(--af-border))',
-      background: 'var(--toolblock-bg, var(--bg-card))',
-      boxShadow: 'var(--toolblock-shadow, 0 4px 20px rgba(0, 0, 0, 0.35))',
-      overflowX: 'auto',
-      overflowY: 'hidden',
-      marginBottom: 6
+      background: 'var(--toolblock-code-bg, var(--bg-inset))',
+      padding: '6px 4px'
     }}>
-      {/* Header: 🔍 TOOL pattern: "..." in path */}
-      <div style={{
-        padding: '5px 9px',
-        background: 'var(--toolblock-head-bg, var(--bg-input))',
-        borderBottom: '1px solid var(--toolblock-head-border, var(--af-border))',
-        color: 'var(--text-primary)',
-        fontWeight: 600,
-        fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
-        fontSize: 11.5,
-        wordBreak: 'break-all'
-      }}>
-        <span style={{ color: '#22d3ee', fontWeight: 600, fontSize: 11 }}>🔍 {String(tool).toUpperCase()}</span> <span style={{ color: 'var(--text-primary)', fontWeight: 500, fontSize: 11.5 }}>{pattern ? ` pattern: "${pattern}"` : ''}{sPath ? ` in ${sPath}` : ''}{include ? ` · ${include}` : ''}{rowCut > 0 ? ` · (${rowCut} dòng bị cắt, tổng ${allRows.length})` : ''}</span>
-      </div>
-      {/* Danh sách kết quả — scroll 600px */}
-      <div style={{
-        maxHeight: 600,
-        overflowY: 'auto',
-        overflowX: 'auto',
-        width: '100%',
-        maxWidth: '100%',
-        boxSizing: 'border-box',
-        background: 'var(--toolblock-code-bg, var(--bg-inset))',
-        padding: '6px 4px'
-      }}>
-        {rows.length === 0 ? (
-          <div style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 11.5, color: 'var(--text-muted)' }}>(no results)</div>
-        ) : rows.map((l, i) => {
-          // grep -n style: "path/file.tsx:580:nội dung"
-          const fm = l.match(/^([^\s:]+\.[A-Za-z0-9]{1,6}):(\d+):(.*)$/);
-          if (fm) {
-            return (
-              <div key={i} style={{ display:'flex', gap:8, padding:'2px 8px', fontFamily:"'JetBrains Mono', monospace", fontSize:11.5, fontWeight:500, lineHeight:1.48 }}>
-                <span style={{ color:'#38bdf8', flexShrink:0 }}>📄 {fm[1]}</span>
-                <span style={{ color:'var(--text-muted)', flexShrink:0, minWidth:44, textAlign:'right' }}>{fm[2]}</span>
-                <span style={{ color:'var(--text-primary)', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{fm[3]}</span>
-              </div>
-            );
-          }
-          // dòng có số thứ tự: "Line 580:" hoặc "580:"
-          const lm = l.match(/^(?:Line\s*)?(\d+)\s*[:：]\s*([\s\S]*)$/i);
-          if (lm) {
-            return (
-              <div key={i} style={{ display:'flex', gap:8, padding:'2px 8px', fontFamily:"'JetBrains Mono', monospace", fontSize:11.5, fontWeight:500, lineHeight:1.48 }}>
-                <span style={{ color:'var(--text-muted)', flexShrink:0, minWidth:36, textAlign:'right' }}>{lm[1]}</span>
-                <span style={{ color:'var(--text-primary)', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{lm[2]}</span>
-              </div>
-            );
-          }
-          // đường dẫn file / thư mục trần
-          const isFile = /\.[A-Za-z0-9]{1,6}$/.test(l.trim()) && !l.includes(' ');
+      {rows.length === 0 ? (
+        <div style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 11.5, color: 'var(--text-muted)' }}>(no results)</div>
+      ) : rows.map((l, i) => {
+        // grep -n style: "path/file.tsx:580:nội dung"
+        const fm = l.match(/^([^\s:]+\.[A-Za-z0-9]{1,6}):(\d+):(.*)$/);
+        if (fm) {
           return (
-            <div key={i} style={{ padding:'2px 8px', fontFamily:"'JetBrains Mono', monospace", fontSize:11.5, fontWeight:500, lineHeight:1.48, color:'var(--text-primary)' }}>
-              {isFile ? `📄 ${l.trim()}` : (/\.[A-Za-z0-9]{1,6}/.test(l) || l.includes('/') || l.includes('\\') ? `📁 ${l.trim()}` : l)}
+            <div key={i} style={{ display:'flex', gap:8, padding:'2px 8px', fontFamily:"'JetBrains Mono', monospace", fontSize:11.5, fontWeight:500, lineHeight:1.48 }}>
+              <span style={{ color:'#38bdf8', flexShrink:0 }}>📄 {fm[1]}</span>
+              <span style={{ color:'var(--text-muted)', flexShrink:0, minWidth:44, textAlign:'right' }}>{fm[2]}</span>
+              <span style={{ color:'var(--text-primary)', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{fm[3]}</span>
             </div>
           );
-        })}
-      </div>
+        }
+        // dòng có số thứ tự: "Line 580:" hoặc "580:"
+        const lm = l.match(/^(?:Line\s*)?(\d+)\s*[:：]\s*([\s\S]*)$/i);
+        if (lm) {
+          return (
+            <div key={i} style={{ display:'flex', gap:8, padding:'2px 8px', fontFamily:"'JetBrains Mono', monospace", fontSize:11.5, fontWeight:500, lineHeight:1.48 }}>
+              <span style={{ color:'var(--text-muted)', flexShrink:0, minWidth:36, textAlign:'right' }}>{lm[1]}</span>
+              <span style={{ color:'var(--text-primary)', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{lm[2]}</span>
+            </div>
+          );
+        }
+        // đường dẫn file / thư mục trần
+        const isFile = /\.[A-Za-z0-9]{1,6}$/.test(l.trim()) && !l.includes(' ');
+        return (
+          <div key={i} style={{ padding:'2px 8px', fontFamily:"'JetBrains Mono', monospace", fontSize:11.5, fontWeight:500, lineHeight:1.48, color:'var(--text-primary)' }}>
+            {isFile ? `📄 ${l.trim()}` : (/\.[A-Za-z0-9]{1,6}/.test(l) || l.includes('/') || l.includes('\\') ? `📁 ${l.trim()}` : l)}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1303,13 +1240,9 @@ function ToolCallBlock({ tool, input, output, isMobile, defaultExpanded = false 
   // Mặc định COLLAPSED (thu gọn, hiện hint click để mở) — user bấm/click header để mở rộng.
   // Nếu setting "Expand Toolcalls by default" bật → khởi tạo expanded=true để mở sẵn.
   const [expanded, setExpanded] = useState(defaultExpanded);
-  // Sync khi prop defaultExpanded thay đổi (setting UI toggle) — tránh trạng thái sticky cũ
-  const prevDefaultExpandedRef = useRef(defaultExpanded);
+  // Sync khi prop defaultExpanded thay đổi (setting UI toggle) — lập tức cập nhật state
   useEffect(() => {
-    if (prevDefaultExpandedRef.current !== defaultExpanded) {
-      prevDefaultExpandedRef.current = defaultExpanded;
-      setExpanded(defaultExpanded);
-    }
+    setExpanded(defaultExpanded);
   }, [defaultExpanded]);
   const [copied, setCopied] = useState(false);
 
@@ -1520,9 +1453,13 @@ function ToolCallBlock({ tool, input, output, isMobile, defaultExpanded = false 
 
 // ============ THINKING BLOCK ============
 // Hiển thị suy luận nội tại của model, kiểu coding-agent: block mềm, nền nhẹ, tối giản.
-// Mặc định thu gọn thành 1 dòng có nhãn rõ ràng + nút mở rộng. Chữ đọc rõ, tương phản tốt.
-function ThinkingBlock({ thinking }: { thinking: string }) {
-  const [expanded, setExpanded] = useState(false);
+// Tuân theo setting expandThinking (mặc định thu gọn), tạm thời dừng tự động bung khi streaming.
+function ThinkingBlock({ thinking, isStreaming, defaultExpanded = false }: { thinking: string; isStreaming?: boolean; defaultExpanded?: boolean }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  useEffect(() => {
+    setExpanded(defaultExpanded);
+  }, [defaultExpanded]);
 
   // Preview: trích 1 dòng gọn đầu tiên, cắt tại 500 ký tự
   const preview = thinking.split('\n').map(l => l.trim()).filter(Boolean)[0] || thinking.slice(0, 500);
@@ -1530,7 +1467,7 @@ function ThinkingBlock({ thinking }: { thinking: string }) {
   return (
     <div
       className="af-thinking"
-      onClick={() => setExpanded(e => !e)}
+      onClick={() => setExpanded(!expanded)}
       style={{
         display: 'block',
         width: '100%',
@@ -1568,7 +1505,7 @@ function ThinkingBlock({ thinking }: { thinking: string }) {
           letterSpacing: '0.02em'
         }}>
           <span style={{ fontSize: 11, opacity: 0.8 }}>🧠</span>
-          {expanded ? 'Thinking' : 'Đã suy nghĩ'}
+          {isStreaming ? 'Đang suy nghĩ...' : (expanded ? 'Thinking' : 'Đã suy nghĩ')}
         </span>
         <span style={{
           fontSize: 10,
@@ -1671,13 +1608,15 @@ interface MessageItemProps {
   isMobile?: boolean;
   showToolBlocks?: boolean;
   defaultExpandToolcalls?: boolean;
+  expandDirectives?: boolean;
+  expandThinking?: boolean;
   selectedAgentId?: string | null;
   queuedMessages?: ChatMsg[];
   onForceSendSingle?: (msgId: string, content: string, targetId: string) => void;
   allMessagesList?: any[];
 }
 
-const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, onToggleReport, isMobile = false, showToolBlocks = true, defaultExpandToolcalls = false, selectedAgentId = null, queuedMessages = [], onForceSendSingle, allMessagesList = [] }: MessageItemProps) {
+const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, onToggleReport, isMobile = false, showToolBlocks = true, defaultExpandToolcalls = false, expandDirectives = false, expandThinking = false, selectedAgentId = null, queuedMessages = [], onForceSendSingle, allMessagesList = [] }: MessageItemProps) {
   const srcAgent = agents.find(a => a.id === msg.from || a.name === msg.from);
   let targetAgent = agents.find(a => a.id === msg.to || a.name === msg.to);
   const isUser = msg.from === 'user' || msg.role === 'user';
@@ -1708,12 +1647,17 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
     : (isOrchestrator || msg.from === 'orchestrator');
 
   // FIX 2: Bóc tách danh sách các directives trong content và kiểm tra trùng lặp từng directive
+  // Tin nhắn từ User hoặc tin nhắn thông thường không chứa thẻ điều phối (<talk>, <spawn>, <report>)
+  // thì KHÔNG bóc tách directives, tránh việc bọc text vào activeDirectives gây xung đột hiển thị với bubble text chuẩn.
   const contentDirectives = useMemo(() => {
     if (msg.msgType === 'talk') return [];
     if (typeof msg.content !== 'string') return [];
+    if (isUser) return []; // User message luôn là plain text bubble, không kích hoạt directive container
+    const hasAnyDirectiveTag = /(?:<|\b\[)\s*(?:talk|spawn|report)\b/i.test(msg.content);
+    if (!hasAnyDirectiveTag) return []; // Không chứa tag directive thì không bóc tách
     const all = extractAllDirectivesAndText(msg.content);
     return all;
-  }, [msg.msgType, msg.content]);
+  }, [msg.msgType, msg.content, isUser]);
 
   // FIX: Kích hoạt Dedup Directives
   // Nếu một directive (Talk/Spawn) đã được phát thành tin nhắn độc lập trong hội thoại (hoặc đã được hiển thị ngoài luồng chat),
@@ -1772,8 +1716,8 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
     });
   }, [contentDirectives, duplicateDirectivesSet]);
 
-  const hasDirectiveInItems = contentDirectives.some(d => d.type === 'talk' || d.type === 'spawn');
-  const hasActiveDirectives = activeDirectives.some(d => d.type === 'talk' || d.type === 'spawn');
+  const hasDirectiveInItems = contentDirectives.some(d => d.type === 'talk' || d.type === 'spawn' || d.type === 'report');
+  const hasActiveDirectives = activeDirectives.some(d => d.type === 'talk' || d.type === 'spawn' || d.type === 'report');
   const hasDuplicateIndependentTalk = hasDirectiveInItems && !hasActiveDirectives;
 
   const isOrchestratorTask = (
@@ -2147,7 +2091,11 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   const hasToolBlocks = effectiveShowToolBlocks && Array.isArray(msg.toolCalls) && msg.toolCalls.length > 0;
   // Option C: server gửi msg.parts (text + tool xen kẽ theo đúng thứ tự emit). Nếu có → render interleaved,
   // bỏ qua Khối 2 (toolCalls block riêng) + Khối 3 (bubble text) để không in trùng.
-  const hasParts = Array.isArray((msg as any).parts) && (msg as any).parts.length > 0;
+  // Chỉ sử dụng khi thực sự có parts được emit theo dòng sự kiện tự nhiên.
+  const effectiveParts = (Array.isArray((msg as any).parts) && (msg as any).parts.length > 0)
+    ? (msg as any).parts
+    : undefined;
+  const hasParts = Array.isArray(effectiveParts) && effectiveParts.length > 0;
   // Option A: parts có chứa 1+ phần 'thinking' → thinking nằm trong mảng interleaved, render đúng vị trí.
   // Khi đó ta ẨN Khối 1 fixed-top (trùng thinking) để không in 2 lần.
   const hasThinkingInParts = hasParts && ((msg as any).parts as any[]).some((p: any) => p && p.type === 'thinking' && String(p.content || '').trim().length > 0);
@@ -2164,7 +2112,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
     return null;
   }
 
-  if (isOpenCode && isRawCommandOutput && !hasToolBlocks && (!msg.thinking || !String(msg.thinking).trim())) {
+  if (isOpenCode && isRawCommandOutput && !hasToolBlocks && (!msg.thinking || !String(msg.thinking).trim()) && !msg.isStreaming) {
     return null;
   }
 
@@ -2416,7 +2364,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           marginBottom: 4,
           userSelect: 'text'
         }}>
-          <ThinkingBlock thinking={msg.thinking} />
+          <ThinkingBlock thinking={msg.thinking} isStreaming={msg.isStreaming} defaultExpanded={expandThinking} />
         </div>
       )}
 
@@ -2462,7 +2410,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
           gap: 4,
           userSelect: 'text'
         }}>
-          {((msg as any).parts as any[]).map((part, i) => {
+          {(effectiveParts as any[]).map((part, i) => {
             if (!part) return null;
             if (part.type === 'tool') {
               if (!effectiveShowToolBlocks) return null;
@@ -2485,7 +2433,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
               if (!thinkContent) return null;
               return (
                 <div key={'pt-' + i} style={{ width: '100%', maxWidth: '100%' }}>
-                  <ThinkingBlock thinking={thinkContent} />
+                  <ThinkingBlock thinking={thinkContent} isStreaming={msg.isStreaming} defaultExpanded={expandThinking} />
                 </div>
               );
             }
@@ -2594,7 +2542,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                           textColor={textColor}
                           isAlignRight={isAlignRight}
                           isOpenCode={isOpenCode}
-                          defaultExpanded={defaultExpandToolcalls}
+                          defaultExpanded={expandDirectives}
                         />
                       );
                     }
@@ -2619,7 +2567,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                           textColor={textColor}
                           isAlignRight={isAlignRight}
                           isOpenCode={isOpenCode}
-                          defaultExpanded={defaultExpandToolcalls}
+                          defaultExpanded={expandDirectives}
                         />
                       );
                     }
@@ -2645,7 +2593,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                            textColor={textColor}
                            isAlignRight={isAlignRight}
                            isOpenCode={isOpenCode}
-                           defaultExpanded={defaultExpandToolcalls}
+                           defaultExpanded={expandDirectives}
                          />
                       );
                     }
@@ -2701,7 +2649,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
       )}
 
       {/* Khối 3: Bubble text — dạng flat stream chuyên nghiệp. Chỉ render khi có nội dung text thật */}
-      {!hasParts && ((hasBubbleContent || isOrchestratorTask) && (!isOpenCode || !isRawCommandOutput || (!hasToolBlocks && (!msg.thinking || !String(msg.thinking).trim())))) && (
+      {!hasParts && (hasBubbleContent || isOrchestratorTask) && (
         <div
           style={{
             display: 'flex',
@@ -2805,7 +2753,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                        textColor="#0f172a"
                        isAlignRight={isAlignRight}
                        isOpenCode={isOpenCode}
-                       defaultExpanded={defaultExpandToolcalls}
+                       defaultExpanded={expandDirectives}
                      />
                   );
                 }
@@ -2830,7 +2778,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                       textColor="#0f172a"
                       isAlignRight={isAlignRight}
                       isOpenCode={isOpenCode}
-                      defaultExpanded={defaultExpandToolcalls}
+                      defaultExpanded={expandDirectives}
                     />
                   );
                 }
@@ -2848,17 +2796,17 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     title={curTaskTitle || (curBody ? (curBody.split('\n')[0].substring(0, 80) + '...') : '')}
                     targetName={curTarget}
                     senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
-content={fullTalkContent}
-                      isMobile={isMobile}
-                      bubbleBg="#ffffff"
-                      bubbleBorder="1px solid #e2e8f0"
-                      bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
-                      textColor="#0f172a"
-                      isAlignRight={isAlignRight}
-                      isOpenCode={isOpenCode}
-                      defaultExpanded={defaultExpandToolcalls}
-                    />
-                  );
+                    content={fullTalkContent}
+                    isMobile={isMobile}
+                    bubbleBg="#ffffff"
+                    bubbleBorder="1px solid #e2e8f0"
+                    bubbleShadow="0 1px 3px rgba(0, 0, 0, 0.05)"
+                    textColor="#0f172a"
+                    isAlignRight={isAlignRight}
+                    isOpenCode={isOpenCode}
+                    defaultExpanded={expandDirectives}
+                  />
+                );
               })}
             </div>
           ) : isOrchestratorTask ? (
@@ -2946,7 +2894,7 @@ content={fullTalkContent}
                     textColor="#0f172a"
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
-                    defaultExpanded={defaultExpandToolcalls}
+                    defaultExpanded={expandDirectives}
                   />
                 ) : (
                   <UnifiedDirectiveCard
@@ -2962,7 +2910,7 @@ content={fullTalkContent}
                     textColor="#0f172a"
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
-                    defaultExpanded={defaultExpandToolcalls}
+                    defaultExpanded={expandDirectives}
                   />
                 )
               )}
@@ -2971,9 +2919,10 @@ content={fullTalkContent}
 
           {/* Render riêng bubble trò chuyện cho conversationText hoặc body (nếu có lời thoại) */}
           {(() => {
-            // Khi đây là tin nhắn giao việc đã có Thẻ Giao Việc (UnifiedDirectiveCard):
-            // TUYỆT ĐỐI KHÔNG vẽ thêm bong bóng text nữa nếu conversationText trùng với nội dung thẻ!
-            if (isOrchestratorTask) return null;
+            // Khi đây là tin nhắn giao việc đã có Thẻ Giao Việc (UnifiedDirectiveCard) hoặc
+            // activeDirectives đã được render ở khối trên (tránh render 2 lần cùng 1 nội dung text):
+            // TUYỆT ĐỐI KHÔNG vẽ thêm bong bóng text nữa!
+            if (isOrchestratorTask || activeDirectives.length > 0) return null;
 
             const rawDisplayText = conversationText || body;
             const cleanDisplayText = stripSystemTaskTags(rawDisplayText).trim();
@@ -3050,6 +2999,7 @@ interface Props {
   onClear?: () => void;
   loading?: boolean;
   title?: string;
+  sessionTitle?: string;
   selectedAgentId?: string | null;
   tokenUsage?: number | TokenUsageDetail;
   contextLength?: number;
@@ -3065,6 +3015,8 @@ interface Props {
   uptimeText?: string;
   showToolBlocks?: boolean;
   defaultExpandToolcalls?: boolean;
+  expandDirectives?: boolean;
+  expandThinking?: boolean;
   queuedMessages?: ChatMsg[];
   onFlushQueue?: () => void;
   onClearQueue?: () => void;
@@ -3240,6 +3192,7 @@ export function ChatPanel({
   onClear,
   loading,
   title,
+  sessionTitle,
   selectedAgentId,
   tokenUsage,
   contextLength,
@@ -3259,7 +3212,9 @@ export function ChatPanel({
   offlineForText,
   uptimeText,
   showToolBlocks = true,
-  defaultExpandToolcalls = false
+  defaultExpandToolcalls = false,
+  expandDirectives = false,
+  expandThinking = false
 }: Props) {
   const [collapsedReports, setCollapsedReports] = useState<Record<string, boolean>>({});
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -3309,18 +3264,23 @@ export function ChatPanel({
       const mId = m.id ? String(m.id) : '';
       if (mId && seenIds.has(mId)) continue;
 
-      const cleanCur = (m.content || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
+      const cleanCur = stripCopyQuoteHeader(m.content || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
       const mTime = Number(m.timestamp) || 0;
 
       // 1. Tránh lặp tin nhắn user (optimistic temp-id vs server canonical id, hoặc lệch to: orchestrator vs UUID)
-      if (m.from === 'user') {
+      if (m.from === 'user' || m.role === 'user') {
         const isContentDup = deduped.some(prev => {
-          if (prev.from !== 'user') return false;
-          const cleanPrev = (prev.content || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
+          if (prev.from !== 'user' && prev.role !== 'user') return false;
+          const cleanPrev = stripCopyQuoteHeader(prev.content || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
           if (!cleanCur || !cleanPrev || cleanCur !== cleanPrev) return false;
-          // Nếu cả 2 tin nhắn đều có timestamp và cách nhau > 5 phút thì coi là 2 lần nhập khác nhau
+          // Nếu cùng ID hoặc 1 trong 2 là temp-id thì luôn coi là trùng (optimistic vs confirmed)
+          const pId = prev.id ? String(prev.id) : '';
+          if (mId && pId && (mId === pId || mId.startsWith('temp-') || pId.startsWith('temp-'))) {
+            return true;
+          }
+          // Nếu cả 2 tin nhắn đều có timestamp và cách nhau > 2 phút thì coi là 2 lần nhập khác nhau
           const prevTime = Number(prev.timestamp) || 0;
-          if (mTime && prevTime && Math.abs(prevTime - mTime) > 300000) return false;
+          if (mTime && prevTime && Math.abs(prevTime - mTime) > 120000) return false;
           return true;
         });
         if (isContentDup) continue;
@@ -3539,10 +3499,28 @@ export function ChatPanel({
                 letterSpacing: '-0.01em',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap'
-              }}>
+                whiteSpace: 'nowrap',
+                maxWidth: 180
+              }} title={title || 'Orchestrator'}>
                 {title || 'Orchestrator'}
               </span>
+
+              {/* Session Title (nếu có) */}
+              {sessionTitle && sessionTitle !== title && (
+                <span style={{
+                  fontSize: 12,
+                  color: 'var(--text-muted)',
+                  fontWeight: 500,
+                  maxWidth: 260,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  borderLeft: '1px solid var(--af-border)',
+                  paddingLeft: 6
+                }} title={sessionTitle}>
+                  {sessionTitle}
+                </span>
+              )}
 
               {/* Status Badge */}
               {status && (
@@ -3753,7 +3731,7 @@ export function ChatPanel({
             {(() => {
               // BỘ LỌC DEDUP RENDER CUỐI CÙNG (FINAL RENDER PASS DEDUP):
               const deduplicatedMessages = visibleMessages.filter((msg: any, idx: number) => {
-                const cleanCur = typeof msg.content === 'string' ? msg.content.trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ') : '';
+                const cleanCur = stripCopyQuoteHeader(typeof msg.content === 'string' ? msg.content : '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
                 const curTime = msg.timestamp ? new Date(msg.timestamp).getTime() : 0;
 
                 const isUserMsg = msg.from === 'user' || msg.role === 'user';
@@ -3762,13 +3740,21 @@ export function ChatPanel({
 
                 // 1. Dedup user/system toàn mảng (không chỉ adjacent)
                 if (isUserMsg || isSystemMsg) {
+                  const mId = msg.id ? String(msg.id) : '';
                   const hasDup = visibleMessages.some((prev: any, pIdx: number) => {
                     if (pIdx >= idx) return false;
-                    if (prev.from !== msg.from) return false;
-                    const cleanPrev = typeof prev.content === 'string' ? prev.content.trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ') : '';
+                    const prevIsUser = prev.from === 'user' || prev.role === 'user';
+                    const prevIsSystem = prev.from === 'system';
+                    if (isUserMsg && !prevIsUser) return false;
+                    if (isSystemMsg && !prevIsSystem) return false;
+                    const cleanPrev = stripCopyQuoteHeader(typeof prev.content === 'string' ? prev.content : '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
                     if (!cleanCur || !cleanPrev || cleanCur !== cleanPrev) return false;
+                    const pId = prev.id ? String(prev.id) : '';
+                    if (mId && pId && (mId === pId || mId.startsWith('temp-') || pId.startsWith('temp-'))) {
+                      return true;
+                    }
                     const prevTime = prev.timestamp ? new Date(prev.timestamp).getTime() : 0;
-                    if (curTime && prevTime && Math.abs(curTime - prevTime) > 300000) return false;
+                    if (curTime && prevTime && Math.abs(curTime - prevTime) > 120000) return false;
                     return true;
                   });
                   if (hasDup) return false;
@@ -3796,6 +3782,8 @@ export function ChatPanel({
                   isMobile={isMobile}
                   showToolBlocks={showToolBlocks}
                   defaultExpandToolcalls={defaultExpandToolcalls}
+                  expandDirectives={expandDirectives}
+                  expandThinking={expandThinking}
                   selectedAgentId={selectedAgentId}
                   queuedMessages={queuedMessages}
                   onForceSendSingle={onForceSendSingle}
@@ -3806,26 +3794,68 @@ export function ChatPanel({
           </>
         )}
 
-        {loading && (
-          <div className="fade-in" style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 10,
-            color: '#93c5fd',
-            fontSize: 12,
-            marginTop: 4,
-            padding: '8px 16px',
-            background: 'rgba(30, 41, 59, 0.8)',
-            border: '1px solid rgba(59, 130, 246, 0.3)',
-            borderRadius: 9999,
-            width: 'fit-content',
-            boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
-            backdropFilter: 'blur(8px)'
-          }}>
-            <span className="spin-icon">⏳</span>
-            <span style={{ fontWeight: 500 }}>Agent is thinking and processing...</span>
-          </div>
-        )}
+        {loading && (() => {
+          // Tính toán trạng thái 4 mức dựa trên tin nhắn stream hiện tại của target:
+          // 1. executing (Chạy công cụ): tool call đang chạy / chưa có output
+          // 2. streaming (Đang trả lời): đã có token text đầu tiên và đang sinh câu trả lời
+          // 3. thinking (Suy nghĩ): model đang reasoning (có thinking trong stream/turn hiện tại)
+          // 4. starting (Khởi động): server đã nhận lệnh, đang nạp context / spawn tiến trình
+          const activeLiveMsg = [...displayMessages].reverse().find(m => m && m.from !== 'user' && m.isStreaming);
+          let stateStage: 'starting' | 'thinking' | 'executing' | 'streaming' = 'starting';
+          let stateLabel = 'Starting process...';
+          let stateIcon = '⚡';
+          let thinkingPreview = '';
+
+          if (activeLiveMsg) {
+            const hasOngoingTool = (Array.isArray(activeLiveMsg.toolCalls) && activeLiveMsg.toolCalls.some((tc: any) => !tc.output)) ||
+              (Array.isArray((activeLiveMsg as any).parts) && (activeLiveMsg as any).parts.some((p: any) => p && p.type === 'tool' && !p.output));
+            const hasTextContent = Boolean(activeLiveMsg.content && String(activeLiveMsg.content).trim().length > 0);
+            const thinkStr = String(activeLiveMsg.thinking || '').trim();
+            const hasThinking = thinkStr.length > 0 || (Array.isArray((activeLiveMsg as any).parts) && (activeLiveMsg as any).parts.some((p: any) => p && p.type === 'thinking'));
+
+            if (hasOngoingTool) {
+              stateStage = 'executing';
+              stateIcon = '⚙️';
+              const lastTool = [...(activeLiveMsg.toolCalls || [])].reverse()[0];
+              const toolName = lastTool?.tool || 'tool';
+              stateLabel = `Executing tool: ${toolName}...`;
+            } else if (hasTextContent) {
+              stateStage = 'streaming';
+              stateIcon = '✍️';
+              stateLabel = 'Streaming response...';
+            } else if (hasThinking) {
+              stateStage = 'thinking';
+              stateIcon = '🧠';
+              const firstLine = thinkStr.split('\n').map(l => l.trim()).filter(Boolean)[0] || '';
+              thinkingPreview = firstLine.slice(0, 70);
+              stateLabel = thinkingPreview ? `Model reasoning: "${thinkingPreview}..."` : 'Model is reasoning...';
+            }
+          }
+
+          return (
+            <div className="fade-in" style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 10,
+              color: stateStage === 'executing' ? '#fde047' : (stateStage === 'streaming' ? '#86efac' : (stateStage === 'thinking' ? '#c4b5fd' : '#93c5fd')),
+              fontSize: 12,
+              marginTop: 4,
+              padding: '8px 16px',
+              background: 'rgba(30, 41, 59, 0.85)',
+              border: `1px solid ${stateStage === 'executing' ? 'rgba(234, 179, 8, 0.4)' : (stateStage === 'streaming' ? 'rgba(34, 197, 94, 0.4)' : (stateStage === 'thinking' ? 'rgba(168, 85, 247, 0.4)' : 'rgba(59, 130, 246, 0.3)'))}`,
+              borderRadius: 9999,
+              width: 'fit-content',
+              maxWidth: '85%',
+              boxShadow: '0 4px 14px rgba(0,0,0,0.3)',
+              backdropFilter: 'blur(8px)'
+            }}>
+              <span className="spin-icon">{stateIcon}</span>
+              <span style={{ fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {stateLabel}
+              </span>
+            </div>
+          );
+        })()}
 
         {/* Floating scroll-to-bottom button */}
         {showScrollBtn && (

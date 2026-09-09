@@ -1,7 +1,7 @@
 {
   "name": "agentforge-web",
   "private": true,
-  "version": "7.0.53",
+  "version": "7.0.66",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -4,6 +4,7 @@ import { ChatPanel } from './components/ChatPanel';
 import { SpawnDialog } from './components/SpawnDialog';
 import { ModelSettingsDialog } from './components/ModelSettingsDialog';
 import { TeamSettingsDialog } from './components/TeamSettingsDialog';
+import { smartRuleRegistry } from './utils/smartClarify';
 import { TabBar } from './components/TabBar';
 import { parseAgentTaskList, renderAgentTaskList, ParsedAgentTask } from './utils/taskUtils';
 
@@ -12,8 +13,12 @@ const API = window.location.port === '5173' ? '' : (window.location.origin.start
 // ============ UNIFIED DEDUP HELPERS (re-apply coder-relay v7.0.55) ============
 // Triệt tiêu duplicate user messages mọi nguồn: optimistic push, SSE echo,
 // fetchHistory, force-send. Key chuẩn hoá bằng normText (NFC + lowercase +
-// collapse whitespace) + timeBucket 30s cho temp/stream ID.
-const normText = (s: any) => (s || '').trim().toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
+// collapse whitespace, loại bỏ prefix trích dẫn copy: > 🕒 [hh:mm:ss] **You**:) + timeBucket 30s cho temp/stream ID.
+const stripCopyPrefix = (s: any) => {
+  if (!s || typeof s !== 'string') return '';
+  return s.replace(/^>\s*(?:🕒\s*)?\[\d{1,2}:\d{2}(?::\d{2})?\]\s*(?:\*\*[^*]+\*\*|__[^_]+__|[^\n:]+):\s*\n*/iu, '').trim();
+};
+const normText = (s: any) => stripCopyPrefix(s).toLowerCase().normalize('NFC').replace(/[\r\n\s]+/g, ' ');
 const timeBucket = (t: number | undefined, bucketMs = 30000) => Math.floor((Number(t) || Date.now()) / bucketMs);
 
 const getMessageKey = (msg: any) => {
@@ -38,16 +43,33 @@ const mergeMessage = (prev: any[], incoming: any): any[] => {
     return false;
   });
 
-  // 2) Nếu là tin nhắn User hoặc tin nhắn trùng nội dung + người gửi gần nhau trong 15s (đặc biệt optimistic temp-* vs canonical id)
+  // 2) Nếu là tin nhắn User hoặc tin nhắn trùng nội dung + người gửi gần nhau trong 120s (đặc biệt optimistic temp-* vs canonical id)
+  // Cũng deduplicate tin nhắn lỗi (msgType === 'error' hoặc content chứa Connection error) nếu cùng lỗi xuất hiện liên tiếp trong 30s
   if (existingIdx === -1 && incomingContent) {
     existingIdx = prev.findIndex(p => {
       if (!p) return false;
       const pFrom = p.from || 'unknown';
-      if (pFrom !== incomingFrom) return false;
       const pContent = normText(p.content);
-      if (!pContent || pContent !== incomingContent) return false;
+      if (!pContent) return false;
+
+      // Dedup lỗi (ví dụ Connection error hoặc ❌) trong vòng 30s kể cả khác id
+      const isErrorMsg = (incoming?.msgType === 'error' || p.msgType === 'error') ||
+                         incomingContent.includes('connection error') ||
+                         pContent.includes('connection error');
+      if (isErrorMsg && pContent === incomingContent) {
+        const timeDiff = Math.abs((p.timestamp || 0) - incomingTime);
+        if (timeDiff < 30000) return true;
+      }
+
+      if (pFrom !== incomingFrom) return false;
+      if (pContent !== incomingContent) return false;
+      // Nếu 1 trong 2 là temp-id và cùng nội dung, hoặc timestamp gần nhau trong 120s
+      const pId = p.id ? String(p.id) : '';
+      if (incomingId.startsWith('temp-') || pId.startsWith('temp-')) {
+        return true;
+      }
       const timeDiff = Math.abs((p.timestamp || 0) - incomingTime);
-      return timeDiff < 15000;
+      return timeDiff < 120000;
     });
   }
 
@@ -184,14 +206,29 @@ export function App() {
   });
   const [enableWatchdog, setEnableWatchdog] = useState(true);
   const [autoContinue, setAutoContinue] = useState(false);
-  const [collapseToolCalls, setCollapseToolCalls] = useState(() => {
+  const [expandOpenCodeTools, setExpandOpenCodeTools] = useState(() => {
     try {
-      const stored = localStorage.getItem('af-collapseToolCalls');
+      const stored = localStorage.getItem('af-expandOpenCodeTools');
+      if (stored !== null) return stored === 'true';
+      // fallback migrate từ af-collapseToolCalls cũ nếu có
+      const oldCollapse = localStorage.getItem('af-collapseToolCalls');
+      return oldCollapse !== null ? oldCollapse !== 'true' : false;
+    } catch { return false; }
+  });
+  // Setting cho directives (Talk, Spawn, Report...)
+  const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(false);
+  // Setting mở rộng Thinking Block
+  const [expandThinking, setExpandThinking] = useState(() => {
+    try {
+      return localStorage.getItem('af-expand-thinking') === 'true';
+    } catch { return false; }
+  });
+  const [smartModeEnabled, setSmartModeEnabled] = useState(() => {
+    try {
+      const stored = localStorage.getItem('af-smart-mode-master');
       return stored === 'true';
     } catch { return false; }
   });
-  // Backward compatibility: expose defaultExpandToolcalls as API value (inverse of collapseToolCalls)
-  const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(() => !collapseToolCalls);
   const wsRef = useRef<WebSocket | null>(null);
   // Bản đồ agentKey -> id tin nhắn stream đang chạy (chat:chunk / chat:tool_call)
   const streamRef = useRef<Record<string, string>>({});
@@ -227,8 +264,9 @@ export function App() {
 
   // Spinner khớp trạng thái agent đích — debounce 700ms sau khi gửi để tránh flicker
   useEffect(() => {
-    const tid = selectedAgentId || 'orchestrator';
-    const cur = agents.find(a => a.id === tid);
+    const defaultOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+    const tid = selectedAgentId || defaultOrch?.id || 'orchestrator';
+    const cur = agents.find(a => a.id === tid || (tid === 'orchestrator' && (a.type === 'orchestrator' || a.role === 'orchestrator')));
     const serverBusy = cur ? cur.status === 'working' : false;
     if (serverBusy) setLoading(true);
     else {
@@ -330,22 +368,35 @@ export function App() {
     }
   };
 
-  const toggleCollapseToolCalls = async (collapse: boolean) => {
-    setCollapseToolCalls(collapse);
-    setDefaultExpandToolcalls(!collapse);
+  const toggleExpandThinking = (expand: boolean) => {
+    setExpandThinking(expand);
     try {
-      localStorage.setItem('af-collapseToolCalls', String(collapse));
+      localStorage.setItem('af-expand-thinking', String(expand));
     } catch (e) {
-      console.error('Failed to persist collapseToolCalls setting:', e);
+      console.error('Failed to persist expandThinking setting:', e);
     }
+  };
+
+  const toggleExpandOpenCodeTools = async (expand: boolean) => {
+    setExpandOpenCodeTools(expand);
     try {
-      await fetch(`${API}/api/settings/defaultExpandToolcalls`, {
+      localStorage.setItem('af-expandOpenCodeTools', String(expand));
+    } catch (e) {
+      console.error('Failed to persist expandOpenCodeTools setting:', e);
+    }
+  };
+
+  const toggleSmartMode = async (enabled: boolean) => {
+    setSmartModeEnabled(enabled);
+    smartRuleRegistry.setMasterEnabled(enabled);
+    try {
+      await fetch(`${API}/api/settings/smartClarify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ defaultExpandToolcalls: !collapse })
+        body: JSON.stringify({ smartClarifyEnabled: enabled, smartClarifyTimeoutSec: 30 })
       });
     } catch (e) {
-      console.error('Failed to update collapse tool calls setting:', e);
+      console.error('Failed to update smart clarify setting:', e);
     }
   };
 
@@ -377,9 +428,11 @@ export function App() {
       if (!Array.isArray(data)) return;
       setAllMessages(prev => {
         if (prev.length === 0) return data.slice(-MAX_DISPLAY_MESSAGES);
-        const map = new Map<string, ChatMsg>(prev.map(m => [m.id, m]));
-        for (const m of data) if (!map.has(m.id)) map.set(m.id, m);
-        const sorted = Array.from(map.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        let merged = [...prev];
+        for (const m of data) {
+          merged = mergeMessage(merged, m);
+        }
+        const sorted = merged.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
         return sorted.slice(-MAX_DISPLAY_MESSAGES);
       });
     } catch (e) {
@@ -417,9 +470,10 @@ export function App() {
           content: '',
           timestamp: Date.now(),
           teamId: agentTeamId,
-          agentRole
+          agentRole,
+          isStreaming: true
         };
-        const mutated = mut(tempMsg);
+        const mutated = { ...mut(tempMsg), isStreaming: true };
         const hasRealContent =
           (typeof mutated.content === 'string' && mutated.content.trim().length > 0) ||
           (Array.isArray(mutated.parts) && mutated.parts.some((p: any) => p && typeof p.content === 'string' && p.content.trim().length > 0)) ||
@@ -724,6 +778,8 @@ export function App() {
           return mergeMessage(prev, m);
         });
       }
+      // Ghi nhận mốc thời gian tin nhắn mới (kể cả agent phản hồi hay user) để đồng hồ tính đúng khoảng cách
+      smartRuleRegistry.recordMessageActivity();
       // KHÔNG tắt spinner vì tin trung gian; chỉ lỗi mới tắt (spinner do agent status điều phối)
       if (m.msgType === 'error' || m.from === 'error') {
         setLoading(false);
@@ -746,12 +802,11 @@ export function App() {
 
 if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'boolean') {
        setDefaultExpandToolcalls(msg.defaultExpandToolcalls);
-       setCollapseToolCalls(!msg.defaultExpandToolcalls);
-       try {
-         localStorage.setItem('af-collapseToolCalls', String(!msg.defaultExpandToolcalls));
-       } catch (e) {
-         console.error('Failed to persist collapseToolCalls setting from server:', e);
-       }
+     }
+
+     if (msg.type === 'settings:updated' && typeof msg.smartClarifyEnabled === 'boolean') {
+       setSmartModeEnabled(msg.smartClarifyEnabled);
+       smartRuleRegistry.setMasterEnabled(msg.smartClarifyEnabled);
      }
 
     if (msg.type === 'agent:created' || msg.type === 'agent:updated' || msg.type === 'agent:deleted') {
@@ -768,7 +823,8 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
       }
       if (msg.agent) {
         const ag = msg.agent;
-        const currentTarget = selectedAgentId || 'orchestrator';
+        const defaultOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+        const currentTarget = selectedAgentId || defaultOrch?.id || 'orchestrator';
         // Khi agent đích không còn working → xoá cờ in-flight để drain tin queue kế tiếp (nếu có).
         // Điều này cho phép tuple 2+ tin tới CÙNG agent vẫn được gửi tuần tự, không bị kẹt bởi 
         // cờ in-flight còn nguyên của lần gửi trước.
@@ -799,7 +855,8 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
           });
         }
         // Sync 2 chiều: spinner BẬT khi working, TẮT khi idle/error/stopped
-        if (ag.id === currentTarget) {
+        const isTargetMatch = ag.id === currentTarget || (!selectedAgentId && (ag.type === 'orchestrator' || ag.role === 'orchestrator'));
+        if (isTargetMatch) {
           setLoading(ag.status === 'working');
         }
         // Ghi activity log cho bottom panel (giữ ~200 dòng gần nhất)
@@ -958,33 +1015,17 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     try {
       const body: any = { message: (qmsg.content || '').normalize('NFC') };
       if (targetId !== 'orchestrator') body.targetAgentId = targetId;
-      const res = await fetch(`${API}/api/chat`, {
+      await fetch(`${API}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      const data = await res.json().catch(() => null);
-      if (!data || data.error) {
-        setAllMessages(prev => mergeMessage(prev, {
-          id: `err-${Date.now()}`,
-          from: targetId,
-          to: 'user',
-          content: `❌ Error: ${data?.error || 'Phản hồi không hợp lệ từ máy chủ'}`,
-          timestamp: Date.now(),
-          msgType: 'error'
-        }));
-        setLoading(false);
-        done();
-      }
+      // Control Plane: HTTP chỉ làm nhiệm vụ trigger gửi lệnh
+      // Toàn bộ tin phản hồi, luồng stream và tin nhắn lỗi đều đi qua kênh WebSocket
+      setLoading(false);
+      done();
     } catch (e: any) {
-      setAllMessages(prev => mergeMessage(prev, {
-        id: `err-${Date.now()}`,
-        from: targetId,
-        to: 'user',
-        content: `❌ Connection error: ${e.message}`,
-        timestamp: Date.now(),
-        msgType: 'error'
-      }));
+      console.error('[sendQueuedMessage] Network error:', e);
       setLoading(false);
       done();
     }
@@ -1045,6 +1086,12 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     const targetAgentObj = agents.find(a => a.id === targetId) || (targetId === 'orchestrator' ? agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator') : undefined);
     const targetTeamId = targetAgentObj?.teamId || (targetId === 'orchestrator' ? 'default' : `team-${targetId.slice(-8)}`);
     const resolvedTargetId = targetAgentObj?.id || targetId;
+    // Xử lý qua Smart Rules Engine (Inactivity Clarify sau 30s timeout)
+    const smartProcessed = smartRuleRegistry.processMessage(trimmedText, resolvedTargetId);
+    const textToSend = smartProcessed.text;
+    // Cập nhật đồng hồ hoạt động mới nhất cho Smart Clarify
+    smartRuleRegistry.recordMessageActivity();
+
     const userMsg: ChatMsg = {
       id: tempId,
       from: 'user',
@@ -1063,7 +1110,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     setLoading(true);
 
     try {
-      const body: any = { message: text, teamId: targetTeamId, messageId: userMsg.id };
+      const body: any = { message: textToSend, teamId: targetTeamId, messageId: userMsg.id };
       if (selectedAgentId) body.targetAgentId = selectedAgentId;
 
       // 1. Phán đoán lạc quan: Nếu agent đích hiện tại đang bận (status === 'working')
@@ -1120,26 +1167,11 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         });
       }
 
-      if (!data || data.error) {
-        setAllMessages(prev => mergeMessage(prev, {
-          id: `err-${Date.now()}`,
-          from: targetId,
-          to: 'user',
-          content: `❌ Error: ${data?.error || 'Phản hồi không hợp lệ từ máy chủ'}`,
-          timestamp: Date.now(),
-          msgType: 'error'
-        }));
-        setLoading(false);
-      }
+      // Control Plane: HTTP response chỉ báo trạng thái gửi lệnh và đóng loading spinner
+      // 100% nội dung trả về, tool calls và tin nhắn lỗi thực tế sẽ được phát qua WebSocket duy nhất
+      setLoading(false);
     } catch (e: any) {
-      setAllMessages(prev => mergeMessage(prev, {
-        id: `err-${Date.now()}`,
-        from: targetId,
-        to: 'user',
-        content: `❌ Connection error: ${e.message}`,
-        timestamp: Date.now(),
-        msgType: 'error'
-      }));
+      console.error('[handleSend] Request failed:', e);
       setLoading(false);
     }
   };
@@ -1247,11 +1279,14 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         seenIds.add(m.id);
       }
       const trimmedContent = (m.content || '').trim();
-      // Tránh lặp tin nhắn giống hệt nhau cùng người gửi trong cùng timestamp / gần nhau (trong cửa sổ ngắn 5s)
+      // Tránh lặp tin nhắn giống hệt nhau cùng người gửi trong cùng timestamp / gần nhau
       if (trimmedContent && m.from) {
-        const normContent = trimmedContent.replace(/\s+/g, ' ').slice(0, 200);
-        const timeBucket = Math.floor((m.timestamp || 0) / 5000);
-        const contentKey = `${m.from}|${m.to || ''}|${normContent}|${timeBucket}`;
+        const normContent = stripCopyPrefix(trimmedContent).toLowerCase().normalize('NFC').replace(/\s+/g, ' ').slice(0, 200);
+        // Với tin nhắn của user: nếu cùng content và thời gian cách nhau < 120s thì gộp triệt để
+        const isUserMsg = m.from === 'user' || (m as any).role === 'user';
+        const bucketSize = isUserMsg ? 120000 : 5000;
+        const timeBucket = Math.floor((m.timestamp || 0) / bucketSize);
+        const contentKey = `${m.from}|${normContent}|${timeBucket}`;
         if (seenContentKeys.has(contentKey)) continue;
         seenContentKeys.add(contentKey);
       }
@@ -1273,7 +1308,8 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
             if (m.teamId && m.teamId !== orchTeamId && !isDirectedToSelected) return false;
 
             const isWorkerOpen = (m.msgType === 'opencode') && (m.from !== 'user') && (m.from !== selectedAgentId) && (m.agentRole !== 'orchestrator');
-            if (isWorkerOpen) return false;
+            // GIỮ LẠI opencode events của worker nếu chúng có toolCalls, parts hoặc thinking để hiển thị trên UI
+            if (isWorkerOpen && !((m.toolCalls && m.toolCalls.length > 0) || (m.parts && m.parts.length > 0) || m.thinking)) return false;
 
             if (m.msgType === 'opencode') {
               // Live stream từ stdio: chỉ hiển thị snapshot của CHÍNH orchestrator đang xem
@@ -1357,10 +1393,9 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         // User messages có to === 'orchestrator' hoặc to === orchId hoặc teamId === 'default' luôn hợp lệ trên main view.
         const isDirectedToMain = m.to === orchId || m.to === 'orchestrator' || m.from === orchId || m.from === 'orchestrator';
         if (m.teamId && m.teamId !== mainTeamId && !isDirectedToMain) return false;
-        // Tab Main: chỉ hiển thị snapshot 'opencode' của ROOT ORCHESTRATOR.
-        // Ẩn hoàn toàn snapshots opencode của Sub-Orchestrators và Workers (msgType 'opencode', from !== orchId && from !== 'orchestrator').
+        // Tab Main: hiển thị snapshot 'opencode' của ROOT ORCHESTRATOR, và cho phép các worker opencode event có toolCalls/thinking/parts
         const isNotRootOrch = (m.from !== orchId) && (m.from !== 'orchestrator');
-        if (m.msgType === 'opencode' && isNotRootOrch) {
+        if (m.msgType === 'opencode' && isNotRootOrch && !((m.toolCalls && m.toolCalls.length > 0) || (m.parts && m.parts.length > 0) || m.thinking)) {
           return false;
         }
         if (m.msgType === 'opencode') {
@@ -1813,7 +1848,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                 </label>
               </div>
 
-              {/* Collapse Tool Calls Toggle Switch */}
+              {/* Smart Clarify Mode Toggle Switch */}
               <div style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -1823,14 +1858,14 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                 borderRadius: 'var(--radius-md)',
                 border: '1px solid var(--af-border)'
               }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', userSelect: 'none' }} title="Tự động thu gọn các khối Tool Calls khi nhận stream mới">
-                  📦 Collapse Tool Calls
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', userSelect: 'none' }} title="Tự động yêu cầu xác minh và hỏi lại nếu người dùng không chat trong hơn 30s">
+                  💡 Smart Mode (30s)
                 </span>
                 <label style={{ position: 'relative', display: 'inline-block', width: 34, height: 18, cursor: 'pointer' }}>
                   <input
                     type="checkbox"
-                    checked={collapseToolCalls}
-                    onChange={(e) => toggleCollapseToolCalls(e.target.checked)}
+                    checked={smartModeEnabled}
+                    onChange={(e) => toggleSmartMode(e.target.checked)}
                     style={{ opacity: 0, width: 0, height: 0 }}
                   />
                   <span style={{
@@ -1839,7 +1874,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                     left: 0,
                     right: 0,
                     bottom: 0,
-                    backgroundColor: collapseToolCalls ? '#2563eb' : '#475569',
+                    backgroundColor: smartModeEnabled ? '#10b981' : '#475569',
                     borderRadius: 18,
                     transition: '0.2s'
                   }}>
@@ -1848,7 +1883,97 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                       content: '""',
                       height: 14,
                       width: 14,
-                      left: collapseToolCalls ? 17 : 2,
+                      left: smartModeEnabled ? 17 : 2,
+                      bottom: 2,
+                      backgroundColor: 'white',
+                      borderRadius: '50%',
+                      transition: '0.2s'
+                    }} />
+                  </span>
+                </label>
+              </div>
+
+              {/* Expand Tool Calls Toggle Switch */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '8px 12px',
+                background: 'var(--bg-inset)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--af-border)'
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', userSelect: 'none' }} title="Tự động mở rộng các khối công cụ OpenCode (read, glob, grep, edit, bash...)">
+                  📦 Expand Tool Calls (OpenCode)
+                </span>
+                <label style={{ position: 'relative', display: 'inline-block', width: 34, height: 18, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={expandOpenCodeTools}
+                    onChange={(e) => toggleExpandOpenCodeTools(e.target.checked)}
+                    style={{ opacity: 0, width: 0, height: 0 }}
+                  />
+                  <span style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: expandOpenCodeTools ? '#2563eb' : '#475569',
+                    borderRadius: 18,
+                    transition: '0.2s'
+                  }}>
+                    <span style={{
+                      position: 'absolute',
+                      content: '""',
+                      height: 14,
+                      width: 14,
+                      left: expandOpenCodeTools ? 17 : 2,
+                      bottom: 2,
+                      backgroundColor: 'white',
+                      borderRadius: '50%',
+                      transition: '0.2s'
+                    }} />
+                  </span>
+                </label>
+              </div>
+
+              {/* Expand Thinking Block Toggle Switch */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '8px 12px',
+                background: 'var(--bg-inset)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--af-border)'
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', userSelect: 'none' }} title="Tự động mở rộng khối suy nghĩ (Thinking) của model">
+                  🧠 Expand Thinking Block
+                </span>
+                <label style={{ position: 'relative', display: 'inline-block', width: 34, height: 18, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={expandThinking}
+                    onChange={(e) => toggleExpandThinking(e.target.checked)}
+                    style={{ opacity: 0, width: 0, height: 0 }}
+                  />
+                  <span style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: expandThinking ? '#2563eb' : '#475569',
+                    borderRadius: 18,
+                    transition: '0.2s'
+                  }}>
+                    <span style={{
+                      position: 'absolute',
+                      content: '""',
+                      height: 14,
+                      width: 14,
+                      left: expandThinking ? 17 : 2,
                       bottom: 2,
                       backgroundColor: 'white',
                       borderRadius: '50%',
@@ -1990,11 +2115,14 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                 selectedAgentId={selectedAgentId}
                 title={selectedAgentId ? (() => {
                   const a = agents.find(x => x.id === selectedAgentId);
-                  return a ? `${a.name} (${a.id})${a.sessionTitle ? ` — ${a.sessionTitle}` : ''}` : 'Agent';
+                  if (!a) return 'Agent';
+                  return a.name || a.id;
                 })() : (() => {
                   const a = agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator');
-                  return a ? `${a.name || 'Orchestrator'} (${a.id})${a.sessionTitle ? ` — ${a.sessionTitle}` : ''}` : 'Chưa có Orchestrator';
+                  if (!a) return 'Chưa có Orchestrator';
+                  return a.name || 'Orchestrator';
                 })()}
+                sessionTitle={selectedAgentId ? (agents.find(x => x.id === selectedAgentId)?.sessionTitle) : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.sessionTitle)}
                 tokenUsage={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.tokenUsage : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.tokenUsage)}
                 contextLength={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.contextLength : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.contextLength)}
                 model={selectedAgentId ? agents.find(x => x.id === selectedAgentId)?.model : (agents.find(x => x.type === 'orchestrator' || x.role === 'orchestrator' || x.id === 'orchestrator')?.model)}
@@ -2007,7 +2135,9 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                 offlineForText={offlineForText}
                 uptimeText={uptimeText}
                 showToolBlocks={true}
-                defaultExpandToolcalls={defaultExpandToolcalls}
+                defaultExpandToolcalls={expandOpenCodeTools}
+                expandDirectives={defaultExpandToolcalls}
+                expandThinking={expandThinking}
                 queuedMessages={currentQueue}
                 onFlushQueue={() => handleForceSendAll(activeTargetId)}
                 onClearQueue={() => clearQueueForAgent(activeTargetId)}
@@ -2366,7 +2496,17 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         <ModelSettingsDialog
           agents={agents}
           onClose={() => setShowModelSettings(false)}
-          onSaved={fetchAgents}
+          onSaved={() => {
+            fetchAgents();
+            fetch(`${API}/api/settings/defaultExpandToolcalls`)
+              .then(r => r.ok ? r.json() : null)
+              .then(d => {
+                if (d && typeof d.defaultExpandToolcalls === 'boolean') {
+                  setDefaultExpandToolcalls(d.defaultExpandToolcalls);
+                }
+              })
+              .catch(() => {});
+          }}
         />
       )}
 

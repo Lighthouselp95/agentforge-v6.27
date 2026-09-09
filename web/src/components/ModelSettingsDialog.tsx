@@ -33,6 +33,7 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
   const [engineMode, setEngineMode] = useState<'run' | 'attach' | 'http'>('run');
   const [serveUrl, setServeUrl] = useState('http://127.0.0.1:4096');
   const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(false);
+  const [smartClarifyEnabled, setSmartClarifyEnabled] = useState(true);
   const [models, setModels] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem('af-models-cache');
@@ -94,11 +95,16 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           .then(r => r.ok ? r.json() : null)
           .catch(() => null);
 
-        const [modelsData, settingsData, engineData, expandData] = await Promise.all([
+        const fetchSmartPromise = fetch(`${API}/api/settings/smartClarify`)
+          .then(r => r.ok ? r.json() : null)
+          .catch(() => null);
+
+        const [modelsData, settingsData, engineData, expandData, smartData] = await Promise.all([
           fetchModelsPromise,
           fetchSettingsPromise,
           fetchEnginePromise,
-          fetchExpandPromise
+          fetchExpandPromise,
+          fetchSmartPromise
         ]);
 
         if (modelsData) {
@@ -140,6 +146,10 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
 
         if (expandData) {
           setDefaultExpandToolcalls(expandData.defaultExpandToolcalls === true);
+        }
+
+        if (smartData && typeof smartData.smartClarifyEnabled === 'boolean') {
+          setSmartClarifyEnabled(smartData.smartClarifyEnabled);
         }
       } catch (e) {
         console.error('Failed to load model settings:', e);
@@ -205,6 +215,11 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ defaultExpandToolcalls })
+        }),
+        fetch(`${API}/api/settings/smartClarify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ smartClarifyEnabled, smartClarifyTimeoutSec: 30 })
         })
       ]);
 
@@ -364,27 +379,6 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
               </div>
             </div>
           )}
-        </div>
-
-        {/* 0.5. Tool Call Expansion Setting */}
-        <div style={{ background: 'var(--bg-inset)', borderRadius: 10, padding: 14, border: '1px solid var(--af-border-strong)' }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
-            🔍 Hiển thị Tool Calls (Tool Call Expansion)
-          </div>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12 }}>
-            <input
-              type="checkbox"
-              checked={defaultExpandToolcalls}
-              onChange={(e) => setDefaultExpandToolcalls(e.target.checked)}
-              style={{ cursor: 'pointer' }}
-            />
-            <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
-              Hiển thị chi tiết tool calls mặc định
-            </span>
-          </label>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-            Tự động mở rộng phần chi tiết nội dung giao việc/báo cáo của tool calls trong cửa sổ chat.
-          </div>
         </div>
 
         {loading ? (

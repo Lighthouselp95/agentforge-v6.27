@@ -48,13 +48,13 @@ export class TaskQueueManager {
   private readonly retryAttempts = new Map<string, number>();
   private readonly taskCheckTimer?: NodeJS.Timeout;
   private readonly broadcastFn: (type: string, data: any) => void;
-  private onAssignTask?: (task: SimpleTask) => void;
+  private onAssignTask?: (task: SimpleTask) => void | Promise<void>;
   private readonly retryScheduleMs: number[];
 
   constructor(
     config: TaskQueueConfig,
     broadcastFn?: (type: string, data: any) => void,
-    onAssignTask?: (task: SimpleTask) => void,
+    onAssignTask?: (task: SimpleTask) => void | Promise<void>,
     retryScheduleMs?: number[]
   ) {
     this.config = config;
@@ -71,7 +71,7 @@ export class TaskQueueManager {
   /**
    * Hook gửi tin nhắc agent thực sự (inject từ core/app để tránh circular import).
    */
-  public setOnAssignTask(fn: (task: SimpleTask) => void): void {
+  public setOnAssignTask(fn: (task: SimpleTask) => void | Promise<void>): void {
     this.onAssignTask = fn;
   }
 
@@ -147,9 +147,13 @@ export class TaskQueueManager {
     const agentId = candidate.assignedTo || 'orchestrator';
     console.log(`[TaskQueueManager] Nhắc tiếp tục task "${candidate.description}" (id=${candidate.id}) cho agent "${agentId}" sau idle ${Date.now() - this.lastIdleCheckTime}ms`);
 
-    // Broadcast sự kiện hệ thống để UI biết
+    const targetAgent = storage.getAgent(agentId);
+    const teamId = targetAgent?.teamId || 'default';
+
+    // Broadcast sự kiện hệ thống để UI biết (kèm teamId để không bị filter chặn)
     this.broadcastFn('system:auto-continue', {
       agentId,
+      teamId,
       taskId: candidate.id,
       task: candidate.description,
       assignedTo: agentId,
@@ -159,7 +163,12 @@ export class TaskQueueManager {
     // Nếu có callback onAssignTask (inject từ core/app), gọi để gửi tin thật cho agent
     if (this.onAssignTask) {
       try {
-        this.onAssignTask(candidate);
+        const result = this.onAssignTask(candidate);
+        if (result && typeof (result as any).catch === 'function') {
+          (result as any).catch((e: any) => {
+            console.warn(`[TaskQueueManager] onAssignTask async promise failed cho ${agentId}:`, e);
+          });
+        }
       } catch (e) {
         console.warn(`[TaskQueueManager] onAssignTask failed cho ${agentId}:`, e);
       }
@@ -199,16 +208,27 @@ export class TaskQueueManager {
         const nextAttempt = (this.retryAttempts.get(agentId) || 0) + 1;
         this.retryAttempts.set(agentId, nextAttempt);
 
+        const targetAgent = storage.getAgent(agentId);
+        const teamId = targetAgent?.teamId || 'default';
+
         console.log(`[TaskQueueManager] Retry ${nextAttempt} — vẫn idle, nhắc lại task "${task.description}" cho ${agentId} (delay ${delay}ms)`);
         this.broadcastFn('system:auto-continue', {
           agentId,
+          teamId,
           taskId: task.id,
           task: task.description,
           assignedTo: agentId,
           attempt: nextAttempt
         });
         if (this.onAssignTask) {
-          try { this.onAssignTask(task); } catch (e) { console.warn(`[TaskQueueManager] onAssignTask retry failed:`, e); }
+          try {
+            const res = this.onAssignTask(task);
+            if (res && typeof (res as any).catch === 'function') {
+              (res as any).catch((e: any) => console.warn(`[TaskQueueManager] onAssignTask retry promise failed:`, e));
+            }
+          } catch (e) {
+            console.warn(`[TaskQueueManager] onAssignTask retry failed:`, e);
+          }
         }
         armNext(nextAttempt);
       }, delay);

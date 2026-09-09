@@ -471,20 +471,30 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: 6 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
                       <span style={{ fontSize: 16, flexShrink: 0 }}>{isCollapsed ? '📁' : '📂'}</span>
-                      <span className="af-card-agent-name" style={{ fontWeight: 700, fontSize: 13.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        👑 {orch.name || 'Orchestrator'}
-                      </span>
-                      <span style={{
-                        fontSize: 10.5,
-                        color: 'var(--text-muted)',
-                        background: 'rgba(148, 163, 184, 0.12)',
-                        padding: '1px 5px',
-                        borderRadius: 4,
-                        fontWeight: 600,
-                        flexShrink: 0
-                      }}>
-                        ({childWorkers.length})
-                      </span>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, overflow: 'hidden' }}>
+                          <span className="af-card-agent-name" style={{ fontWeight: 700, fontSize: 13.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={orch.task || orch.name || 'Orchestrator'}>
+                            👑 {orch.task || orch.name || 'Orchestrator'}
+                          </span>
+                          <span style={{
+                            fontSize: 10.5,
+                            color: 'var(--text-muted)',
+                            background: 'rgba(148, 163, 184, 0.12)',
+                            padding: '1px 5px',
+                            borderRadius: 4,
+                            fontWeight: 600,
+                            flexShrink: 0
+                          }}>
+                            ({childWorkers.length})
+                          </span>
+                        </div>
+                        {/* Hiển thị rõ agent.name nếu đang hiển thị task ở dòng 1 */}
+                        {orch.task && orch.name && orch.task !== orch.name && (
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 }} title={orch.name}>
+                            👤 {orch.name}
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
@@ -744,7 +754,9 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                                   alignItems: 'center',
                                   gap: 6
                                 }}>
-                                  <span className="af-card-agent-name" style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{agent.name}</span>
+                                  <span className="af-card-agent-name" style={{ fontWeight: 700, color: 'var(--text-primary)' }} title={agent.task || agent.name}>
+                                    {agent.task || agent.name}
+                                  </span>
                                   <span
                                     style={{
                                       fontSize: 11,
@@ -782,6 +794,12 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                                   <span style={{ fontSize: 11, color: 'var(--wb-muted)', fontFamily: 'monospace' }}>
                                     {agent.id}
                                   </span>
+                                  {/* Hiển thị tên agent.name nếu dòng 1 đang hiển thị task */}
+                                  {agent.task && agent.name && agent.task !== agent.name && (
+                                    <span style={{ fontSize: 11, color: '#38bdf8', fontWeight: 600 }} title={agent.name}>
+                                      · {agent.name}
+                                    </span>
+                                  )}
                                 </div>
                               </div>
                             </div>
@@ -1038,8 +1056,8 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', gap: 6 }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
                               <span style={{ fontSize: 16, flexShrink: 0 }}>{roleIcon}</span>
-                              <span className="af-card-agent-name" style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {agent.name || agent.role}
+                              <span className="af-card-agent-name" style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={agent.task || agent.name || agent.role}>
+                                {agent.task || agent.name || agent.role}
                               </span>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
@@ -1070,8 +1088,15 @@ export function Dashboard({ agents, onStart, onSpawn, onSelect, selectedAgentId,
                             </div>
                           </div>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 }}>
-                            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{agent.role}</span>
-                            <span style={{ fontSize: 10.5, color: 'var(--wb-info)', fontFamily: 'monospace' }}>⚡ {agentTokens}</span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, overflow: 'hidden' }}>
+                              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{agent.role}</span>
+                              {agent.task && agent.name && agent.task !== agent.name && (
+                                <span style={{ fontSize: 11, color: '#38bdf8', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={agent.name}>
+                                  · {agent.name}
+                                </span>
+                              )}
+                            </div>
+                            <span style={{ fontSize: 10.5, color: 'var(--wb-info)', fontFamily: 'monospace', flexShrink: 0 }}>⚡ {agentTokens}</span>
                           </div>
                         </div>
                       );

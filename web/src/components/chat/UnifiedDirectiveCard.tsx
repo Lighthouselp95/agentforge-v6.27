@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
 export interface UnifiedDirectiveCardProps {
@@ -34,7 +34,15 @@ export const UnifiedDirectiveCard = React.memo(function UnifiedDirectiveCard({
   isOpenCode = false,
   defaultExpanded = false
 }: UnifiedDirectiveCardProps) {
+  // Khi có detail content: tuân theo defaultExpanded (hoặc user click)
+  // Khi KHÔNG có title: nếu defaultExpanded=false thì vẫn có thể thu gọn preview content
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
+
+  // Sync khi prop defaultExpanded thay đổi từ settings
+  useEffect(() => {
+    setIsExpanded(defaultExpanded);
+  }, [defaultExpanded]);
+
   const [copiedDirective, setCopiedDirective] = useState(false);
 
   const isSpawn = type === 'spawn';
@@ -277,23 +285,57 @@ export const UnifiedDirectiveCard = React.memo(function UnifiedDirectiveCard({
           </div>
         )}
 
-        {/* Trường hợp không có title riêng mà chỉ có content: hiển thị trực tiếp với nền trắng phẳng */}
+        {/* Trường hợp không có title riêng mà chỉ có content: nếu không mở rộng thì cho thu gọn/xem chi tiết */}
         {!title && cleanDisplayContent && (
-          <div
-            className="af-directive-expanded-content"
-            style={{
-              background: badgeTheme.contentBg,
-              color: badgeTheme.contentText,
-              padding: '10px 14px',
-              borderRadius: 6,
-              border: `1px solid ${badgeTheme.contentBorder}`,
-              boxShadow: 'none',
-              lineHeight: 1.6
-            }}
-          >
-            <div style={{ color: badgeTheme.contentText }}>
-              <MarkdownRenderer content={cleanDisplayContent} isMobile={isMobile} />
+          <div>
+            <div
+              onClick={() => setIsExpanded(!isExpanded)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '4px 8px',
+                marginBottom: isExpanded ? 4 : 0,
+                background: badgeTheme.taskBg,
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontSize: 11,
+                color: '#64748b',
+                userSelect: 'none'
+              }}
+            >
+              <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '80%' }}>
+                {isExpanded ? 'Chi tiết nội dung:' : cleanDisplayContent.slice(0, 70) + '...'}
+              </span>
+              <span style={{
+                background: '#ffffff',
+                border: '1px solid #cbd5e1',
+                padding: '1px 6px',
+                borderRadius: 4,
+                flexShrink: 0
+              }}>
+                {isExpanded ? '▲ Thu gọn' : '▼ Xem chi tiết'}
+              </span>
             </div>
+
+            {isExpanded && (
+              <div
+                className="af-directive-expanded-content"
+                style={{
+                  background: badgeTheme.contentBg,
+                  color: badgeTheme.contentText,
+                  padding: '10px 14px',
+                  borderRadius: 6,
+                  border: `1px solid ${badgeTheme.contentBorder}`,
+                  boxShadow: 'none',
+                  lineHeight: 1.6
+                }}
+              >
+                <div style={{ color: badgeTheme.contentText }}>
+                  <MarkdownRenderer content={cleanDisplayContent} isMobile={isMobile} />
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

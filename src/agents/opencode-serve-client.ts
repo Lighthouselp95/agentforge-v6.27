@@ -223,8 +223,75 @@ export class OpenCodeServeClient {
     const sid = sessionId || this.sessionId;
     if (!sid) return null;
     try {
-      const title = await this.getSessionTitle(sid);
-      return { title: title || undefined };
+      // 1. Thử lấy tin nhắn cuối cùng từ /session/:id/message để lấy token chính xác của bước/lượt gần nhất (thường là context/step tokens)
+      let lastMsgTokens: any = null;
+      try {
+        const msgsRes = await fetch(`${this.serverUrl.replace(/\/$/, '')}/session/${encodeURIComponent(sid)}/message`);
+        if (msgsRes.ok) {
+          const msgs: any = await msgsRes.json();
+          if (Array.isArray(msgs) && msgs.length > 0) {
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              const m = msgs[i];
+              if (m?.info?.tokens && typeof m.info.tokens === 'object') {
+                lastMsgTokens = m.info.tokens;
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+
+      // 2. Lấy session info
+      let found: any = null;
+      try {
+        const sessRes = await fetch(`${this.serverUrl.replace(/\/$/, '')}/session/${encodeURIComponent(sid)}`);
+        if (sessRes.ok) {
+          found = await sessRes.json();
+        }
+      } catch {}
+
+      if (!found) {
+        const sessions = await OpenCodeServeClient.getSessionsHttp(this.serverUrl);
+        found = sessions.find((s: any) => s.id === sid);
+      }
+      if (!found && !lastMsgTokens) return null;
+      const title = found?.title || found?.slug || undefined;
+
+      let tokenUsage: TokenUsage | undefined;
+      const rawCost = typeof found?.cost === 'number' ? found.cost : (typeof found?.tokens?.cost === 'number' ? found.tokens.cost : (typeof found?.usage?.cost === 'number' ? found.usage.cost : undefined));
+      const rawLimit = found?.context_length || found?.contextLength || found?.tokens?.limit || found?.usage?.contextLimit || found?.context_limit;
+
+      // Ưu tiên tokens từ lastMsgTokens nếu có (chính xác bước gần nhất của session như 97713)
+      const tokenSrc = lastMsgTokens || found?.tokens || found?.usage || found?.info?.usage || found?.data?.usage;
+      if (tokenSrc && typeof tokenSrc === 'object') {
+        const inp = tokenSrc.input_tokens || tokenSrc.prompt_tokens || tokenSrc.input || tokenSrc.prompt || 0;
+        const out = tokenSrc.output_tokens || tokenSrc.completion_tokens || tokenSrc.output || tokenSrc.completion || 0;
+        const rea = tokenSrc.reasoning_tokens || tokenSrc.thought_tokens || tokenSrc.reasoning || tokenSrc.thought || tokenSrc.completion_tokens_details?.reasoning_tokens;
+        const cr = tokenSrc.cache_read_input_tokens || tokenSrc.cached_tokens || tokenSrc.cache?.read || tokenSrc.cache_read || tokenSrc.prompt_tokens_details?.cached_tokens;
+        const cw = tokenSrc.cache_write_input_tokens || tokenSrc.cache?.write || tokenSrc.cache_write;
+        const tot = tokenSrc.total_tokens || tokenSrc.total || tokenSrc.tokens || (inp + out + (cr || 0) + (cw || 0));
+        tokenUsage = {
+          inputTokens: inp,
+          outputTokens: out,
+          reasoningTokens: rea,
+          cacheReadTokens: cr,
+          cacheWriteTokens: cw,
+          totalTokens: tot,
+          cost: rawCost,
+          contextLength: rawLimit || tot
+        };
+      } else if (typeof tokenSrc === 'number') {
+        tokenUsage = {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: tokenSrc,
+          cost: rawCost,
+          contextLength: rawLimit || tokenSrc
+        };
+      }
+
+      const contextLength = rawLimit || tokenUsage?.totalTokens || undefined;
+      return { title, tokenUsage, contextLength };
     } catch {
       return null;
     }
@@ -300,7 +367,7 @@ export class OpenCodeServeClient {
     this._aborted = true;
 
     try {
-      if (this.mode === 'http' && this.sessionId) {
+      if ((this.mode === 'http' || this.mode === 'attach') && this.sessionId) {
         OpenCodeServeClient.abortSessionHttp(this.serverUrl, this.sessionId).catch(() => {});
       }
 

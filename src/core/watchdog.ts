@@ -21,10 +21,16 @@ const getStorage = () => storage;
 // Reminder message templates
 const REMINDER_MESSAGES = {
   streamInactivity: (agentId: string, taskDescription: string) =>
-    `[WATCHDOG] Agent ${agentId} has been idle (no stream activity) for 30s. Current task: "${taskDescription}". Please provide an update or continue working.`,
+    `[WATCHDOG REMINDER] Bạn đang có công việc chưa hoàn thành: "${taskDescription}". Tiến trình đã ngừng sinh stream quá 45s (đã reset ngắt tiến trình cũ để tiếp tục).
+- Nếu công việc đã xong: hãy tự đánh giá hoàn tất bằng: <task_update task="1" status="completed" /> (hoặc số thứ tự task tương ứng).
+- Nếu tiếp tục làm việc: hãy cập nhật tiến độ bằng <task_update task="1" status="working" /> hoặc tiếp tục triển khai mã nguồn.
+- Nếu phát sinh việc mới cho chính mình: có thể tự lên task bằng: <talk target="${agentId}" task="Tên task mới">Chi tiết công việc...</talk>`,
   
   idleTimeout: (agentId: string, taskDescription: string) =>
-    `[WATCHDOG] Agent ${agentId} has been idle for 15s. Current task: "${taskDescription}". Please provide an update or continue working.`
+    `[WATCHDOG REMINDER] Bạn đang có công việc chưa hoàn thành trong danh sách: "${taskDescription}" nhưng đã ở trạng thái idle hơn 1 phút.
+- Nếu công việc đã xong: hãy đánh giá hoàn tất bằng: <task_update task="1" status="completed" /> (hoặc số thứ tự task tương ứng).
+- Nếu còn việc dở dang: hãy tiếp tục xử lý và dùng: <task_update task="1" status="working" />.
+- Nếu cần lên task mới cho bản thân: hãy dùng thẻ: <talk target="${agentId}" task="Tên task mới">Chi tiết nhiệm vụ...</talk>`
 };
 
 // Singleton AgentStatusManager để tránh cấp phát lặp đi lặp lại và rò rỉ bộ nhớ
@@ -45,12 +51,21 @@ export class WatchdogManager {
   private broadcastFn: (type: string, data: any) => void = () => {};
   private storageRef: any = null;
 
-  constructor(broadcastFn?: (type: string, data: any) => void) {
+  private onDeliverReminder?: (agent: Agent, message: string) => Promise<void>;
+
+  constructor(broadcastFn?: (type: string, data: any) => void, onDeliverReminder?: (agent: Agent, message: string) => Promise<void>) {
     if (broadcastFn) {
       this.broadcastFn = broadcastFn;
     }
+    if (onDeliverReminder) {
+      this.onDeliverReminder = onDeliverReminder;
+    }
     // Start periodic check every 5s to evaluate conditions
     this.checkInterval = setInterval(() => this.checkAllAgents(), 5000);
+  }
+
+  public setDeliverReminder(fn: (agent: Agent, message: string) => Promise<void>): void {
+    this.onDeliverReminder = fn;
   }
 
   public setBroadcast(fn: (type: string, data: any) => void): void {
@@ -86,10 +101,10 @@ export class WatchdogManager {
       this.idleTimers.delete(agentId);
     }
 
-    // Start new 15s idle timer
+    // Start new 60s idle timer (1 phút theo yêu cầu watchdog)
     const timeout = setTimeout(() => {
       this.handleIdleTimeout(agentId);
-    }, 15000); // 15s
+    }, 60000); // 60s (1 phút)
     
     this.idleTimers.set(agentId, timeout);
   }
@@ -183,14 +198,19 @@ export class WatchdogManager {
   }
 
   /**
-   * Check stream inactivity for an agent (30s threshold)
+   * Check stream inactivity for an agent (45s threshold)
    */
   private async checkStreamInactivity(agent: Agent): Promise<void> {
-    const lastActivity = this.lastStreamActivity.get(agent.id);
+    const lastActivity = this.lastStreamActivity.get(agent.id) || agent.workingSince;
+    // Nếu agent đang working nhưng chưa có ghi nhận stream thì lấy workingSince làm mốc tính
+    if (!lastActivity && agent.status === 'working') {
+      this.lastStreamActivity.set(agent.id, Date.now());
+      return;
+    }
     if (!lastActivity) return;
 
     const inactiveFor = Date.now() - lastActivity;
-    if (inactiveFor >= 30000) { // 30s
+    if (inactiveFor >= 45000) { // 45s theo yêu cầu mới
       // Check if we already sent a reminder recently (avoid spam)
       const lastReminder = this.getLastReminderTime(agent.id, 'stream');
       if (!lastReminder || (Date.now() - lastReminder) > 60000) { // 1min cooldown
@@ -265,12 +285,12 @@ export class WatchdogManager {
       
       const taskId = `watchdog-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       
-      await statusManager.dispatchTaskUpdate(
+      statusManager.dispatchTaskUpdate(
         agent.id,
         'working', // status
         taskId,
         `<task_update agent="${agent.id}" task="${reminderMessage}" status="working" />`
-      );
+      ).catch(() => {});
  
       // Also broadcast as system message for visibility
       this.broadcastFn('system:watchdog', {
@@ -280,6 +300,14 @@ export class WatchdogManager {
         message: reminderMessage,
         timestamp: Date.now()
       });
+
+      // Nếu có registered deliver reminder hook (deliverTalk vào context thật của agent), gọi gửi trực tiếp
+      if (this.onDeliverReminder) {
+        console.log(`[Watchdog] Invoking onDeliverReminder for ${agent.name} (${agent.id})...`);
+        await this.onDeliverReminder(agent, reminderMessage);
+      } else {
+        console.warn(`[Watchdog] Warning: onDeliverReminder is NOT registered in WatchdogManager!`);
+      }
 
       console.log(`[Watchdog] Sent ${type} reminder to agent ${agent.id}`);
     } catch (error) {

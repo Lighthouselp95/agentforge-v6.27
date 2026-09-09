@@ -98,6 +98,25 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     res.json({ success: true, autoContinue: enabled });
   });
 
+  // GET /api/settings/smartClarify
+  router.get('/smartClarify', (_req, res) => {
+    res.json({
+      smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false) === true,
+      smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 30)) || 30
+    });
+  });
+
+  // POST /api/settings/smartClarify
+  router.post('/smartClarify', (req, res) => {
+    const { smartClarifyEnabled, smartClarifyTimeoutSec } = req.body || {};
+    const enabled = smartClarifyEnabled !== undefined ? Boolean(smartClarifyEnabled) : true;
+    const timeoutSec = Math.max(5, Number(smartClarifyTimeoutSec) || 30);
+    deps.storage.setSetting('smartClarifyEnabled', enabled);
+    deps.storage.setSetting('smartClarifyTimeoutSec', timeoutSec);
+    deps.broadcast('settings:updated', { smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec });
+    res.json({ success: true, smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec });
+  });
+
   // GET /api/settings/defaultExpandToolcalls
   router.get('/defaultExpandToolcalls', (_req, res) => {
     res.json({ defaultExpandToolcalls: deps.storage.getSetting('defaultExpandToolcalls', false) === true });
@@ -110,6 +129,20 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     deps.storage.setSetting('defaultExpandToolcalls', enabled);
     deps.broadcast('settings:updated', { defaultExpandToolcalls: enabled });
     res.json({ success: true, defaultExpandToolcalls: enabled });
+  });
+
+  // GET /api/settings/rawResultTool
+  router.get('/rawResultTool', (_req, res) => {
+    res.json({ rawResultTool: deps.storage.getSetting('rawResultTool', false) === true });
+  });
+
+  // POST /api/settings/rawResultTool
+  router.post('/rawResultTool', (req, res) => {
+    const { rawResultTool } = req.body || {};
+    const enabled = Boolean(rawResultTool);
+    deps.storage.setSetting('rawResultTool', enabled);
+    deps.broadcast('settings:updated', { rawResultTool: enabled });
+    res.json({ success: true, rawResultTool: enabled });
   });
 
   // GET /api/settings/engineMode

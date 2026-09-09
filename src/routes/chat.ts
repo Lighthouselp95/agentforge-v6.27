@@ -53,12 +53,11 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
       agentId: qAgentId,
       teamId: teamFilter
     });
-    // Fix interleave 6.44 (rework 6.33): khi trả history về client, GIỮ text + tool trong parts cho mọi
-    // snapshot opencode (msgType==='opencode') để sau restart/reconnect vẫn render xen kẽ đúng thứ tự.
-    // Chỉ guard bỏ entry null — KHÔNG lọc text. Dedup với canonical reply do client xử lý (agent view
-    // lọc reply trùng nội dung khi đã có snapshot interleave; Khối 2/3 ẩn khi hasParts).
+    // Fix interleave 6.44 (rework 6.33): khi trả history về client, GIỮ text + tool + thinking trong parts cho mọi
+    // tin nhắn (opencode hoặc assistant turn reply) để sau restart/reconnect/F5 vẫn render xen kẽ đúng thứ tự.
+    // Chỉ guard bỏ entry null.
     const sanitized = history.map((m: any) => {
-      if (m && m.msgType === 'opencode' && Array.isArray(m.parts)) {
+      if (m && Array.isArray(m.parts)) {
         return { ...m, parts: m.parts.filter((p: any) => p && (p.type === 'tool' || p.type === 'text' || p.type === 'thinking')) };
       }
       return m;
@@ -401,7 +400,9 @@ export function createChatRouter(deps: ChatRouteDeps): Router {
         }
       }
       if (!res.headersSent) {
-        res.json({ ok: false, error: err.message, response: isAbortError ? undefined : errorText, aborted: isAbortError });
+        // Control Plane: HTTP Response chỉ trả trạng thái điều khiển (ok, error, aborted).
+        // Tuyệt đối KHÔNG trả text hay sinh message lặp lại ở client — 100% tin nhắn hội thoại và lỗi đã được phát qua WebSocket.
+        res.json({ ok: false, error: err.message, aborted: isAbortError });
       }
     }
   });

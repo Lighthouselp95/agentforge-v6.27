@@ -52,6 +52,112 @@ export function createAgentsRouter(deps: AgentsRouteDeps): Router {
     res.json(rows);
   });
 
+  // POST /api/agents/sync-titles — Đồng bộ sessionTitle và tokenUsage từ opencode serve cho toàn bộ agents
+  router.post('/sync-titles', async (_req, res) => {
+    const updated: any[] = [];
+    const client = deps.clients.get('orchestrator') || Array.from(deps.clients.values())[0];
+
+    for (const [id, agent] of deps.agents.entries()) {
+      const sid = agent.sessionId || deps.clients.get(id)?.getSessionId();
+      if (!sid) continue;
+
+      let stats: any = null;
+      const agentClient = deps.clients.get(id) || client;
+      if (agentClient && typeof agentClient.getSessionStats === 'function') {
+        try {
+          stats = await agentClient.getSessionStats(sid);
+        } catch {}
+      }
+
+      if (!stats) {
+        // Direct fetch fallback to opencode serve
+        try {
+          const serveUrl = (process.env.OPENCODE_SERVE_URL || 'http://localhost:4096').replace(/\/+$/, '');
+          // Thử lấy message cuối cùng để lấy chính xác token của lượt gần nhất (ví dụ 97,713 tokens)
+          let lastMsgTokens: any = null;
+          try {
+            const msgsRes = await fetch(`${serveUrl}/session/${encodeURIComponent(sid)}/message`);
+            if (msgsRes.ok) {
+              const msgs: any = await msgsRes.json();
+              if (Array.isArray(msgs) && msgs.length > 0) {
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                  const m = msgs[i];
+                  if (m?.info?.tokens && typeof m.info.tokens === 'object') {
+                    lastMsgTokens = m.info.tokens;
+                    break;
+                  }
+                }
+              }
+            }
+          } catch {}
+
+          const r = await fetch(`${serveUrl}/session/${encodeURIComponent(sid)}`);
+          if (r.ok) {
+            const data: any = await r.json();
+            const tokens = lastMsgTokens || data.tokens || {};
+            const input = Number(tokens.input) || 0;
+            const output = Number(tokens.output) || 0;
+            const cacheRead = Number(tokens.cache?.read) || 0;
+            const cacheWrite = Number(tokens.cache?.write) || 0;
+            const reasoning = Number(tokens.reasoning) || 0;
+            const total = Number(tokens.total) || (input + output + cacheRead + cacheWrite);
+            const cost = Number(data.cost) || 0;
+
+            stats = {
+              title: data.title || undefined,
+              tokenUsage: {
+                input,
+                output,
+                cacheReadTokens: cacheRead,
+                cacheWriteTokens: cacheWrite,
+                reasoning,
+                totalTokens: total,
+                cost
+              },
+              contextLength: total
+            };
+          }
+        } catch {}
+      }
+
+      if (stats) {
+        let changed = false;
+        if (stats.title && stats.title !== agent.sessionTitle) {
+          agent.sessionTitle = stats.title;
+          changed = true;
+        }
+        if (stats.tokenUsage) {
+          agent.tokenUsage = { ...agent.tokenUsage, ...stats.tokenUsage };
+          changed = true;
+        }
+        if (stats.contextLength !== undefined) {
+          agent.contextLength = stats.contextLength;
+          changed = true;
+        }
+
+        if (changed) {
+          agent.sessionId = sid;
+          ACPClient.registerSession(agent.id, sid);
+          deps.storage.updateAgent(agent.id, {
+            sessionId: sid,
+            sessionTitle: agent.sessionTitle,
+            tokenUsage: agent.tokenUsage,
+            contextLength: agent.contextLength
+          });
+          deps.broadcast('agent:updated', { agent });
+          updated.push({
+            id: agent.id,
+            name: agent.name,
+            sessionTitle: agent.sessionTitle,
+            tokenUsage: agent.tokenUsage
+          });
+        }
+      }
+    }
+
+    res.json({ ok: true, count: updated.length, updated });
+  });
+
   // POST /api/agents (create)
   router.post('/', async (req, res) => {
     const { name, role: rawRole, type: rawType, spawnedBy, projectDir, task, model, teamId } = req.body;
@@ -314,7 +420,7 @@ Nội dung phân công nhiệm vụ mới tại đây
     if (model !== undefined) {
       agent.model = model || undefined;
       deps.storage.updateAgent(agentId, { model: model || null });
-      if (agentId === 'orchestrator') {
+      if (agentId === 'orchestrator' || agent.role === 'orchestrator' || agent.type === 'orchestrator') {
         deps.storage.setSetting('orchestratorModel', model || null);
         if (model) process.env.ORCHESTRATOR_MODEL = model; else delete process.env.ORCHESTRATOR_MODEL;
       }
@@ -322,6 +428,19 @@ Nội dung phân công nhiệm vụ mới tại đây
       if (client) {
         const resolved = deps.resolveModelForAgent(agent);
         client.setModel(resolved || undefined);
+      }
+      // Cập nhật model kế thừa cho toàn bộ workers trực thuộc team của Orchestrator này
+      if (agent.role === 'orchestrator' || agent.type === 'orchestrator' || agentId === 'orchestrator') {
+        const teamId = agent.teamId || 'default';
+        for (const [, w] of deps.agents) {
+          if (w && w.id !== agentId && (w.teamId || 'default') === teamId && (!w.model || w.model === 'default')) {
+            const wClient = deps.clients.get(w.id);
+            if (wClient) {
+              const wResolved = deps.resolveModelForAgent(w);
+              wClient.setModel(wResolved || undefined);
+            }
+          }
+        }
       }
     }
     if (name !== undefined) {
@@ -382,8 +501,10 @@ Nội dung phân công nhiệm vụ mới tại đây
     // Xóa phần tử task khỏi mảng
     const [removedTask] = agent.tasks.splice(removeIndex, 1);
 
-    // Nếu tất cả task còn lại đều đã completed -> CHỈ tự xóa sạch khi có ĐỦ TỐI THIỂU 6 TASKS
-    if (agent.tasks.length >= 6 && agent.tasks.every((t: any) => t.status === 'completed')) {
+    // Nếu tất cả task còn lại đều đã completed -> CHỈ tự xóa sạch khi có ĐỦ TỐI THIỂU max tasks (theo setting taskLimit)
+    const teamSettings = deps.storage?.getTeamSettings ? deps.storage.getTeamSettings(agent.teamId || 'default') : undefined;
+    const taskLimit = teamSettings?.taskLimit ?? 5;
+    if (agent.tasks.length >= taskLimit && agent.tasks.every((t: any) => t.status === 'completed')) {
       agent.tasks = [];
     } else {
       // QUAN TRỌNG: Các task sau đó sẽ LÙI SỐ ID VỀ 1 LẦN (re-index lại 1, 2, 3...)
@@ -541,7 +662,7 @@ Nội dung phân công nhiệm vụ mới tại đây
     agent.model = model || undefined;
     deps.storage.updateAgent(agentId, { model: model || null });
 
-    if (agentId === 'orchestrator') {
+    if (agentId === 'orchestrator' || agent.role === 'orchestrator' || agent.type === 'orchestrator') {
       deps.storage.setSetting('orchestratorModel', model || null);
       if (model) process.env.ORCHESTRATOR_MODEL = model; else delete process.env.ORCHESTRATOR_MODEL;
     }
@@ -551,6 +672,20 @@ Nội dung phân công nhiệm vụ mới tại đây
     if (client) {
       const resolved = deps.resolveModelForAgent(agent);
       client.setModel(resolved || undefined);
+    }
+
+    // Cập nhật model kế thừa cho toàn bộ workers trực thuộc team của Orchestrator này
+    if (agent.role === 'orchestrator' || agent.type === 'orchestrator' || agentId === 'orchestrator') {
+      const teamId = agent.teamId || 'default';
+      for (const [, w] of deps.agents) {
+        if (w && w.id !== agentId && (w.teamId || 'default') === teamId && (!w.model || w.model === 'default')) {
+          const wClient = deps.clients.get(w.id);
+          if (wClient) {
+            const wResolved = deps.resolveModelForAgent(w);
+            wClient.setModel(wResolved || undefined);
+          }
+        }
+      }
     }
 
     deps.broadcast('agent:updated', { agent });
