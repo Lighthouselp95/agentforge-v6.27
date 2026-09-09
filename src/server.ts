@@ -6299,6 +6299,9 @@ process.on('unhandledRejection', (reason) => {
 
 import { ensureOpenCodeServer, killOpenCodeServer, getOpenCodeServerStatus } from './process/opencode-spawner.js';
 
+// Mỗi khi server Node.js khởi động lại (mới boot), reset flag isSystemStarted về false để UI hiện StartupModal
+storage.setSetting('isSystemStarted', false);
+
 // Khởi động: dò port trống chủ động từ PORT (mặc định 4001) rồi bind port và mở web ngay lập tức;
 // Các dịch vụ nền (OpenCode serve, BootSequence, Replay...) chạy sau khi server đã listen.
 findAvailablePort(PORT).then(async (freePort) => {
