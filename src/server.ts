@@ -975,7 +975,8 @@ function initTaskQueueManager(): void {
     }
   });
 }
-// Chỉ cấu hình callback, KHÔNG tự ý start ngầm khi người dùng chưa bấm Start
+// Đăng ký hook và callback ban đầu khi nạp module
+initTaskQueueManager();
 
 interface CommandErrorInfo {
   type: 'SPAWN_ROLE_LIMIT' | 'SPAWN_PARSE_FAIL' | 'SPAWN_TASK_LONG' | 'SPAWN_EMPTY_TASK' | 'TALK_PARSE_FAIL' | 'TALK_AGENT_NOT_FOUND' | 'TASK_BARRIER_VIOLATION' | 'CREATE_ROLE_LIMIT' | 'TASK_UPDATE_ERROR';
@@ -4906,7 +4907,8 @@ app.use('/api', createApiRouter({
     wsClients,
     agents,
     storage,
-    logBuffer
+    logBuffer,
+    getOpenCodeStatus: () => getOpenCodeServerStatus()
   },
   settings: {
     storage,
@@ -6295,7 +6297,7 @@ process.on('unhandledRejection', (reason) => {
   try { ACPClient.killAllChildProcesses(); } catch {}
 });
 
-import { ensureOpenCodeServer, killOpenCodeServer } from './process/opencode-spawner.js';
+import { ensureOpenCodeServer, killOpenCodeServer, getOpenCodeServerStatus } from './process/opencode-spawner.js';
 
 // Khởi động: dò port trống chủ động từ PORT (mặc định 4001) rồi bind port và mở web ngay lập tức;
 // Các dịch vụ nền (OpenCode serve, BootSequence, Replay...) chạy sau khi server đã listen.
