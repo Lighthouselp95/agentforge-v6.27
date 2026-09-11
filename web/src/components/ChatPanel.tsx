@@ -3616,6 +3616,136 @@ export function ChatPanel({
         </div>
       </div>
 
+      {/* Agent Tasks Checklist (Todolist Banner) */}
+      {(() => {
+        const curAgent = agents?.find(a => a.id === selectedAgentId);
+        const hasTaskList = Array.isArray(curAgent?.tasks) && curAgent!.tasks.length > 0;
+        const singleTask = curAgent?.task;
+        if (!hasTaskList && !singleTask) return null;
+
+        const tasks = hasTaskList
+          ? curAgent!.tasks!
+          : [{ id: '1', task: singleTask!, status: curAgent?.status || 'working' }];
+        const completedCount = tasks.filter(t => t.status === 'completed').length;
+        const workingTask = tasks.find(t => t.status === 'working' || t.status === 'in_progress');
+
+        return (
+          <div style={{
+            borderBottom: '1px solid var(--af-border)',
+            background: 'var(--bg-panel)',
+            padding: isMobile ? '6px 10px' : '8px 16px',
+            fontSize: 12,
+            boxShadow: '0 2px 4px rgba(0,0,0,0.08)',
+            flexShrink: 0
+          }}>
+            <div
+              onClick={() => setShowTodoList(prev => !prev)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                cursor: 'pointer',
+                userSelect: 'none'
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <span style={{ fontSize: 14 }}>📋</span>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                  Todolist của {curAgent?.name || 'Agent'} ({completedCount}/{tasks.length} hoàn tất)
+                </span>
+                {workingTask && !showTodoList && (
+                  <span style={{
+                    color: '#60a5fa',
+                    fontSize: 11.5,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    maxWidth: 320
+                  }}>
+                    · Đang làm: #{workingTask.id || '1'} {workingTask.task}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 11 }}>
+                <span>{showTodoList ? 'Thu gọn ▲' : 'Xem chi tiết ▼'}</span>
+              </div>
+            </div>
+
+            {showTodoList && (
+              <div style={{
+                marginTop: 8,
+                maxHeight: 180,
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 5,
+                paddingRight: 4
+              }}>
+                {tasks.map((t, idx) => {
+                  const num = t.id || String(idx + 1);
+                  const st = (t.status || 'pending').toLowerCase();
+                  const isDone = st === 'completed';
+                  const isWork = st === 'working' || st === 'in_progress';
+                  const isCancel = st === 'cancelled' || st === 'cancel';
+                  const icon = isDone ? '✅' : isWork ? '⚡' : isCancel ? '❌' : '⬜';
+                  const badgeBg = isDone ? 'rgba(34, 197, 94, 0.15)' : isWork ? 'rgba(59, 130, 246, 0.15)' : isCancel ? 'rgba(239, 68, 68, 0.15)' : 'rgba(148, 163, 184, 0.1)';
+                  const badgeColor = isDone ? '#4ade80' : isWork ? '#60a5fa' : isCancel ? '#f87171' : '#94a3b8';
+
+                  return (
+                    <div
+                      key={num}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 8,
+                        padding: '4px 8px',
+                        borderRadius: 6,
+                        background: isWork ? 'rgba(59, 130, 246, 0.08)' : 'rgba(255,255,255,0.02)',
+                        border: `1px solid ${isWork ? 'rgba(59, 130, 246, 0.3)' : 'var(--af-border)'}`
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                        <span style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
+                        <span style={{
+                          fontWeight: 600,
+                          fontSize: 11.5,
+                          color: isWork ? '#60a5fa' : 'var(--text-muted)',
+                          flexShrink: 0
+                        }}>
+                          #{num}
+                        </span>
+                        <span style={{
+                          color: isDone ? 'var(--text-muted)' : 'var(--text-primary)',
+                          textDecoration: isDone ? 'line-through' : 'none',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap'
+                        }}>
+                          {t.task}
+                        </span>
+                      </div>
+                      <span style={{
+                        background: badgeBg,
+                        color: badgeColor,
+                        padding: '1px 6px',
+                        borderRadius: 4,
+                        fontSize: 10,
+                        fontWeight: 600,
+                        flexShrink: 0,
+                        textTransform: 'uppercase'
+                      }}>
+                        {st}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Messages */}
       <div ref={scrollRef} onScroll={handleScroll} className="af-chat-scroll" style={{ flex: 1, overflow: 'auto', minWidth: 0, padding: isMobile ? '8px 6px' : '14px 16px', display: 'flex', flexDirection: 'column', gap: 8, userSelect: 'none' }}>
         {displayMessages.length === 0 ? (
