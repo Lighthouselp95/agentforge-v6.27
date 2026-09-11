@@ -30,18 +30,20 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
   const [orchestratorModel, setOrchestratorModel] = useState('');
   const [defaultSubagentModel, setDefaultSubagentModel] = useState('');
   const [agentModelOverrides, setAgentModelOverrides] = useState<Record<string, string>>({});
-  const [engineMode, setEngineMode] = useState<'run' | 'attach' | 'http'>('run');
+  const [engineMode, setEngineMode] = useState<'run' | 'attach' | 'http'>('attach');
   const [serveUrl, setServeUrl] = useState('http://127.0.0.1:4096');
   const [defaultExpandToolcalls, setDefaultExpandToolcalls] = useState(false);
   const [activeTab, setActiveTab] = useState<'models' | 'automation' | 'prompts'>('models');
   const [enableWatchdog, setEnableWatchdog] = useState(true);
   const [autoContinue, setAutoContinue] = useState(true);
-  const [watchdogSec, setWatchdogSec] = useState(45);
-  const [idleSec, setIdleSec] = useState(30);
+  const [watchdogSec, setWatchdogSec] = useState(60);
+  const [idleSec, setIdleSec] = useState(120);
   const [taskUpdateThrottleMs, setTaskUpdateThrottleMs] = useState(600);
+  const [smartClarifyEnabled, setSmartClarifyEnabled] = useState(false);
   const [smartClarifyTimeoutSec, setSmartClarifyTimeoutSec] = useState(120);
   const [smartClarifyPromptTemplate, setSmartClarifyPromptTemplate] = useState('Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.');
-  const [workerReminderPrompt, setWorkerReminderPrompt] = useState('=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />\n(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)');
+  const [smartClarifyScope, setSmartClarifyScope] = useState<'orchestrator' | 'all'>('orchestrator');
+  const [workerReminderPrompt, setWorkerReminderPrompt] = useState('=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> for communications.\nKhi bắt đầu xử lý: <task_update task="N" status="working" />\nKhi hoàn tất: <task_update task="N" status="completed" /> (yêu cầu task phải ở trạng thái working trước khi completed)\nKhi hủy bỏ: <task_update task="N" status="cancel" /> (có thể hủy trực tiếp từ pending hoặc working)\n(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)');
   const [models, setModels] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem('af-models-cache');
@@ -144,6 +146,9 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           setOrchestratorModel(mod.orchestratorModel || '');
           setDefaultSubagentModel(mod.defaultSubagentModel || '');
           setAgentModelOverrides(mod.agentModelOverrides || {});
+          if (settingsData.engineMode === 'run' || settingsData.engineMode === 'attach' || settingsData.engineMode === 'http') {
+            setEngineMode(settingsData.engineMode);
+          }
           if (typeof settingsData.enableWatchdog === 'boolean') setEnableWatchdog(settingsData.enableWatchdog);
           if (typeof settingsData.autoContinue === 'boolean') setAutoContinue(settingsData.autoContinue);
           if (typeof settingsData.watchdogStreamTimeoutSec === 'number') setWatchdogSec(settingsData.watchdogStreamTimeoutSec);
@@ -152,6 +157,7 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
           if (typeof settingsData.smartClarifyEnabled === 'boolean') setSmartClarifyEnabled(settingsData.smartClarifyEnabled);
           if (typeof settingsData.smartClarifyTimeoutSec === 'number') setSmartClarifyTimeoutSec(settingsData.smartClarifyTimeoutSec);
           if (settingsData.smartClarifyPromptTemplate) setSmartClarifyPromptTemplate(settingsData.smartClarifyPromptTemplate);
+          if (settingsData.smartClarifyScope === 'all' || settingsData.smartClarifyScope === 'orchestrator') setSmartClarifyScope(settingsData.smartClarifyScope);
           if (settingsData.workerReminderPrompt) setWorkerReminderPrompt(settingsData.workerReminderPrompt);
         }
 
@@ -168,6 +174,9 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
 
         if (smartData && typeof smartData.smartClarifyEnabled === 'boolean') {
           setSmartClarifyEnabled(smartData.smartClarifyEnabled);
+          if (smartData.smartClarifyScope === 'all' || smartData.smartClarifyScope === 'orchestrator') {
+            setSmartClarifyScope(smartData.smartClarifyScope);
+          }
         }
       } catch (e) {
         console.error('Failed to load model settings:', e);
@@ -246,13 +255,14 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
             smartClarifyEnabled,
             smartClarifyTimeoutSec,
             smartClarifyPromptTemplate,
+            smartClarifyScope,
             workerReminderPrompt
           })
         }),
         fetch(`${API}/api/settings/smartClarify`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ smartClarifyEnabled, smartClarifyTimeoutSec, smartClarifyPromptTemplate })
+          body: JSON.stringify({ smartClarifyEnabled, smartClarifyTimeoutSec, smartClarifyPromptTemplate, smartClarifyScope })
         })
       ]);
 
@@ -378,12 +388,12 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
                       fontSize: 12
                     }}
                   />
-                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Thời gian ngưng stream tối đa trước khi tự abort & nhắc lại việc (mặc định: 45s)</span>
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Timer 1 của Watchdog: Agent đang WORKING mà ngưng sinh stream/bị treo quá ngưỡng này sẽ tự ngắt & nhắc tiếp tục (mặc định: 60s / 1 phút)</span>
                 </div>
 
                 <div>
                   <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
-                    Idle Task Check Delay (giây)
+                    Watchdog Idle With Incomplete Job (giây)
                   </label>
                   <input
                     type="number"
@@ -401,7 +411,7 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
                       fontSize: 12
                     }}
                   />
-                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Thời gian agent ở trạng thái idle trước khi tự động quét và nhắc làm tiếp task (mặc định: 30s)</span>
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Timer 2 của Watchdog: Agent còn JOB/TASK dở dang mà ở trạng thái IDLE quá ngưỡng này sẽ tự động nhắc làm tiếp (mặc định: 120s / 2 phút)</span>
                 </div>
 
                 <div>
@@ -449,6 +459,29 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
                     }}
                   />
                   <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Thời gian người dùng không chat trước khi tự động kích hoạt rule hỏi lại (mặc định: 30s)</span>
+                </div>
+
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
+                    Phạm vi áp dụng (Target Scope)
+                  </label>
+                  <select
+                    value={smartClarifyScope}
+                    onChange={(e) => setSmartClarifyScope(e.target.value as 'orchestrator' | 'all')}
+                    style={{
+                      width: '100%',
+                      background: 'var(--bg-panel)',
+                      color: 'var(--text-primary)',
+                      border: '1px solid var(--af-border-strong)',
+                      borderRadius: 6,
+                      padding: '6px 10px',
+                      fontSize: 12
+                    }}
+                  >
+                    <option value="orchestrator">Chỉ Orchestrator (Khuyên dùng)</option>
+                    <option value="all">Cả Team (Tất cả agent)</option>
+                  </select>
+                  <span style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>Chọn gửi câu xác minh chỉ tới Orchestrator hay tới mọi agent trong team</span>
                 </div>
               </div>
             </div>
@@ -528,7 +561,7 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
                 style={{ marginTop: 2 }}
               />
               <div>
-                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>1. opencode run (Mặc định)</span>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>1. opencode run</span>
                 <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block' }}>
                   Spawn tiến trình CLI độc lập cho từng agent.
                 </span>
@@ -545,7 +578,7 @@ export function ModelSettingsDialog({ agents, onClose, onSaved }: Props) {
                 style={{ marginTop: 2 }}
               />
               <div>
-                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>2. opencode attach</span>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>2. opencode attach (Mặc định)</span>
                 <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block' }}>
                   Gắn CLI vào daemon OpenCode Serve qua cờ --attach.
                 </span>

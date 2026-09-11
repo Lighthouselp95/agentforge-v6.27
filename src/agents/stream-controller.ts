@@ -111,17 +111,34 @@ export abstract class StreamController extends EventEmitter {
   public emitChunk(agentId: string, raw: string, payload: StreamChunk['payload']): void {
     // Notify watchdog of stream activity (resets 30s inactivity timer)
     watchdogManager.onStreamActivity(agentId);
-    
-    // LIVE STREAM CHUNK: gửi nguyên text chunk thay vì loop tách từng ký tự làm flood WebSocket
-    const chunk: StreamChunk = {
-      type: StreamEventType.CHUNK,
-      agentId,
-      timestamp: Date.now(),
-      source: this.source,
-      raw,
-      payload
-    };
-    this.broadcast(StreamEventType.CHUNK, chunk);
+
+    // LIVE STREAM CHUNK-BY-CHUNK: nội dung text được tách thành TỪNG KÝ TỰ riêng lẻ
+    // (thay vì gói thành block lớn) để UI render mượt theo thời gian thực.
+    if (payload.kind === 'text' && payload.text) {
+      const textChars = Array.from(payload.text);
+      for (const ch of textChars) {
+        const chunk: StreamChunk = {
+          type: StreamEventType.CHUNK,
+          agentId,
+          timestamp: Date.now(),
+          source: this.source,
+          raw,
+          payload: { kind: 'text', text: ch }
+        };
+        this.broadcast(StreamEventType.CHUNK, chunk);
+      }
+    } else {
+      // Non-text (thinking / tool_call / tool_result / metadata): gửi nguyên chunk
+      const chunk: StreamChunk = {
+        type: StreamEventType.CHUNK,
+        agentId,
+        timestamp: Date.now(),
+        source: this.source,
+        raw,
+        payload
+      };
+      this.broadcast(StreamEventType.CHUNK, chunk);
+    }
 
     if (this.stableStatusSet.has(agentId)) {
       this.scheduleIdle(agentId, 500);

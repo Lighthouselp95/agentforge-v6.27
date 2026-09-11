@@ -10,6 +10,7 @@ import { StringDecoder } from 'string_decoder';
 import type { AgentConfig, AgentMessage, MessagePart, TokenUsage, ToolCallInfo } from './types.js';
 import { storage } from '../storage.js';
 import { spawnOpencodeRunProcess, getOpenCodeServerUrl } from '../process/opencode-spawner.js';
+import { opencodeSSEGate } from './opencode-sse-gate.js';
 
 const execAsync = promisify(exec);
 const isWin = process.platform === 'win32';
@@ -102,10 +103,16 @@ export class OpenCodeServeClient {
 
   /** Tạo session mới qua HTTP (POST /session) */
   static async createSessionHttp(serverUrl: string = process.env.OPENCODE_SERVE_URL || 'http://127.0.0.1:4096', params?: { title?: string; directory?: string }): Promise<string> {
-    const url = `${serverUrl.replace(/\/$/, '')}/session`;
+    const cleanUrl = serverUrl.replace(/\/$/, '');
+    const dirQuery = params?.directory ? `?directory=${encodeURIComponent(params.directory)}` : '';
+    const url = `${cleanUrl}/session${dirQuery}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (params?.directory) {
+      headers['x-opencode-directory'] = params.directory;
+    }
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(params || {}),
       signal: AbortSignal.timeout(10000)
     });
@@ -119,12 +126,17 @@ export class OpenCodeServeClient {
   }
 
   /** Gửi message trực tiếp qua HTTP REST API (POST /session/{sessionID}/message) */
-  static async sendHttpMessage(serverUrl: string, sessionId: string, payload: any): Promise<any> {
+  static async sendHttpMessage(serverUrl: string, sessionId: string, payload: any, directory?: string): Promise<any> {
     const cleanUrl = serverUrl.replace(/\/$/, '');
-    const url = `${cleanUrl}/session/${sessionId}/message`;
+    const dirQuery = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    const url = `${cleanUrl}/session/${sessionId}/message${dirQuery}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (directory) {
+      headers['x-opencode-directory'] = directory;
+    }
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(120000)
     });
@@ -152,6 +164,18 @@ export class OpenCodeServeClient {
       const cleanUrl = serverUrl.replace(/\/$/, '');
       const url = `${cleanUrl}/session/${sessionId}`;
       const res = await fetch(url, { method: 'DELETE', signal: AbortSignal.timeout(5000) });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Kiểm tra session có tồn tại thực sự trên OpenCode Serve hay không (GET /session/{sessionID}) */
+  static async checkSessionExistsHttp(serverUrl: string, sessionId: string): Promise<boolean> {
+    try {
+      const cleanUrl = serverUrl.replace(/\/$/, '');
+      const url = `${cleanUrl}/session/${encodeURIComponent(sessionId)}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
       return res.ok;
     } catch {
       return false;
@@ -461,6 +485,29 @@ export class OpenCodeServeClient {
       }
     }
 
+    // Đảm bảo session tồn tại trên OpenCode Serve. Nếu session cũ bị mất (do restart OpenCode Serve), tự động khôi phục session mới
+    if (this.sessionId) {
+      const dynamicUrl = getOpenCodeServerUrl();
+      const exists = await OpenCodeServeClient.checkSessionExistsHttp(dynamicUrl, this.sessionId);
+      if (!exists) {
+        console.warn(`[OpenCodeServeClient] ⚠️ Session "${this.sessionId}" của agent "${this.config.name}" không còn tồn tại trên OpenCode Serve (${dynamicUrl}). Đang tự động khởi tạo session mới...`);
+        try {
+          const newSid = await OpenCodeServeClient.createSessionHttp(dynamicUrl, {
+            title: `AgentForge - ${this.config.name} (${this.config.role || 'worker'})`,
+            directory: projectDir
+          });
+          if (newSid) {
+            console.log(`[OpenCodeServeClient] ✅ Đã khôi phục session mới "${newSid}" cho agent "${this.config.name}"`);
+            this.sessionId = newSid;
+            OpenCodeServeClient.registerSession(this.config.id, newSid);
+            storage.updateAgent(this.config.id, { sessionId: newSid } as any);
+          }
+        } catch (sessErr: any) {
+          console.error(`[OpenCodeServeClient] Không thể tạo lại session mới trên OpenCode Serve:`, sessErr?.message || sessErr);
+        }
+      }
+    }
+
     const isSlash = prompt.startsWith('/');
     let cleanCmd = '';
     let cmdArgsRest = '';
@@ -629,17 +676,33 @@ export class OpenCodeServeClient {
     }
 
     // 2. Map model "provider/model" sang đúng định dạng OpenCode Serve API { providerID, modelID }.
-    //    Gửi model dạng string sẽ bị Serve trả HTTP 400 (validation) — đây là bug cũ.
     let modelToUse = this.config.model;
     if (!modelToUse || !modelToUse.trim() || modelToUse.trim().toLowerCase() === 'default') {
-      modelToUse = process.env.ORCHESTRATOR_MODEL || process.env.DEFAULT_MODEL || 'antigravity/gemini-3.7-flash-high';
+      modelToUse = process.env.ORCHESTRATOR_MODEL || process.env.DEFAULT_MODEL || 'antigravity/gemini-3.8-flash-high';
     }
     modelToUse = modelToUse.trim();
     const modelObj = modelToUse.includes('/')
       ? { providerID: modelToUse.split('/')[0], modelID: modelToUse.split('/').slice(1).join('/') }
       : { providerID: modelToUse, modelID: modelToUse };
 
+    // Xác định agent cho OpenCode Serve:
+    // 1. Ưu tiên vai trò/role của agent nếu có (coder, verifier, tester, researcher, v.v.)
+    // 2. Nếu type là orchestrator thì dùng 'orchestrator'
+    // 3. Fallback về 'coder' (cho worker) hoặc 'orchestrator'
+    const roleToAgent: Record<string, string> = {
+      coder: 'coder', reviewer: 'reviewer', tester: 'tester',
+      docs: 'docs', planner: 'planner', orchestrator: 'orchestrator',
+      researcher: 'researcher', verifier: 'verifier', debugger: 'debugger',
+      searcher: 'searcher', idea: 'idea'
+    };
+    const roleKey = String(this.config.role || '').toLowerCase().trim();
+    let agentToUse = roleToAgent[roleKey] || this.config.role || (this.config.type === 'orchestrator' ? 'orchestrator' : 'coder');
+    if (!agentToUse || !agentToUse.trim()) {
+      agentToUse = this.config.type === 'orchestrator' ? 'orchestrator' : 'coder';
+    }
+
     const payload: any = {
+      agent: agentToUse,
       parts: [
         { type: 'text', text: prompt }
       ]
@@ -651,28 +714,61 @@ export class OpenCodeServeClient {
 
     this.pushOACEvent({ kind: 'in', prompt: prompt.length > 4000 ? prompt.slice(0, 4000) + '\n…(truncated)' : prompt });
 
-    // 3. Gửi message qua HTTP
+    // 3. Đăng ký SSE Gate biên dịch stream realtime song song với HTTP request
+    opencodeSSEGate.ensureConnected(this.serverUrl);
+    let streamedViaSSE = false;
+    const unsubSSE = opencodeSSEGate.subscribe(this.sessionId, (sseEv) => {
+      streamedViaSSE = true;
+      // Chuyển tiếp trực tiếp event đã biên dịch sang hệ thống phát sóng của AgentForge
+      this.pushOACEvent({ kind: 'out', event: sseEv });
+    });
+
+    // 4. Gửi message qua HTTP kèm context project directory
     let res: any;
     try {
-      res = await OpenCodeServeClient.sendHttpMessage(this.serverUrl, this.sessionId, payload);
+      const projectDir = this.config.projectDir || process.cwd();
+      res = await OpenCodeServeClient.sendHttpMessage(this.serverUrl, this.sessionId, payload, projectDir);
     } catch (e: any) {
       const hint = (e && e.message && e.message.includes('HTTP')) ? e.message : `OpenCode Serve reply failed: ${e?.message || e}`;
-      // Gửi message thất bại — trả AgentMessage lỗi để orchestrator biết thay vì nuốt im lặng
       throw new Error(`[${this.config.name} HTTP] ${hint}`);
+    } finally {
+      unsubSSE();
+      opencodeSSEGate.cleanupSession(this.sessionId);
     }
 
     let content = '';
     const parts: MessagePart[] = [];
-    // 4. Parse toàn bộ part của response: text + thinking + tool (giống parseJsonlEvents)
+    let tokenUsage: TokenUsage | undefined;
+
+    if (res && res.info && res.info.tokens) {
+      const t = res.info.tokens;
+      tokenUsage = {
+        inputTokens: t.input || 0,
+        outputTokens: t.output || 0,
+        reasoningTokens: t.reasoning || 0,
+        totalTokens: t.total || ((t.input || 0) + (t.output || 0))
+      };
+    }
+
+    // 5. Parse toàn bộ part của response: text + thinking + tool để lưu trữ DB
     if (res && Array.isArray(res.parts)) {
       for (const p of res.parts) {
         const type = String(p.type || '').toLowerCase();
         if ((type === 'text' || type === 'reasoning' || type === 'thinking' || type === 'thought')) {
           if (type !== 'text') {
             parts.push({ type: 'thinking', content: p.text || '' });
+            if (!streamedViaSSE) {
+              this.pushOACEvent({ kind: 'out', event: { type: 'reasoning', sessionID: this.sessionId, part: { type: 'reasoning', text: p.text || '' } } });
+            }
           } else if (typeof p.text === 'string' && p.text) {
-            content += p.text;
-            parts.push({ type: 'text', content: p.text });
+            const cleanTxt = p.text.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<\/?think>/gi, '');
+            if (cleanTxt) {
+              content += cleanTxt;
+              parts.push({ type: 'text', content: cleanTxt });
+              if (!streamedViaSSE) {
+                this.pushOACEvent({ kind: 'out', event: { type: 'text', sessionID: this.sessionId, part: { type: 'text', text: cleanTxt } } });
+              }
+            }
           }
         } else if (type === 'tool_use' || type === 'tool_call') {
           const tool = p.name || p.tool || 'tool';
@@ -685,19 +781,38 @@ export class OpenCodeServeClient {
             input: typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput ?? ''),
             ...(rawOutput ? { output: typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput) } : {})
           });
+          if (!streamedViaSSE) {
+            this.pushOACEvent({
+              kind: 'out',
+              event: {
+                type: 'tool_use',
+                sessionID: this.sessionId,
+                part: {
+                  type: 'tool',
+                  tool,
+                  callID: p.id ?? p.callID,
+                  state: { input: rawInput, output: rawOutput }
+                }
+              }
+            });
+          }
         }
       }
     } else if (res && typeof res.content === 'string') {
       content = res.content;
+      if (!streamedViaSSE) {
+        this.pushOACEvent({ kind: 'out', event: { type: 'text', sessionID: this.sessionId, part: { type: 'text', text: content } } });
+      }
     }
 
     return {
       id: uuidv4(),
       from: this.config.id,
       to: 'orchestrator',
-      content: content || '(HTTP response)',
+      content: content || '',
       timestamp: Date.now(),
-      parts: parts.length > 0 ? parts : undefined
+      parts: parts.length > 0 ? parts : undefined,
+      tokenUsage
     };
   }
 
@@ -777,10 +892,13 @@ export class OpenCodeServeClient {
         // Đọc từ ev.part trước rồi fallback ev.text để tương thích cả 2 cấu trúc (giống ACPClient).
         const evType = String(ev.type || ev.evt || '').toLowerCase().replace(/-/g, '_');
         if (evType === 'text' || evType === 'assistant') {
-          const txt = ev.part?.text ?? ev.text ?? ev.message ?? ev.content;
-          if (typeof txt === 'string' && txt) {
-            content += txt;
-            parts.push({ type: 'text', content: txt });
+          const rawTxt = ev.part?.text ?? ev.text ?? ev.message ?? ev.content;
+          if (typeof rawTxt === 'string' && rawTxt) {
+            const txt = rawTxt.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<\/?think>/gi, '');
+            if (txt) {
+              content += txt;
+              parts.push({ type: 'text', content: txt });
+            }
           }
         } else if (evType === 'thinking' || evType === 'reasoning' || evType === 'thought') {
           const rt = ev.part?.text ?? ev.text ?? ev.part?.thinking ?? ev.thinking;

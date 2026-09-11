@@ -89,6 +89,21 @@ export class SmartRuleRegistry {
     }
   }
 
+  public setTargetScope(scope: 'orchestrator' | 'all') {
+    const defaultRule = this.rules.get('inactivity-clarify') as any;
+    if (defaultRule && typeof defaultRule.setTargetScope === 'function') {
+      defaultRule.setTargetScope(scope);
+      try {
+        localStorage.setItem('agentforge_smart_clarify_scope', scope);
+      } catch {}
+    }
+  }
+
+  public getTargetScope(): 'orchestrator' | 'all' {
+    const defaultRule = this.rules.get('inactivity-clarify') as any;
+    return defaultRule?.targetScope || 'orchestrator';
+  }
+
   public getPromptTemplate(): string {
     const defaultRule = this.rules.get('inactivity-clarify') as any;
     return defaultRule?.promptTemplate || 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.';
@@ -101,7 +116,7 @@ export class SmartRuleRegistry {
   /**
    * Xử lý tin nhắn xuất phát từ User qua toàn bộ pipeline các smart rules đã đăng ký
    */
-  public processMessage(rawText: string, targetId: string = 'orchestrator'): SmartRuleResult {
+  public processMessage(rawText: string, targetId: string = 'orchestrator', targetRole?: string, targetType?: string): SmartRuleResult {
     const now = Date.now();
     const isFirstMessage = this.lastUserSendTimestamp === 0;
     const timeSinceLastUserMessageSec = isFirstMessage ? 999999 : Math.max(0, (now - this.lastUserSendTimestamp) / 1000);
@@ -110,7 +125,9 @@ export class SmartRuleRegistry {
       rawText,
       targetId,
       isFirstMessage,
-      timeSinceLastUserMessageSec
+      timeSinceLastUserMessageSec,
+      targetRole,
+      targetType
     };
 
     // Đánh dấu mốc thời gian của tin nhắn vừa gửi

@@ -14,7 +14,7 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
 
   // GET /api/settings
   router.get('/', (_req, res) => {
-    const engineMode = deps.storage.getSetting('engineMode', 'attach');
+    const engineMode = deps.storage.getSetting('engineMode', 'http');
     const opencodeServeUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
     res.json({
       engineMode,
@@ -22,12 +22,14 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
       serveUrl: opencodeServeUrl,
       autoContinue: deps.storage.getSetting('autoContinue', false) === true,
       enableWatchdog: deps.storage.getSetting('enableWatchdog', false) === true,
-      watchdogStreamTimeoutSec: Number(deps.storage.getSetting('watchdogStreamTimeoutSec', 45)) || 45,
-      taskQueueIdleCheckSec: Number(deps.storage.getSetting('taskQueueIdleCheckSec', 30)) || 30,
+      watchdogStreamTimeoutSec: Number(deps.storage.getSetting('watchdogStreamTimeoutSec', 60)) || 60,
+      watchdogIdleTimeoutSec: Number(deps.storage.getSetting('watchdogIdleTimeoutSec', deps.storage.getSetting('taskQueueIdleCheckSec', 120))) || 120,
+      taskQueueIdleCheckSec: Number(deps.storage.getSetting('watchdogIdleTimeoutSec', deps.storage.getSetting('taskQueueIdleCheckSec', 120))) || 120,
       taskUpdateThrottleMs: Number(deps.storage.getSetting('taskUpdateThrottleMs', 600)) || 600,
       smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false) === true,
       smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 120)) || 120,
       smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.'),
+      smartClarifyScope: deps.storage.getSetting('smartClarifyScope', 'orchestrator'),
       workerReminderPrompt: deps.storage.getSetting('workerReminderPrompt', '=== SYSTEM REMINDER ===\nUse <talk target="<target-id>">your message</talk> for communications.\nKhi bắt đầu xử lý, hãy dùng: <task_update task="N" status="working" />\nKhi hoàn thành và nghiệm thu xong, hãy dùng: <task_update task="N" status="completed" />\n(Lưu ý: Các lệnh điều phối AgentForge phải viết trực tiếp dưới dạng thẻ văn bản ngoài trường text, tuyệt đối không gọi qua toolcalls)'),
       isSystemStarted: deps.storage.getSetting('isSystemStarted', false) === true,
       models: deps.storage.getModelSettings()
@@ -43,11 +45,13 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
       autoContinue,
       enableWatchdog,
       watchdogStreamTimeoutSec,
+      watchdogIdleTimeoutSec,
       taskQueueIdleCheckSec,
       taskUpdateThrottleMs,
       smartClarifyEnabled,
       smartClarifyTimeoutSec,
       smartClarifyPromptTemplate,
+      smartClarifyScope,
       workerReminderPrompt,
       isSystemStarted
     } = req.body || {};
@@ -73,10 +77,16 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
       deps.storage.setSetting('enableWatchdog', Boolean(enableWatchdog));
     }
     if (watchdogStreamTimeoutSec !== undefined) {
-      deps.storage.setSetting('watchdogStreamTimeoutSec', Math.max(5, Number(watchdogStreamTimeoutSec) || 45));
+      deps.storage.setSetting('watchdogStreamTimeoutSec', Math.max(5, Number(watchdogStreamTimeoutSec) || 60));
     }
-    if (taskQueueIdleCheckSec !== undefined) {
-      deps.storage.setSetting('taskQueueIdleCheckSec', Math.max(5, Number(taskQueueIdleCheckSec) || 30));
+    if (watchdogIdleTimeoutSec !== undefined) {
+      const idleVal = Math.max(5, Number(watchdogIdleTimeoutSec) || 120);
+      deps.storage.setSetting('watchdogIdleTimeoutSec', idleVal);
+      deps.storage.setSetting('taskQueueIdleCheckSec', idleVal);
+    } else if (taskQueueIdleCheckSec !== undefined) {
+      const idleVal = Math.max(5, Number(taskQueueIdleCheckSec) || 120);
+      deps.storage.setSetting('watchdogIdleTimeoutSec', idleVal);
+      deps.storage.setSetting('taskQueueIdleCheckSec', idleVal);
     }
     if (taskUpdateThrottleMs !== undefined) {
       deps.storage.setSetting('taskUpdateThrottleMs', Math.max(100, Number(taskUpdateThrottleMs) || 600));
@@ -90,6 +100,9 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     if (smartClarifyPromptTemplate !== undefined && typeof smartClarifyPromptTemplate === 'string') {
       deps.storage.setSetting('smartClarifyPromptTemplate', smartClarifyPromptTemplate);
     }
+    if (smartClarifyScope !== undefined && typeof smartClarifyScope === 'string') {
+      deps.storage.setSetting('smartClarifyScope', smartClarifyScope === 'all' ? 'all' : 'orchestrator');
+    }
     if (workerReminderPrompt !== undefined && typeof workerReminderPrompt === 'string') {
       deps.storage.setSetting('workerReminderPrompt', workerReminderPrompt);
     }
@@ -98,10 +111,13 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     }
 
     if (changed) {
+      for (const client of deps.clients.values()) {
+        try { client.abort(); } catch {}
+      }
       deps.clients.clear();
     }
 
-    const currentMode = deps.storage.getSetting('engineMode', 'attach');
+    const currentMode = deps.storage.getSetting('engineMode', 'http');
     const currentUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
 
     const updatedPayload = {
@@ -110,11 +126,13 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
       serveUrl: currentUrl,
       autoContinue: deps.storage.getSetting('autoContinue', false),
       enableWatchdog: deps.storage.getSetting('enableWatchdog', false),
-      watchdogStreamTimeoutSec: Number(deps.storage.getSetting('watchdogStreamTimeoutSec', 45)),
-      taskQueueIdleCheckSec: Number(deps.storage.getSetting('taskQueueIdleCheckSec', 30)),
+      watchdogStreamTimeoutSec: Number(deps.storage.getSetting('watchdogStreamTimeoutSec', 60)),
+      watchdogIdleTimeoutSec: Number(deps.storage.getSetting('watchdogIdleTimeoutSec', deps.storage.getSetting('taskQueueIdleCheckSec', 120))),
+      taskQueueIdleCheckSec: Number(deps.storage.getSetting('watchdogIdleTimeoutSec', deps.storage.getSetting('taskQueueIdleCheckSec', 120))),
       smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false),
       smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 30)),
       smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', ''),
+      smartClarifyScope: deps.storage.getSetting('smartClarifyScope', 'orchestrator'),
       workerReminderPrompt: deps.storage.getSetting('workerReminderPrompt', ''),
       isSystemStarted: deps.storage.getSetting('isSystemStarted', false)
     };
@@ -176,13 +194,14 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     res.json({
       smartClarifyEnabled: deps.storage.getSetting('smartClarifyEnabled', false) === true,
       smartClarifyTimeoutSec: Number(deps.storage.getSetting('smartClarifyTimeoutSec', 120)) || 120,
-      smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.')
+      smartClarifyPromptTemplate: deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.'),
+      smartClarifyScope: deps.storage.getSetting('smartClarifyScope', 'orchestrator')
     });
   });
 
   // POST /api/settings/smartClarify
   router.post('/smartClarify', (req, res) => {
-    const { smartClarifyEnabled, smartClarifyTimeoutSec, smartClarifyPromptTemplate } = req.body || {};
+    const { smartClarifyEnabled, smartClarifyTimeoutSec, smartClarifyPromptTemplate, smartClarifyScope } = req.body || {};
     const enabled = smartClarifyEnabled !== undefined ? Boolean(smartClarifyEnabled) : true;
     const timeoutSec = Math.max(5, Number(smartClarifyTimeoutSec) || 120);
     deps.storage.setSetting('smartClarifyEnabled', enabled);
@@ -190,9 +209,13 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     if (smartClarifyPromptTemplate !== undefined && typeof smartClarifyPromptTemplate === 'string') {
       deps.storage.setSetting('smartClarifyPromptTemplate', smartClarifyPromptTemplate);
     }
+    if (smartClarifyScope !== undefined && typeof smartClarifyScope === 'string') {
+      deps.storage.setSetting('smartClarifyScope', smartClarifyScope === 'all' ? 'all' : 'orchestrator');
+    }
     const template = deps.storage.getSetting('smartClarifyPromptTemplate', 'Người dùng nói rằng "{content}", bạn hãy xác minh theo sự hiểu của bạn và hỏi lại người dùng xem có đúng ý bạn không một lần nữa.');
-    deps.broadcast('settings:updated', { smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec, smartClarifyPromptTemplate: template });
-    res.json({ success: true, smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec, smartClarifyPromptTemplate: template });
+    const scope = deps.storage.getSetting('smartClarifyScope', 'orchestrator');
+    deps.broadcast('settings:updated', { smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec, smartClarifyPromptTemplate: template, smartClarifyScope: scope });
+    res.json({ success: true, smartClarifyEnabled: enabled, smartClarifyTimeoutSec: timeoutSec, smartClarifyPromptTemplate: template, smartClarifyScope: scope });
   });
 
   // GET /api/settings/defaultExpandToolcalls
@@ -225,7 +248,7 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
 
   // GET /api/settings/engineMode
   router.get('/engineMode', (_req, res) => {
-    const engineMode = deps.storage.getSetting('engineMode', 'attach');
+    const engineMode = deps.storage.getSetting('engineMode', 'http');
     const opencodeServeUrl = deps.storage.getSetting('opencodeServeUrl', deps.storage.getSetting('serveUrl', 'http://127.0.0.1:4096'));
     res.json({ engineMode, opencodeServeUrl, serveUrl: opencodeServeUrl });
   });
@@ -233,7 +256,7 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
   // POST /api/settings/engineMode
   router.post('/engineMode', (req, res) => {
     const { engineMode, serveUrl, opencodeServeUrl } = req.body || {};
-    const validMode = (engineMode === 'attach' || engineMode === 'http' || engineMode === 'run') ? engineMode : 'attach';
+    const validMode = (engineMode === 'attach' || engineMode === 'http' || engineMode === 'run') ? engineMode : 'http';
     const rawUrl = (typeof opencodeServeUrl === 'string' && opencodeServeUrl.trim())
       ? opencodeServeUrl.trim()
       : (typeof serveUrl === 'string' && serveUrl.trim() ? serveUrl.trim() : 'http://127.0.0.1:4096');
@@ -242,6 +265,9 @@ export function createSettingsRouter(deps: SettingsRouteDeps): Router {
     deps.storage.setSetting('opencodeServeUrl', rawUrl);
     deps.storage.setSetting('serveUrl', rawUrl);
 
+    for (const client of deps.clients.values()) {
+      try { client.abort(); } catch {}
+    }
     deps.clients.clear();
 
     deps.broadcast('settings:updated', { engineMode: validMode, opencodeServeUrl: rawUrl, serveUrl: rawUrl });

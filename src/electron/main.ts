@@ -236,11 +236,17 @@ async function ensureServerRunning(): Promise<void> {
   const runner = findBackendRunner();
   if (!runner) {
     console.warn('[Electron] Could not locate backend runner. Attempting in-process fallback import...');
-    try {
-      await import('../dist/server.js' as any);
-      console.log(`[Electron] In-process fallback import succeeded.`);
-    } catch (e: any) {
-      console.error('[Electron] In-process fallback import failed:', e?.message || e);
+    const fallbackPath = path.resolve(getProjectRoot(), 'dist', 'server.js');
+    if (fs.existsSync(fallbackPath)) {
+      try {
+        const fileUrl = pathToFileURL(fallbackPath).href;
+        await import(fileUrl);
+        console.log(`[Electron] In-process fallback import succeeded.`);
+      } catch (e: any) {
+        console.error('[Electron] In-process fallback import failed:', e?.message || e);
+      }
+    } else {
+      console.error(`[Electron] In-process fallback failed: file not found at ${fallbackPath}`);
     }
     return;
   }

@@ -19,7 +19,7 @@ let adoptedServePort: number | null = null;
 const MAX_RESTART_ATTEMPTS = 5;
 const RESTART_BACKOFF_BASE_MS = 2000; // 2s, 4s, 8s, 16s, 32s
 const HEALTH_CHECK_INTERVAL_MS = 30000; // 30s periodic health check
-const HEALTH_CHECK_TIMEOUT_MS = 5000;
+const HEALTH_CHECK_TIMEOUT_MS = 12000; // 12s timeout (tránh false-positive khi model LLM inference nặng)
 
 let restartCount = 0;
 let lastSpawnTime = 0;
@@ -103,25 +103,31 @@ function startHealthMonitor(): void {
     const ownedAlive = !!opencodeProcess && !opencodeProcess.killed;
     const adoptedAlive = !ownedAlive && adoptedServePort !== null;
     if (!ownedAlive && !adoptedAlive) return;
-    const healthy = await quickHealthCheck(currentServePort);
-    if (!healthy && !isShuttingDown) {
-      console.warn(`[OpenCodeSpawner] ⚠️ Health check failed for port ${currentServePort}. Will retry...`);
-      // Don't kill immediately — the process might be temporarily busy.
-      // Second failure in next cycle triggers restart.
-      const retryOk = await quickHealthCheck(currentServePort);
-      if (!retryOk && !isShuttingDown) {
-        console.error(`[OpenCodeSpawner] ❌ Two consecutive health check failures on port ${currentServePort}. Restarting/re-spawning...`);
-        if (adoptedServePort !== null && adoptedServePort === currentServePort) {
-          // serve được adopt (không thuộc quyền quản lý) → bỏ adopt, spawn serve riêng
-          adoptedServePort = null;
-          autoRestartEnabled = true;
-          ensureOpenCodeServer().catch((err) => {
-            console.error(`[OpenCodeSpawner] Re-spawn after adopted-serve failure:`, err?.message || err);
-          });
-        } else {
-          // serve do chính spawner quản lý → kill để exit handler restart
-          forceKillForRestart();
-          autoRestartEnabled = true;
+    const healthy1 = await quickHealthCheck(currentServePort);
+    if (!healthy1 && !isShuttingDown) {
+      console.warn(`[OpenCodeSpawner] ⚠️ Health check #1 failed for port ${currentServePort}. Process may be busy with LLM inference. Waiting 4s before retry #2...`);
+      await new Promise((r) => setTimeout(r, 4000));
+
+      const healthy2 = await quickHealthCheck(currentServePort);
+      if (!healthy2 && !isShuttingDown) {
+        console.warn(`[OpenCodeSpawner] ⚠️ Health check #2 failed for port ${currentServePort}. Waiting 5s before final retry #3...`);
+        await new Promise((r) => setTimeout(r, 5000));
+
+        const healthy3 = await quickHealthCheck(currentServePort);
+        if (!healthy3 && !isShuttingDown) {
+          console.error(`[OpenCodeSpawner] ❌ Three consecutive health check failures over ~25s on port ${currentServePort}. Restarting/re-spawning...`);
+          if (adoptedServePort !== null && adoptedServePort === currentServePort) {
+            // serve được adopt (không thuộc quyền quản lý) → bỏ adopt, spawn serve riêng
+            adoptedServePort = null;
+            autoRestartEnabled = true;
+            ensureOpenCodeServer().catch((err) => {
+              console.error(`[OpenCodeSpawner] Re-spawn after adopted-serve failure:`, err?.message || err);
+            });
+          } else {
+            // serve do chính spawner quản lý → kill để exit handler restart
+            forceKillForRestart();
+            autoRestartEnabled = true;
+          }
         }
       }
     }
@@ -222,8 +228,9 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; url: strin
     return { port: currentServePort, url: `http://127.0.0.1:${currentServePort}` };
   }
 
-  // CHÍNH SÁCH: Không tái sử dụng tiến trình opencode đang chạy bên ngoài.
-  // Luôn tìm port trống mới (nếu port bận thì tự động tăng +1) và tự spawn tiến trình riêng.
+  // CHÍNH SÁCH VẬN HÀNH: Không tái sử dụng tiến trình opencode bên ngoài.
+  // Bắt buộc AgentForge tự spawn tiến trình riêng và gắn PID vào Windows Kernel Job Object.
+  // Khi AgentForge tắt hoặc bị ngắt, Windows Kernel tự động hủy toàn bộ tiến trình serve, đảm bảo không có agent chạy ngầm.
 
   isSpawning = true;
   try {
@@ -239,8 +246,10 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; url: strin
       }
     }
 
+    // Mặc định khởi động ở port 4096, nếu đã bị chiếm thì tự động tăng port đến khi tìm được free và gán cứng
     const freePort = await findFreePortFrom(4096);
     currentServePort = freePort;
+
     const isWin = process.platform === 'win32';
     const cmd = isWin ? 'cmd.exe' : 'sh';
     const args = isWin
@@ -312,7 +321,7 @@ export async function ensureOpenCodeServer(): Promise<{ port: number; url: strin
     process.env.OPENCODE_SERVE_PORT = String(freePort);
     process.env.OPENCODE_SERVE_URL = serveUrl;
     adoptedServePort = null; // giờ chúng ta tự quản lý serve mới
-    persistServeUrl(serveUrl); // sync storage để createAgentClient dùng ĐÚNG port động
+    persistServeUrl(serveUrl); // sync storage để createAgentClient dùng ĐÚNG port cố định
 
     if (ready) {
       console.log(`[OpenCodeSpawner] ✅ opencode serve ready at ${serveUrl}`);

@@ -22,7 +22,7 @@ interface Message {
   thinking?: string;
 }
 
-interface ChatMsg {
+export interface ChatMsg {
   id: string;
   from: string;
   to?: string;
@@ -34,12 +34,16 @@ interface ChatMsg {
   agentRole?: string;
   msgType?: string;
   showOnUI?: boolean;
+  isStreaming?: boolean;
+  isQueued?: boolean;
+  messageId?: string;
   // Toolcall cấu trúc từ event gốc opencode (backend gửi kèm trong payload)
   toolCalls?: Array<{ tool: string; input?: string; output?: string }>;
   thinking?: string;
   // Ordered parts (Option C): text + tool xen kẽ theo ĐÚNG thứ tự opencode emit — server gửi trong final snapshot.
   // Client render trực tiếp theo array. OPTIONAL (không có → render theo cách cũ).
   parts?: Array<{ type: 'text' | 'tool' | 'thinking'; content?: string; tool?: string; input?: string; output?: string }>;
+  teamId?: string;
 }
 
 interface AgentInfo {
@@ -48,6 +52,7 @@ interface AgentInfo {
   role?: string;
   type?: string;
   task?: string;
+  tasks?: Array<{ id?: string; task: string; status: string }>;
   status?: string;
 }
 
@@ -343,19 +348,6 @@ function htmlToMarkdown(html: string): string {
 const ANSI_NOISE_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-NPRZcf-nqry=><]/g;
 const ANSI_SGR_SPLIT = /((?:\u001b\[|\u009b\[|\[)\d{1,3}(?:;\d{1,3}){0,8}m)/g;
 
-// Hàm dọn dẹp các lệnh hệ thống (delete_task, task_update, directives) khỏi text hiển thị
-export function stripSystemTaskTags(text: string): string {
-  if (!text) return '';
-  return String(text)
-    .replace(/<\s*delete_task\b[^>]*\/>/gi, '')
-    .replace(/<\s*delete_task\b[^>]*>[\s\S]*?<\/\s*delete_task\s*>/gi, '')
-    .replace(/\[DELETE\s+TASK\b[^\]]*\]/gi, '')
-    .replace(/<\s*task_update\b[^>]*\/>/gi, '')
-    .replace(/<\s*task_update\b[^>]*>[\s\S]*?<\/\s*task_update\s*>/gi, '')
-    .replace(/\[TASK\s+UPDATE\b[^\]]*\]/gi, '')
-    .trim();
-}
-
 function ansiApplyCode(code: number, style: React.CSSProperties): React.CSSProperties {
   const s = { ...style };
   switch (code) {
@@ -481,99 +473,6 @@ function extIcon(path: string): React.ReactNode {
     }}>{cfg.glyph}</span>
   );
 }
-
-const CodeBlock = React.memo(function CodeBlock({ code, lang, isMobile }: { code: string; lang: string; isMobile?: boolean }) {
-  const [copied, setCopied] = useState(false);
-
-  // USER: giới hạn tối đa 90 dòng hiển thị code (cắt trước khi tokenize)
-  const displayCode = clampToolLines(code).text;
-
-  // Chỉ tokenize khi ngôn ngữ được hỗ trợ — fallback plain text giữ hiệu năng tối đa
-  const supported = useMemo(() => isSupportedLang(lang), [lang]);
-  const tokens = useMemo(() => (supported ? highlight(displayCode, lang) : []), [supported, displayCode, lang]);
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(code).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }).catch(() => {});
-  };
-
-  return (
-    <div style={{
-      borderRadius: 8,
-      border: '1px solid var(--af-border)',
-      background: 'var(--bg-inset)',
-      margin: '8px 0',
-      overflow: 'hidden',
-      width: '100%',
-      boxSizing: 'border-box'
-    }}>
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        padding: '6px 12px',
-        background: 'rgba(255, 255, 255, 0.03)',
-        borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
-        fontSize: 11,
-        color: 'var(--text-secondary)',
-        fontFamily: 'monospace'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          {getLangBadge(lang)}
-          <span style={{ fontWeight: 600, textTransform: 'lowercase' }}>{lang || 'code'}</span>
-        </div>
-        <button
-          onClick={handleCopy}
-          style={{
-            background: copied ? 'rgba(34, 197, 94, 0.15)' : 'transparent',
-            border: copied ? '1px solid rgba(34, 197, 94, 0.3)' : 'none',
-            color: copied ? '#10b981' : '#93c5fd',
-            borderRadius: 4,
-            padding: '2px 6px',
-            fontSize: 11,
-            cursor: 'pointer',
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            transition: 'all 0.15s ease'
-          }}
-        >
-          <span>{copied ? '✓' : '📋'}</span>
-          <span>{copied ? 'Copied' : 'Copy'}</span>
-        </button>
-      </div>
-      <pre style={{
-        margin: 0,
-        padding: '10px 14px',
-        overflowX: 'auto',
-        maxWidth: '100%',
-        fontSize: isMobile ? 12 : 11.5,
-        lineHeight: 1.55,
-        color: 'var(--text-primary)',
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
-      }}>
-        {supported ? (
-          <code>{tokens.map((t, i) => (
-            <span
-              key={i}
-              style={{
-                color: t.color || undefined,
-                fontStyle: t.italic ? 'italic' : undefined,
-                fontWeight: t.bold ? 700 : undefined
-              }}
-            >
-              {t.text}
-            </span>
-          ))}</code>
-        ) : (
-          <code>{displayCode}</code>
-        )}
-      </pre>
-    </div>
-  );
-});
 
 // ============ WRITE FILE VIEWER ============
 // Hiển thị tool write dạng khung file đẹp: header nổi bật, nội dung code có expand/collapse, badge thành công.
@@ -945,7 +844,10 @@ function parseTodosFrom(raw?: string): any[] {
 
 const TODO_STATUS_ICON: Record<string, string> = {
   in_progress: '🟡',
+  working: '🟡',
   completed: '✅',
+  cancelled: '❌',
+  cancel: '❌',
   pending: '⬜'
 };
 
@@ -1649,21 +1551,27 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   // FIX 2: Bóc tách danh sách các directives trong content và kiểm tra trùng lặp từng directive
   // Tin nhắn từ User hoặc tin nhắn thông thường không chứa thẻ điều phối (<talk>, <spawn>, <report>)
   // thì KHÔNG bóc tách directives, tránh việc bọc text vào activeDirectives gây xung đột hiển thị với bubble text chuẩn.
+  // CHỈ Orchestrator hoặc Sub-Orchestrator mới phát sinh Directive Cards giao việc / spawn.
+  // Worker report / streaming message: KHÔNG biến tin nhắn của Worker thành directive card giao việc!
   const contentDirectives = useMemo(() => {
     if (msg.msgType === 'talk') return [];
     if (typeof msg.content !== 'string') return [];
-    if (isUser) return []; // User message luôn là plain text bubble, không kích hoạt directive container
+    if (isUser) return []; // User message luôn là plain text bubble
+    const isSenderOrch = isOrchestrator || isFromCurrentSubOrch || msg.from === 'orchestrator' || msg.agentRole === 'orchestrator';
+    if (!isSenderOrch) return [];
     const hasAnyDirectiveTag = /(?:<|\b\[)\s*(?:talk|spawn|report)\b/i.test(msg.content);
     if (!hasAnyDirectiveTag) return []; // Không chứa tag directive thì không bóc tách
     const all = extractAllDirectivesAndText(msg.content);
     return all;
-  }, [msg.msgType, msg.content, isUser]);
+  }, [msg.msgType, msg.content, isUser, isOrchestrator, isFromCurrentSubOrch, msg.from, msg.agentRole]);
 
   // FIX: Kích hoạt Dedup Directives
   // Nếu một directive (Talk/Spawn) đã được phát thành tin nhắn độc lập trong hội thoại (hoặc đã được hiển thị ngoài luồng chat),
   // thì bên trong bubble tổng hợp của Orchestrator PHẢI ĐƯỢC ẨN ĐI (đưa vào duplicateDirectivesSet), không render lặp lại lần thứ 3!
   const duplicateDirectivesSet = useMemo(() => {
     const dups = new Set<number>();
+    // KHI ĐANG STREAM: TUYỆT ĐỐI KHÔNG dedup ẩn directive đang chạy
+    if (msg.isStreaming) return dups;
     if (!allMessagesList || allMessagesList.length === 0) return dups;
 
     contentDirectives.forEach((dir, idx) => {
@@ -1720,7 +1628,12 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
   const hasActiveDirectives = activeDirectives.some(d => d.type === 'talk' || d.type === 'spawn' || d.type === 'report');
   const hasDuplicateIndependentTalk = hasDirectiveInItems && !hasActiveDirectives;
 
-  const isOrchestratorTask = (
+  // CHỈ coi là Orchestrator Task (thẻ giao việc từ Orchestrator tới worker) khi:
+  // 1. Người gửi thực sự là Orchestrator (isOrchestrator === true), VÀ
+  // 2. Có activeDirectives (hoặc msgType === 'talk' gửi tới worker)
+  // Khi worker gửi <talk> (ví dụ báo cáo cho Orchestrator hoặc trao đổi với verifier):
+  // Đó là tin nhắn trao đổi (Talk message), PHẢI hiện bubble chat đầy đủ ở cả 2 khung chat!
+  const isOrchestratorTask = isOrchestrator && (
     (msg.msgType === 'talk' && msg.to && msg.to !== 'user' && msg.to !== 'broadcast') ||
     hasActiveDirectives
   );
@@ -1863,8 +1776,29 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
     senderColor = '#34d399';
   }
 
-  // Parse and strip internal prompt wrappers ([TEAM]...[/TEAM], [TASK], === INCOMING MESSAGE ===, === SYSTEM REMINDER ===, etc.)
+  // Nhận diện người gửi thực sự nếu tin nhắn chứa header === INCOMING MESSAGE ===
+  // (Khắc phục triệt để lỗi hiển thị tin hệ thống/Orchestrator gửi đến nhưng hiện nhầm bên phía Agent phát ra)
+  const incomingFromMatch = (msg.content || '').match(/=== INCOMING MESSAGE ===[\s\S]*?\bFROM:\s*([^\n\r(]+)/i);
+  if (incomingFromMatch && incomingFromMatch[1]) {
+    const trueSender = incomingFromMatch[1].trim();
+    if (trueSender) {
+      sender = trueSender;
+      const isSenderOrch = /orchestrator/i.test(trueSender);
+      senderColor = isSenderOrch ? '#a5b4fc' : '#22d3ee';
+      roleBadge = isSenderOrch ? 'main' : (roleBadge || 'orchestrator');
+    }
+  }
+
+  // Parse and strip internal prompt wrappers ([YOUR TASKS STATUS], [TEAM]...[/TEAM], [TASK], === INCOMING MESSAGE ===, === SYSTEM REMINDER ===, etc.)
   let rawContent: string = (msg.content || '').normalize('NFC');
+  if (rawContent.includes('[YOUR TASKS STATUS]')) {
+    if (rawContent.includes('[/YOUR TASKS STATUS]')) {
+      rawContent = rawContent.replace(/\[YOUR TASKS STATUS\][\s\S]*?\[\/YOUR TASKS STATUS\]/g, '').trim();
+    } else {
+      rawContent = rawContent.replace(/\[YOUR TASKS STATUS\][\s\S]*/g, '').trim();
+    }
+  }
+
   if (rawContent.includes('=== INCOMING MESSAGE ===') && rawContent.includes('=== MESSAGE ===')) {
     const msgIdx = rawContent.indexOf('=== MESSAGE ===');
     let inner = rawContent.substring(msgIdx + '=== MESSAGE ==='.length);
@@ -2119,11 +2053,15 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
     return null;
   }
 
-  // Guard tin nhắn rỗng: nếu sau khi làm sạch không còn conversationText, không có report,
+  // Guard tin nhắn rỗng / fallback giả '(HTTP response)': nếu sau khi làm sạch không còn conversationText, không có report,
   // không có body, không có thinking, không có toolCalls và không có parts -> ẨN TOÀN BỘ MessageItem,
-  // tránh sinh ra header mồ côi (chỉ hiện tên người gửi mà không có bong bóng nội dung nào).
-  const cleanConvText = stripSystemTaskTags(conversationText || '').trim();
-  const cleanBodyText = stripSystemTaskTags(body || '').trim();
+  // tránh sinh ra header mồ côi hoặc hiển thị thẻ '(HTTP response)' vô nghĩa.
+  const isHttpFallback = String(msg.content || '').trim() === '(HTTP response)';
+  if (isHttpFallback && !hasToolBlocks && !hasParts && (!msg.thinking || !String(msg.thinking).trim())) {
+    return null;
+  }
+  const cleanConvText = stripSystemTaskTags(conversationText || '').replace(/^\(HTTP response\)$/i, '').trim();
+  const cleanBodyText = stripSystemTaskTags(body || '').replace(/^\(HTTP response\)$/i, '').trim();
   const hasAnyThinking = typeof msg.thinking === 'string' && msg.thinking.trim().length > 0;
   const hasAnyText = !!cleanConvText || 
                      !!(hasReport && reportContent && reportContent.trim()) || 
@@ -2136,6 +2074,70 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
 
   if (!hasAnyContent) {
     return null;
+  }
+
+  // Khối đặc biệt: Cập nhật task (task_update) -> hiển thị danh sách checklist todolist trực quan
+  if (msg.msgType === 'task_update') {
+    return (
+      <div
+        className="fade-in af-message-item-container"
+        data-msg-id={msg.id}
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-start',
+          alignSelf: 'flex-start',
+          width: '100%',
+          marginBottom: 14
+        }}
+      >
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          fontSize: 11,
+          marginBottom: 6,
+          fontWeight: 600
+        }}>
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              padding: '2px 8px',
+              borderRadius: 6,
+              fontSize: 11,
+              fontWeight: 600,
+              background: '#000000',
+              border: '1px solid rgba(148, 163, 184, 0.3)',
+              color: '#94a3b8'
+            }}
+          >
+            <span>⚙️ System</span>
+          </span>
+          <span style={{ color: '#818cf8', fontWeight: 700, fontSize: 12 }}>➜</span>
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              padding: '2px 8px',
+              borderRadius: 6,
+              fontSize: 11,
+              fontWeight: 600,
+              background: '#000000',
+              border: '1px solid rgba(52, 211, 153, 0.4)',
+              color: '#6ee7b7'
+            }}
+          >
+            <span>🤖 {srcAgent?.name || msg.agentName || 'Agent'}</span>
+          </span>
+        </div>
+        <div style={{ width: 'fit-content', minWidth: isMobile ? '100%' : 380, maxWidth: isMobile ? '100%' : '85%' }}>
+          <TodoListViewer output={msg.content} />
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -2462,8 +2464,8 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 <React.Fragment key={'pt-' + i}>
                   {items.map((item, subIdx) => {
                     if (item.type === 'text') {
-                      const cleanT = item.text || '';
-                      if (!cleanT.trim()) return null;
+                      const cleanT = stripSystemTaskTags(item.text || '').trim();
+                      if (!cleanT) return null;
                       return (
                         <div
                           key={`pt-${i}-txt-${subIdx}`}
@@ -2472,7 +2474,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                             background: bubbleBg,
                             color: textColor,
                             padding: '10px 14px',
-                            paddingRight: 48,
                             borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
                             width: 'fit-content',
                             maxWidth: isMobile ? '96%' : '82%',
@@ -2493,31 +2494,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                             marginBottom: 4
                           }}
                         >
-                          <button
-                            onClick={copyFullMarkdown}
-                            style={{
-                              position: 'absolute',
-                              top: 6,
-                              right: 6,
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              padding: '2px 6px',
-                              borderRadius: 4,
-                              background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)',
-                              border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : '1px solid rgba(255, 255, 255, 0.12)',
-                              color: copiedMsgId === msg.id ? '#4ade80' : 'var(--text-muted, #94a3b8)',
-                              fontSize: 10,
-                              fontWeight: 600,
-                              cursor: 'pointer',
-                              transition: 'all 0.15s ease',
-                              zIndex: 2,
-                              userSelect: 'none'
-                            }}
-                            title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
-                          >
-                            {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
-                          </button>
                           <MarkdownRenderer content={cleanT} isMobile={isMobile} />
                         </div>
                       );
@@ -2537,7 +2513,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                           role={pSpawnRole}
                           targetName={displayTargetName}
                           senderName={srcAgent?.name || 'Orchestrator'}
-                          content={item.data.message || pSpawnTaskDesc || item.raw}
+                          content={item.data.message || pSpawnTaskDesc || item.raw || ''}
                           isMobile={isMobile}
                           bubbleBg={bubbleBg}
                           bubbleBorder={bubbleBorder}
@@ -2546,6 +2522,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                           isAlignRight={isAlignRight}
                           isOpenCode={isOpenCode}
                           defaultExpanded={expandDirectives}
+                          isStreaming={Boolean(msg.isStreaming)}
                         />
                       );
                     }
@@ -2553,7 +2530,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     if (item.type === 'report') {
                       const pReportTarget = item.data.target || 'orchestrator';
                       const pReportTitle = item.data.title || item.data.task || 'Báo Cáo Tiến Độ / Kết Quả';
-                      const pReportContent = item.data.message || item.raw;
+                      const pReportContent = item.data.message || item.raw || '';
 
                       return (
                         <UnifiedDirectiveCard
@@ -2571,6 +2548,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                           isAlignRight={isAlignRight}
                           isOpenCode={isOpenCode}
                           defaultExpanded={expandDirectives}
+                          isStreaming={Boolean(msg.isStreaming)}
                         />
                       );
                     }
@@ -2582,13 +2560,13 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                       const displayTargetName = pTalkTarget || displayTo || 'Agent';
 
                       return (
-<UnifiedDirectiveCard
+                        <UnifiedDirectiveCard
                            key={`pt-${i}-tk-${subIdx}`}
                            type="talk"
-                           title={pTalkTaskTitle || (pTalkBody ? (pTalkBody.split('\n')[0].substring(0, 80) + '...') : '')}
+                           title={pTalkTaskTitle || (msg.isStreaming ? '' : (pTalkBody ? (pTalkBody.split('\n')[0].substring(0, 80) + '...') : ''))}
                            targetName={displayTargetName}
                            senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
-                           content={pTalkBody || pTalkTaskTitle || item.raw}
+                           content={pTalkBody || pTalkTaskTitle || item.raw || ''}
                            isMobile={isMobile}
                            bubbleBg={bubbleBg}
                            bubbleBorder={bubbleBorder}
@@ -2597,6 +2575,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                            isAlignRight={isAlignRight}
                            isOpenCode={isOpenCode}
                            defaultExpanded={expandDirectives}
+                           isStreaming={Boolean(msg.isStreaming)}
                          />
                       );
                     }
@@ -2617,6 +2596,9 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
             const segHasReport = segSplit.hasReport;
             const segReportTitle = segSplit.reportTitle;
             const segReportContent = segSplit.reportContent;
+
+            const segCleanText = stripSystemTaskTags(segConvText || segText).trim();
+            if (!segCleanText) return null;
 
             return (
               <div
@@ -2644,7 +2626,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 marginLeft: isAlignRight ? 'auto' : undefined,
                 marginRight: isAlignRight ? undefined : 'auto'
               }}>
-                <MarkdownRenderer content={segConvText || segText} isMobile={isMobile} />
+                <MarkdownRenderer content={segCleanText} isMobile={isMobile} />
               </div>
             );
           })}
@@ -2673,7 +2655,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 background: isOrchestratorTask ? '#ffffff' : bubbleBg,
                 color: isOrchestratorTask ? '#0f172a' : textColor,
                 padding: '12px 14px',
-                paddingRight: 48,
                 borderRadius: '16px 16px 16px 4px',
                 width: 'fit-content',
                 maxWidth: isMobile ? '96%' : '85%',
@@ -2697,32 +2678,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 gap: 10
               }}
             >
-              {/* Nút Copy cho bubble Orchestrator Directive */}
-              <button
-                onClick={copyFullMarkdown}
-                style={{
-                  position: 'absolute',
-                  top: 8,
-                  right: 8,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  padding: '2px 8px',
-                  borderRadius: 4,
-                  background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : (isOrchestratorTask ? '#f1f5f9' : 'rgba(255, 255, 255, 0.08)'),
-                  border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : (isOrchestratorTask ? '1px solid #cbd5e1' : '1px solid rgba(255, 255, 255, 0.12)'),
-                  color: copiedMsgId === msg.id ? '#16a34a' : (isOrchestratorTask ? '#475569' : 'var(--text-muted, #94a3b8)'),
-                  fontSize: 11,
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  transition: 'all 0.15s ease',
-                  zIndex: 2,
-                  userSelect: 'none'
-                }}
-                title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
-              >
-                {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
-              </button>
               {activeDirectives.map((dir, dIdx) => {
                 if (dir.type === 'text') {
                   const cleanT = stripSystemTaskTags(dir.text || dir.data?.raw || '');
@@ -2741,14 +2696,14 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                   const dTarget = curName || curRole || 'New Agent';
 
                   return (
-<UnifiedDirectiveCard
+                    <UnifiedDirectiveCard
                        key={`msg-dir-sp-${dIdx}`}
                        type="spawn"
                        title={curTask}
                        role={curRole}
                        targetName={dTarget}
                        senderName={srcAgent?.name || 'Orchestrator'}
-                       content={dir.data.message || curTask || dir.raw}
+                       content={dir.data.message || curTask || dir.raw || ''}
                        isMobile={isMobile}
                        bubbleBg="#ffffff"
                        bubbleBorder="1px solid #e2e8f0"
@@ -2757,6 +2712,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                        isAlignRight={isAlignRight}
                        isOpenCode={isOpenCode}
                        defaultExpanded={expandDirectives}
+                       isStreaming={Boolean(msg.isStreaming)}
                      />
                   );
                 }
@@ -2764,7 +2720,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 if (dir.type === 'report') {
                   const curReportTarget = dir.data.target || 'orchestrator';
                   const curReportTitle = dir.data.title || dir.data.task || 'Báo Cáo Tiến Độ / Kết Quả';
-                  const curReportContent = dir.data.message || dir.raw;
+                  const curReportContent = dir.data.message || dir.raw || '';
 
                   return (
                     <UnifiedDirectiveCard
@@ -2782,6 +2738,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                       isAlignRight={isAlignRight}
                       isOpenCode={isOpenCode}
                       defaultExpanded={expandDirectives}
+                      isStreaming={Boolean(msg.isStreaming)}
                     />
                   );
                 }
@@ -2790,13 +2747,13 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 const curTarget = dir.data.target || displayTo || 'Agent';
                 const curTaskTitle = dir.data.task || '';
                 const curBody = dir.data.message || '';
-                const fullTalkContent = curBody || curTaskTitle || dir.raw;
+                const fullTalkContent = curBody || curTaskTitle || dir.raw || '';
 
                 return (
                   <UnifiedDirectiveCard
                     key={`msg-dir-tk-${dIdx}`}
                     type="talk"
-                    title={curTaskTitle || (curBody ? (curBody.split('\n')[0].substring(0, 80) + '...') : '')}
+                    title={curTaskTitle || (msg.isStreaming ? '' : (curBody ? (curBody.split('\n')[0].substring(0, 80) + '...') : ''))}
                     targetName={curTarget}
                     senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
                     content={fullTalkContent}
@@ -2808,6 +2765,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
                     defaultExpanded={expandDirectives}
+                    isStreaming={Boolean(msg.isStreaming)}
                   />
                 );
               })}
@@ -2819,7 +2777,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 background: isOrchestratorTask ? '#ffffff' : bubbleBg,
                 color: isOrchestratorTask ? '#0f172a' : textColor,
                 padding: '12px 14px',
-                paddingRight: 48,
                 borderRadius: '16px 16px 16px 4px',
                 width: 'fit-content',
                 maxWidth: isMobile ? '96%' : '85%',
@@ -2843,32 +2800,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                 gap: 10
               }}
             >
-              {/* Nút Copy cho bubble dẫn dắt Orchestrator */}
-              <button
-                onClick={copyFullMarkdown}
-                style={{
-                  position: 'absolute',
-                  top: 8,
-                  right: 8,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  padding: '2px 8px',
-                  borderRadius: 4,
-                  background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : (isOrchestratorTask ? '#f1f5f9' : 'rgba(255, 255, 255, 0.08)'),
-                  border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : (isOrchestratorTask ? '1px solid #cbd5e1' : '1px solid rgba(255, 255, 255, 0.12)'),
-                  color: copiedMsgId === msg.id ? '#16a34a' : (isOrchestratorTask ? '#475569' : 'var(--text-muted, #94a3b8)'),
-                  fontSize: 11,
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  transition: 'all 0.15s ease',
-                  zIndex: 2,
-                  userSelect: 'none'
-                }}
-                title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
-              >
-                {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
-              </button>
               {/* Nếu có lời dẫn tự sự conversationText, LUÔN LUÔN RENDER bảo toàn 100% */}
               {(() => {
                 const convText = stripSystemTaskTags(conversationText).trim();
@@ -2898,11 +2829,12 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
                     defaultExpanded={expandDirectives}
+                    isStreaming={Boolean(msg.isStreaming)}
                   />
                 ) : (
                   <UnifiedDirectiveCard
                     type="talk"
-                    title={cleanTaskTitle || (talkTaskDesc ? (talkTaskDesc.split('\n')[0].substring(0, 80) + '...') : '')}
+                    title={cleanTaskTitle || (msg.isStreaming ? '' : (talkTaskDesc ? (talkTaskDesc.split('\n')[0].substring(0, 80) + '...') : ''))}
                     targetName={displayTo || 'Agent'}
                     senderName={srcAgent?.name || (msg.agentRole === 'orchestrator' ? 'Orchestrator' : 'Orchestrator')}
                     content={talkTaskDesc || cleanTaskTitle || (typeof msg.content === 'string' ? msg.content : '')}
@@ -2914,6 +2846,7 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                     isAlignRight={isAlignRight}
                     isOpenCode={isOpenCode}
                     defaultExpanded={expandDirectives}
+                    isStreaming={Boolean(msg.isStreaming)}
                   />
                 )
               )}
@@ -2938,7 +2871,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                   background: bubbleBg,
                   color: textColor,
                   padding: '10px 14px',
-                  paddingRight: 48,
                   borderRadius: isAlignRight ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
                   width: 'fit-content',
                   maxWidth: isMobile ? '96%' : '82%',
@@ -2959,32 +2891,6 @@ const MessageItem = React.memo(function MessageItem({ msg, agents, isCollapsed, 
                   marginRight: isAlignRight ? undefined : 'auto'
                 }}
               >
-                {/* Nút Copy đặt ở góc trên bên phải của Bubble text */}
-                <button
-                  onClick={copyFullMarkdown}
-                  style={{
-                    position: 'absolute',
-                    top: 6,
-                    right: 6,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    padding: '2px 6px',
-                    borderRadius: 4,
-                    background: copiedMsgId === msg.id ? 'rgba(34, 197, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)',
-                    border: copiedMsgId === msg.id ? '1px solid rgba(34, 197, 94, 0.5)' : '1px solid rgba(255, 255, 255, 0.12)',
-                    color: copiedMsgId === msg.id ? '#4ade80' : 'var(--text-muted, #94a3b8)',
-                    fontSize: 10,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    transition: 'all 0.15s ease',
-                    zIndex: 2,
-                    userSelect: 'none'
-                  }}
-                  title={copiedMsgId === msg.id ? 'Đã sao chép vào clipboard!' : 'Sao chép Markdown'}
-                >
-                  {copiedMsgId === msg.id ? 'Copied!' : 'Copy'}
-                </button>
                 <MarkdownRenderer content={cleanDisplayText} isMobile={isMobile} />
               </div>
             );
@@ -3019,7 +2925,9 @@ interface Props {
   showToolBlocks?: boolean;
   defaultExpandToolcalls?: boolean;
   expandDirectives?: boolean;
+  onToggleExpandDirectives?: () => void;
   expandThinking?: boolean;
+  onToggleExpandThinking?: () => void;
   queuedMessages?: ChatMsg[];
   onFlushQueue?: () => void;
   onClearQueue?: () => void;
@@ -3217,10 +3125,13 @@ export function ChatPanel({
   showToolBlocks = true,
   defaultExpandToolcalls = false,
   expandDirectives = false,
-  expandThinking = false
+  onToggleExpandDirectives,
+  expandThinking = false,
+  onToggleExpandThinking
 }: Props) {
   const [collapsedReports, setCollapsedReports] = useState<Record<string, boolean>>({});
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const [showTodoList, setShowTodoList] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -3641,6 +3552,32 @@ export function ChatPanel({
             </div>
           )}
 
+          {onToggleExpandDirectives && (
+            <button
+              onClick={onToggleExpandDirectives}
+              title={expandDirectives ? "Thu gọn các lệnh chỉ thị (<talk>, <spawn>)" : "Mở rộng toàn bộ các lệnh chỉ thị (<talk>, <spawn>)"}
+              style={{
+                background: expandDirectives ? 'rgba(59, 130, 246, 0.2)' : 'rgba(100, 116, 139, 0.1)',
+                color: expandDirectives ? '#60a5fa' : 'var(--text-secondary)',
+                border: `1px solid ${expandDirectives ? 'rgba(59, 130, 246, 0.4)' : 'var(--af-border)'}`,
+                borderRadius: 6,
+                padding: '4px 8px',
+                fontSize: 11.5,
+                cursor: 'pointer',
+                fontWeight: 600,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                whiteSpace: 'nowrap',
+                flexShrink: 0,
+                transition: 'all 0.15s ease'
+              }}
+            >
+              <span>⚡</span>
+              <span>{expandDirectives ? 'Directives (Open)' : 'Directives (Folded)'}</span>
+            </button>
+          )}
+
           {onClear && (
             <button
               onClick={() => {
@@ -3797,13 +3734,14 @@ export function ChatPanel({
           </>
         )}
 
-        {loading && (() => {
+        {loading && status === 'working' && (() => {
           // Tính toán trạng thái 4 mức dựa trên tin nhắn stream hiện tại của target:
           // 1. executing (Chạy công cụ): tool call đang chạy / chưa có output
           // 2. streaming (Đang trả lời): đã có token text đầu tiên và đang sinh câu trả lời
           // 3. thinking (Suy nghĩ): model đang reasoning (có thinking trong stream/turn hiện tại)
           // 4. starting (Khởi động): server đã nhận lệnh, đang nạp context / spawn tiến trình
-          const activeLiveMsg = [...displayMessages].reverse().find(m => m && m.from !== 'user' && m.isStreaming);
+          const now = Date.now();
+          const activeLiveMsg = [...displayMessages].reverse().find(m => m && m.from !== 'user' && m.isStreaming && (now - (Number(m.timestamp) || 0) < 60000));
           let stateStage: 'starting' | 'thinking' | 'executing' | 'streaming' = 'starting';
           let stateLabel = 'Starting process...';
           let stateIcon = '⚡';
@@ -4040,7 +3978,7 @@ export function ChatPanel({
         )}
 
         <ChatInputBar
-          loading={loading}
+          loading={Boolean(loading)}
           isMobile={isMobile}
           onSend={onSend}
           onStop={onStop}

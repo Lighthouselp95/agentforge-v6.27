@@ -32,6 +32,7 @@ export interface DirectiveItem {
   start: number;
   end: number;
   text?: string;
+  raw?: string;
   data: {
     target?: string;
     role?: string;
@@ -233,12 +234,14 @@ export function extractAllDirectivesAndText(content: string): DirectiveItem[] {
   // Live streaming unclosed tag support
   const remainingStream = text.substring(lastIndex);
   const unclosedTalkMatch = remainingStream.match(/<\s*talk\b([^>]*)>([\s\S]*)$/i);
+  const unclosedOpeningTalkMatch = !unclosedTalkMatch ? remainingStream.match(/<\s*talk\b([^>]*)$/i) : null;
   const unclosedSpawnMatch = remainingStream.match(/<\s*spawn\b([^>]*)>([\s\S]*)$/i);
+  const unclosedOpeningSpawnMatch = !unclosedSpawnMatch ? remainingStream.match(/<\s*spawn\b([^>]*)$/i) : null;
 
   if (unclosedTalkMatch) {
     const unclosedStart = lastIndex + (unclosedTalkMatch.index || 0);
     if (unclosedStart > lastIndex) {
-      const prec = text.substring(lastIndex, unclosedStart);
+      const prec = restoreMasks(text.substring(lastIndex, unclosedStart));
       if (prec.trim().length > 0) {
         items.push({
           type: 'text',
@@ -250,7 +253,7 @@ export function extractAllDirectivesAndText(content: string): DirectiveItem[] {
       }
     }
     const attrs = parseXmlAttributes(unclosedTalkMatch[1]);
-    let bodyStreaming = (unclosedTalkMatch[2] || '').replace(/<\/\s*talk(?:\s+[^>]*)?>\s*$/i, '');
+    let bodyStreaming = restoreMasks((unclosedTalkMatch[2] || '').replace(/<\/\s*talk(?:\s+[^>]*)?>\s*$/i, ''));
     items.push({
       type: 'talk',
       start: unclosedStart,
@@ -263,10 +266,37 @@ export function extractAllDirectivesAndText(content: string): DirectiveItem[] {
       }
     });
     lastIndex = text.length;
+  } else if (unclosedOpeningTalkMatch) {
+    const unclosedStart = lastIndex + (unclosedOpeningTalkMatch.index || 0);
+    if (unclosedStart > lastIndex) {
+      const prec = restoreMasks(text.substring(lastIndex, unclosedStart));
+      if (prec.trim().length > 0) {
+        items.push({
+          type: 'text',
+          start: lastIndex,
+          end: unclosedStart,
+          text: prec,
+          data: { raw: prec }
+        });
+      }
+    }
+    const attrs = parseXmlAttributes(unclosedOpeningTalkMatch[1]);
+    items.push({
+      type: 'talk',
+      start: unclosedStart,
+      end: text.length,
+      data: {
+        target: attrs.target || attrs.agent || attrs.to || '',
+        task: attrs.task || '',
+        message: '',
+        raw: unclosedOpeningTalkMatch[0]
+      }
+    });
+    lastIndex = text.length;
   } else if (unclosedSpawnMatch) {
     const unclosedStart = lastIndex + (unclosedSpawnMatch.index || 0);
     if (unclosedStart > lastIndex) {
-      const prec = text.substring(lastIndex, unclosedStart);
+      const prec = restoreMasks(text.substring(lastIndex, unclosedStart));
       if (prec.trim().length > 0) {
         items.push({
           type: 'text',
@@ -278,7 +308,7 @@ export function extractAllDirectivesAndText(content: string): DirectiveItem[] {
       }
     }
     const attrs = parseXmlAttributes(unclosedSpawnMatch[1]);
-    let bodyStreaming = (unclosedSpawnMatch[2] || '').trim().replace(/<\/\s*spawn(?:\s+[^>]*)?>\s*$/i, '');
+    let bodyStreaming = restoreMasks((unclosedSpawnMatch[2] || '').trim().replace(/<\/\s*spawn(?:\s+[^>]*)?>\s*$/i, ''));
     const combinedTask = [attrs.task, bodyStreaming].filter(Boolean).join('\n\n') || attrs.task || bodyStreaming;
     items.push({
       type: 'spawn',
@@ -291,6 +321,35 @@ export function extractAllDirectivesAndText(content: string): DirectiveItem[] {
         message: bodyStreaming,
         target: attrs.name || attrs.target || '',
         raw: unclosedSpawnMatch[0]
+      }
+    });
+    lastIndex = text.length;
+  } else if (unclosedOpeningSpawnMatch) {
+    const unclosedStart = lastIndex + (unclosedOpeningSpawnMatch.index || 0);
+    if (unclosedStart > lastIndex) {
+      const prec = restoreMasks(text.substring(lastIndex, unclosedStart));
+      if (prec.trim().length > 0) {
+        items.push({
+          type: 'text',
+          start: lastIndex,
+          end: unclosedStart,
+          text: prec,
+          data: { raw: prec }
+        });
+      }
+    }
+    const attrs = parseXmlAttributes(unclosedOpeningSpawnMatch[1]);
+    items.push({
+      type: 'spawn',
+      start: unclosedStart,
+      end: text.length,
+      data: {
+        role: attrs.role || '',
+        name: attrs.name || attrs.target || '',
+        task: attrs.task || '',
+        message: '',
+        target: attrs.name || attrs.target || '',
+        raw: unclosedOpeningSpawnMatch[0]
       }
     });
     lastIndex = text.length;

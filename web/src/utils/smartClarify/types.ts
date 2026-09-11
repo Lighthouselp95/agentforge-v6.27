@@ -3,6 +3,8 @@ export interface SmartRuleContext {
   targetId: string;
   isFirstMessage: boolean;
   timeSinceLastUserMessageSec: number;
+  targetRole?: string;
+  targetType?: string;
 }
 
 export interface SmartRuleResult {

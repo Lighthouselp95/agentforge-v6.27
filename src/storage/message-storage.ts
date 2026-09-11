@@ -22,10 +22,28 @@ export class MessageStorage {
     if (walMessages.length > 0) {
       const map = new Map<string, any>();
       for (const m of this.engine.inMemoryHistory) {
-        if (m && m.id) map.set(m.id, m);
+        if (m && m.id) map.set(m.id, { ...m, isStreaming: false });
       }
       for (const m of walMessages) {
-        if (m && m.id) map.set(m.id, m);
+        if (m && m.id) {
+          let cleanContent = m.content;
+          if (typeof cleanContent === 'string') {
+            cleanContent = cleanContent.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<\/?think>/gi, '').trim();
+          }
+          let cleanParts = m.parts;
+          if (Array.isArray(cleanParts)) {
+            cleanParts = cleanParts
+              .filter((p: any) => p && (p.type === 'tool' || p.type === 'text' || p.type === 'thinking'))
+              .map((p: any) => {
+                if (p.type === 'text' && typeof p.content === 'string') {
+                  return { ...p, content: p.content.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<\/?think>/gi, '').trim() };
+                }
+                return p;
+              })
+              .filter((p: any) => !(p.type === 'text' && !p.content));
+          }
+          map.set(m.id, { ...m, isStreaming: false, content: cleanContent, parts: cleanParts });
+        }
       }
       this.engine.inMemoryHistory = Array.from(map.values());
       console.log(`[ChatWAL] Đã nạp ${this.engine.inMemoryHistory.length} tin nhắn từ ${walMessages.length} WAL entries`);

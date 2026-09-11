@@ -92,16 +92,17 @@ export class TaskQueueManager {
     const prev = this.statusDebounce.get(agentId);
     if (prev) clearTimeout(prev);
 
-    // Kiểm tra toggle autoContinue từ storage (UI setting) — autoContinue hoặc enableWatchdog đều bật tính năng này
-    const autoContinue = storage.getSetting('autoContinue', false) === true;
+    // Nhiệm vụ của TaskQueue khi agent idle:
+    // Watchdog chịu trách nhiệm nhắc agent có task dở dang, 
+    // còn TaskQueue kiểm tra xem có toggle watchdogEnabled/autoContinue hay không để phân công task
     const watchdogEnabled = storage.getSetting('enableWatchdog', false) === true;
-    if (!autoContinue && !watchdogEnabled) {
-      this.broadcastFn('system:log', { level: 'debug', message: `[TaskQueue] autoContinue/watchdog OFF — bỏ qua agent idle ${agentId}` });
+    if (!watchdogEnabled) {
+      this.broadcastFn('system:log', { level: 'debug', message: `[TaskQueue] watchdog OFF — bỏ qua agent idle ${agentId}` });
       return;
     }
 
-    // Đợi debounce thời gian idleDetectionMs để tránh nháy trạng thái (hỗ trợ tuỳ biến từ Settings)
-    const customIdleSec = Number(storage.getSetting('taskQueueIdleCheckSec', 30)) || 30;
+    // Đợi debounce thời gian idleDetectionMs để tránh nháy trạng thái (mặc định 120s / 2 phút)
+    const customIdleSec = Number(storage.getSetting('watchdogIdleTimeoutSec', storage.getSetting('taskQueueIdleCheckSec', 120))) || 120;
     const idleMs = Math.max(5000, customIdleSec * 1000);
     const timeout = setTimeout(() => {
       this.lastIdleCheckTime = Date.now();
@@ -137,10 +138,8 @@ export class TaskQueueManager {
    * Tìm và nhắc thực hiện task nhỏ nhất chưa hoàn thành. Trả về Task | null.
    */
   public async checkAndAssignTask(): Promise<SimpleTask | null> {
-    // Chỉ chạy khi toggle autoContinue/watchdog bật
-    const autoContinue = storage.getSetting('autoContinue', false) === true;
     const watchdogEnabled = storage.getSetting('enableWatchdog', false) === true;
-    if (!autoContinue && !watchdogEnabled) return null;
+    if (!watchdogEnabled) return null;
 
     const candidate = await this.findSmallestUncompletedTask();
     if (!candidate) return null;

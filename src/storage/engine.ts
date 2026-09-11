@@ -92,6 +92,8 @@ export class StorageEngine {
       const autoContinue = loadedSettings.autoContinue === true;
       for (const a of loadedState.agents) {
         if (a && a.id) {
+          // AUTO CONTINUE CHUẨN: Chỉ khi bật autoContinue thì mới giữ trạng thái working khi mở app để tiếp tục,
+          // nếu không bật autoContinue thì chuyển về idle khi khởi động lại app.
           if (a.status === 'working' && !autoContinue) {
             a.status = 'idle';
             a.workingSince = undefined;

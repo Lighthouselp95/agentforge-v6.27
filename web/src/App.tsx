@@ -1,6 +1,6 @@
-﻿import React, { useState, useEffect, useRef, useCallback } from 'react';
+﻿import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Dashboard } from './components/Dashboard';
-import { ChatPanel } from './components/ChatPanel';
+import { ChatPanel, ChatMsg } from './components/ChatPanel';
 import { SpawnDialog } from './components/SpawnDialog';
 import { ModelSettingsDialog } from './components/ModelSettingsDialog';
 import { TeamSettingsDialog } from './components/TeamSettingsDialog';
@@ -90,25 +90,6 @@ const mergeMessage = (prev: any[], incoming: any): any[] => {
   return [...prev, incoming];
 };
 // ============ END UNIFIED DEDUP HELPERS ============
-
-interface ChatMsg {
-  id: string;
-  from: string;
-  to: string;
-  content: string;
-  task?: string;
-  timestamp?: number;
-  agentName?: string;
-  agentRole?: string;
-  msgType?: string;
-  showOnUI?: boolean;
-  toolCalls?: Array<{ tool: string; input?: string; output?: string }>;
-  thinking?: string;
-  // Ordered parts (Option C): text + tool xen kẽ theo ĐÚNG thứ tự opencode emit — server gửi trong final snapshot.
-  // Client render trực tiếp theo array, không cần split content. OPTIONAL (không có → render theo cách cũ).
-  parts?: Array<{ type: 'text' | 'tool'; content?: string; tool?: string; input?: string; output?: string }>;
-  teamId?: string;
-}
 
 export interface TokenUsage {
   input?: number;
@@ -311,6 +292,12 @@ export function App() {
         if (typeof data.enableWatchdog === 'boolean') setEnableWatchdog(data.enableWatchdog);
         if (typeof data.autoContinue === 'boolean') setAutoContinue(data.autoContinue);
         if (typeof data.smartClarifyEnabled === 'boolean') setSmartModeEnabled(data.smartClarifyEnabled);
+        if (data.smartClarifyScope === 'all' || data.smartClarifyScope === 'orchestrator') {
+          smartRuleRegistry.setTargetScope(data.smartClarifyScope);
+        }
+        if (typeof data.smartClarifyPromptTemplate === 'string') {
+          smartRuleRegistry.setPromptTemplate(data.smartClarifyPromptTemplate);
+        }
         
         // Kiểm tra xem hệ thống đã được start chưa (hoặc người dùng đã chọn bỏ qua modal)
         const skipStartup = localStorage.getItem('af-skip-startup-modal') === 'true';
@@ -442,6 +429,11 @@ export function App() {
       const data = await res.json();
       if (Array.isArray(data)) {
         applyAgents(data);
+        const mainOrch = data.find((a: any) => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+        if (mainOrch?.teamId) {
+          try { localStorage.setItem('af-current-teamId', mainOrch.teamId); } catch {}
+          fetchHistory(selectedAgentId, mainOrch.teamId);
+        }
       }
     } catch (e) {
       console.error('Failed to fetch agents:', e);
@@ -449,13 +441,23 @@ export function App() {
   };
 
   // Fetch history from DB — merge (not overwrite) to avoid race with WS messages arriving during fetch
-  const fetchHistory = async (agentId?: string | null) => {
+  const fetchHistory = async (agentId?: string | null, explicitTeamId?: string) => {
     try {
       // Truyền teamId tường minh (backend ép team isolation — không còn fallback 'default' ngầm):
       // - Có agentId → backend tự resolve teamId theo agent.
-      // - Không agentId (main view) → gửi đúng teamId của main orchestrator (defaultOrch?.teamId || 'default').
-      const mainOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
-      const mainTeamId = mainOrch?.teamId || 'default';
+      // - Không agentId (main view) → gửi đúng teamId của main orchestrator hoặc fallback localStorage
+      let mainTeamId = explicitTeamId;
+      if (!mainTeamId) {
+        const mainOrch = agents.find(a => a.type === 'orchestrator' || a.role === 'orchestrator' || a.id === 'orchestrator');
+        mainTeamId = mainOrch?.teamId;
+        if (!mainTeamId) {
+          try {
+            const cachedTeam = localStorage.getItem('af-current-teamId');
+            if (cachedTeam) mainTeamId = cachedTeam;
+          } catch {}
+        }
+        if (!mainTeamId) mainTeamId = 'default';
+      }
       const targetParam = agentId
         ? `&agentId=${encodeURIComponent(agentId)}`
         : `&teamId=${encodeURIComponent(mainTeamId)}`;
@@ -468,7 +470,7 @@ export function App() {
         for (const m of data) {
           merged = mergeMessage(merged, m);
         }
-        const sorted = merged.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        const sorted = merged.sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
         return sorted.slice(-MAX_DISPLAY_MESSAGES);
       });
     } catch (e) {
@@ -499,10 +501,12 @@ export function App() {
         const agentTeamId = teamId || targetAgent?.teamId || (key === 'orchestrator' ? 'default' : `team-${key.slice(-8)}`);
 
         // Áp dụng mutation lên message tạm để kiểm tra nội dung THỰC trước khi tạo bubble
+        const isWorkerAgent = key !== 'orchestrator' && targetAgent?.role !== 'orchestrator' && targetAgent?.type !== 'orchestrator';
+        const defaultTo = isWorkerAgent ? (targetAgent?.spawnedBy || 'orchestrator') : 'user';
         const tempMsg: ChatMsg = {
           id: sid,
           from: key,
-          to: 'user',
+          to: defaultTo,
           content: '',
           timestamp: Date.now(),
           teamId: agentTeamId,
@@ -848,6 +852,9 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
      if (msg.type === 'settings:updated' && typeof msg.smartClarifyPromptTemplate === 'string') {
        smartRuleRegistry.setPromptTemplate(msg.smartClarifyPromptTemplate);
      }
+     if (msg.type === 'settings:updated' && (msg.smartClarifyScope === 'all' || msg.smartClarifyScope === 'orchestrator')) {
+       smartRuleRegistry.setTargetScope(msg.smartClarifyScope);
+     }
 
     if (msg.type === 'agent:created' || msg.type === 'agent:updated' || msg.type === 'agent:deleted') {
       if (msg.type === 'agent:deleted') {
@@ -1127,7 +1134,12 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     const targetTeamId = targetAgentObj?.teamId || (targetId === 'orchestrator' ? 'default' : `team-${targetId.slice(-8)}`);
     const resolvedTargetId = targetAgentObj?.id || targetId;
     // Xử lý qua Smart Rules Engine (Inactivity Clarify sau 30s timeout)
-    const smartProcessed = smartRuleRegistry.processMessage(trimmedText, resolvedTargetId);
+    const smartProcessed = smartRuleRegistry.processMessage(
+      trimmedText,
+      resolvedTargetId,
+      targetAgentObj?.role || (resolvedTargetId === 'orchestrator' ? 'orchestrator' : undefined),
+      targetAgentObj?.type || (resolvedTargetId === 'orchestrator' ? 'orchestrator' : undefined)
+    );
     const textToSend = smartProcessed.text;
     // Cập nhật đồng hồ hoạt động mới nhất cho Smart Clarify
     smartRuleRegistry.recordMessageActivity();
@@ -1325,7 +1337,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         // Với tin nhắn của user: nếu cùng content và thời gian cách nhau < 120s thì gộp triệt để
         const isUserMsg = m.from === 'user' || (m as any).role === 'user';
         const bucketSize = isUserMsg ? 120000 : 5000;
-        const timeBucket = Math.floor((m.timestamp || 0) / bucketSize);
+        const timeBucket = Math.floor((Number(m.timestamp) || 0) / bucketSize);
         const contentKey = `${m.from}|${normContent}|${timeBucket}`;
         if (seenContentKeys.has(contentKey)) continue;
         seenContentKeys.add(contentKey);
@@ -1335,11 +1347,12 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
     return out;
   };
 
-  const filteredMessages = applyOacDedup(selectedAgentId
-    ? (() => {
-        const sel = agents.find(a => a.id === selectedAgentId);
-        const isSubOrch = sel?.type === 'orchestrator' || sel?.role === 'orchestrator';
-        const base = allMessages.filter(m => {
+  const filteredMessages = useMemo(() => {
+    return applyOacDedup(selectedAgentId
+      ? (() => {
+          const sel = agents.find(a => a.id === selectedAgentId);
+          const isSubOrch = sel?.type === 'orchestrator' || sel?.role === 'orchestrator';
+          const base = allMessages.filter(m => {
           if (isSystemMsg(m)) return false;
           if (isSubOrch) {
             if (isInternalMsg(m)) return false;
@@ -1385,8 +1398,8 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
 
             const isFromWorker = m.from !== 'user' && m.from !== selectedAgentId && m.agentRole !== 'orchestrator' && m.from !== 'system' && m.from !== 'error';
             if (isFromWorker) {
-              // Giữ lại báo cáo / trao đổi từ worker gửi về Orchestrator hoặc broadcast
-              const isToOrch = m.to === selectedAgentId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to;
+              // Giữ lại báo cáo / trao đổi từ worker gửi về Orchestrator hoặc broadcast, hoặc khi đang stream
+              const isToOrch = m.to === selectedAgentId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to || Boolean(m.isStreaming);
               const isReportOrTask = m.msgType === 'talk' || /(?:REPORT|HOÀN THÀNH|KẾT QUẢ|TIẾN ĐỘ|TASK|ERROR)/i.test(m.content || '');
               if (!isToOrch && !isReportOrTask) {
                 return false;
@@ -1399,7 +1412,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
               // Lệnh giao task (spawn/talk) của Root Orchestrator → agent: HIỂN THỊ thành cục riêng
               (isRootOrchSender &&
                (m.msgType === 'talk' || (typeof m.content === 'string' && /(?:\[(?:TALK|SPAWN|TASK)\]|<\s*(?:talk|spawn)\b)/i.test(m.content)) || (m.to && m.to !== 'user' && m.to !== 'broadcast'))) ||
-              (isFromWorker && (m.to === selectedAgentId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to)) ||
+              (isFromWorker && (m.to === selectedAgentId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to || Boolean(m.isStreaming))) ||
               (m.msgType === 'error' && (m.to === 'user' || m.from === selectedAgentId || m.to === selectedAgentId || m.from === 'orchestrator')) ||
               (m.from === 'error' && (m.to === 'user' || m.to === selectedAgentId || m.to === 'orchestrator'))
             );
@@ -1443,8 +1456,8 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
         }
         const isFromWorker = m.from !== 'user' && isNotRootOrch && m.from !== 'system' && m.from !== 'error';
         if (isFromWorker) {
-          // Giữ lại báo cáo / phản hồi từ worker hoặc Sub-Orch gửi về Main Orchestrator hoặc broadcast
-          const isToOrch = m.to === orchId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to;
+          // Giữ lại báo cáo / phản hồi từ worker hoặc Sub-Orch gửi về Main Orchestrator hoặc broadcast, hoặc khi đang stream
+          const isToOrch = m.to === orchId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to || Boolean(m.isStreaming);
           const isReportOrTask = m.msgType === 'talk' || /(?:REPORT|HOÀN THÀNH|KẾT QUẢ|TIẾN ĐỘ|TASK|ERROR)/i.test(m.content || '');
           if (!isToOrch && !isReportOrTask) {
             return false;
@@ -1463,12 +1476,13 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
           isDirective ||
           (m.from === 'user' && (m.to === orchId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to)) ||
           ((m.from === orchId || m.from === 'orchestrator') && (m.to === 'user' || m.to === 'broadcast' || !m.to)) ||
-          (isFromWorker && (m.to === orchId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to)) ||
+          (isFromWorker && (m.to === orchId || m.to === 'orchestrator' || m.to === 'broadcast' || !m.to || Boolean(m.isStreaming))) ||
           (m.msgType === 'error' && (m.to === 'user' || m.from === orchId || m.from === 'orchestrator')) ||
           (m.from === 'error' && (m.to === 'user' || m.to === orchId || m.to === 'orchestrator'))
         );
       })
-  );
+    );
+  }, [selectedAgentId, allMessages, agents]);
 
   const formatMessage = (msg: ChatMsg): { sender: string; content: string; isUser: boolean; timestamp?: number } => {
     const isUser = msg.from === 'user';
@@ -1482,7 +1496,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
       if (agent) sender = `${agent.name} (${agent.role}) [${agent.id}]`;
     }
 
-    return { sender, content: msg.content, isUser, timestamp: msg.timestamp };
+    return { sender, content: msg.content, isUser, timestamp: typeof msg.timestamp === 'number' ? msg.timestamp : (Number(msg.timestamp) || undefined) };
   };
 
   const addAgent = async (config: any) => {
@@ -2027,6 +2041,51 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                 </label>
               </div>
 
+              {/* Expand Directives Toggle Switch */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '8px 12px',
+                background: 'var(--bg-inset)',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--af-border)'
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', userSelect: 'none' }} title="Tự động mở rộng các thẻ lệnh hệ thống (<talk>, <spawn>, <report>)">
+                  ⚡ Expand Directives (&lt;talk&gt;, &lt;spawn&gt;)
+                </span>
+                <label style={{ position: 'relative', display: 'inline-block', width: 34, height: 18, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={defaultExpandToolcalls}
+                    onChange={(e) => toggleDefaultExpandToolcalls(e.target.checked)}
+                    style={{ opacity: 0, width: 0, height: 0 }}
+                  />
+                  <span style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    backgroundColor: defaultExpandToolcalls ? '#2563eb' : '#475569',
+                    borderRadius: 18,
+                    transition: '0.2s'
+                  }}>
+                    <span style={{
+                      position: 'absolute',
+                      content: '""',
+                      height: 14,
+                      width: 14,
+                      left: defaultExpandToolcalls ? 17 : 2,
+                      bottom: 2,
+                      backgroundColor: 'white',
+                      borderRadius: '50%',
+                      transition: '0.2s'
+                    }} />
+                  </span>
+                </label>
+              </div>
+
               {/* Model Hierarchy Settings Button */}
               <button
                 onClick={() => setShowModelSettings(true)}
@@ -2181,7 +2240,9 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
                 showToolBlocks={true}
                 defaultExpandToolcalls={expandOpenCodeTools}
                 expandDirectives={defaultExpandToolcalls}
+                onToggleExpandDirectives={() => toggleDefaultExpandToolcalls(!defaultExpandToolcalls)}
                 expandThinking={expandThinking}
+                onToggleExpandThinking={() => toggleExpandThinking(!expandThinking)}
                 queuedMessages={currentQueue}
                 onFlushQueue={() => handleForceSendAll(activeTargetId)}
                 onClearQueue={() => clearQueueForAgent(activeTargetId)}
@@ -2528,11 +2589,12 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
       {/* Floating Broadcast Bar */}
       <FloatingBroadcastBar
         agentsCount={agents.length}
-        onSendBroadcast={async (message) => {
+        agents={agents}
+        onSendBroadcast={async (message, teamId) => {
           const res = await fetch(`${API}/api/broadcast`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message })
+            body: JSON.stringify({ message, teamId: teamId || 'all' })
           });
           if (!res.ok) throw new Error('Broadcast request failed');
         }}
@@ -2540,6 +2602,7 @@ if (msg.type === 'settings:updated' && typeof msg.defaultExpandToolcalls === 'bo
 
       {/* Startup Modal */}
       <StartupModal
+        key={showStartupModal ? 'modal-open' : 'modal-closed'}
         isOpen={showStartupModal}
         initialSettings={startupInitialSettings}
         onStart={async (settings) => {

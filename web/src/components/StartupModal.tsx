@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 interface StartupModalProps {
   isOpen: boolean;
@@ -26,10 +26,22 @@ export const StartupModal: React.FC<StartupModalProps> = ({ isOpen, initialSetti
   const [enableWatchdog, setEnableWatchdog] = useState(initialSettings.enableWatchdog ?? true);
   const [autoContinue, setAutoContinue] = useState(initialSettings.autoContinue ?? true);
   const [smartClarifyEnabled, setSmartClarifyEnabled] = useState(initialSettings.smartClarifyEnabled ?? false);
-  const [watchdogSec, setWatchdogSec] = useState(initialSettings.watchdogStreamTimeoutSec || 45);
-  const [idleSec, setIdleSec] = useState(initialSettings.taskQueueIdleCheckSec || 30);
+  const [watchdogSec, setWatchdogSec] = useState(initialSettings.watchdogStreamTimeoutSec || 60);
+  const [idleSec, setIdleSec] = useState(initialSettings.taskQueueIdleCheckSec || 120);
   const [rememberChoice, setRememberChoice] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+
+  // Đồng bộ giá trị từ initialSettings khi modal mở hoặc khi backend nạp xong settings
+  useEffect(() => {
+    if (initialSettings && isOpen) {
+      if (initialSettings.engineMode) setEngineMode(initialSettings.engineMode);
+      if (initialSettings.enableWatchdog !== undefined) setEnableWatchdog(initialSettings.enableWatchdog);
+      if (initialSettings.autoContinue !== undefined) setAutoContinue(initialSettings.autoContinue);
+      if (initialSettings.smartClarifyEnabled !== undefined) setSmartClarifyEnabled(initialSettings.smartClarifyEnabled);
+      if (initialSettings.watchdogStreamTimeoutSec !== undefined) setWatchdogSec(initialSettings.watchdogStreamTimeoutSec);
+      if (initialSettings.taskQueueIdleCheckSec !== undefined) setIdleSec(initialSettings.taskQueueIdleCheckSec);
+    }
+  }, [initialSettings, isOpen]);
 
   if (!isOpen) return null;
 
@@ -42,8 +54,8 @@ export const StartupModal: React.FC<StartupModalProps> = ({ isOpen, initialSetti
         enableWatchdog,
         autoContinue,
         smartClarifyEnabled,
-        watchdogStreamTimeoutSec: Number(watchdogSec) || 45,
-        taskQueueIdleCheckSec: Number(idleSec) || 30,
+        watchdogStreamTimeoutSec: Number(watchdogSec) || 60,
+        taskQueueIdleCheckSec: Number(idleSec) || 120,
         rememberChoice
       });
     } finally {
@@ -129,7 +141,7 @@ export const StartupModal: React.FC<StartupModalProps> = ({ isOpen, initialSetti
 
           {/* Toggles */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '16px' }}>
-            {/* Watchdog */}
+            {/* Watchdog Stream Inactivity */}
             <div style={{
               display: 'flex',
               alignItems: 'center',
@@ -139,8 +151,8 @@ export const StartupModal: React.FC<StartupModalProps> = ({ isOpen, initialSetti
               borderRadius: '12px'
             }}>
               <div>
-                <div style={{ fontSize: '13px', fontWeight: 600, color: '#f4f4f5' }}>Bật Watchdog (Stream Inactivity)</div>
-                <div style={{ fontSize: '11px', color: '#a1a1aa' }}>Tự reset & nhắc việc khi tiến trình ngưng stream</div>
+                <div style={{ fontSize: '13px', fontWeight: 600, color: '#f4f4f5' }}>Bật Watchdog (Stream Inactivity & Idle Job)</div>
+                <div style={{ fontSize: '11px', color: '#a1a1aa' }}>Timer 1: Ngắt & nhắc khi working bị treo stream ({watchdogSec}s) | Timer 2: Nhắc khi idle có task ({idleSec}s)</div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {enableWatchdog && (
@@ -162,34 +174,7 @@ export const StartupModal: React.FC<StartupModalProps> = ({ isOpen, initialSetti
                         textAlign: 'center'
                       }}
                     />
-                    <span style={{ fontSize: '11px', color: '#71717a' }}>giây</span>
-                  </div>
-                )}
-                <input
-                  type="checkbox"
-                  checked={enableWatchdog}
-                  onChange={(e) => setEnableWatchdog(e.target.checked)}
-                  style={{ width: '18px', height: '18px', cursor: 'pointer' }}
-                />
-              </div>
-            </div>
-
-            {/* Auto-continue Idle */}
-            <div style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              background: '#27272a',
-              padding: '12px',
-              borderRadius: '12px'
-            }}>
-              <div>
-                <div style={{ fontSize: '13px', fontWeight: 600, color: '#f4f4f5' }}>Auto-Continue & Nhắc Idle Task</div>
-                <div style={{ fontSize: '11px', color: '#a1a1aa' }}>Tự động nhắc agent làm tiếp các task còn dở dang khi rảnh</div>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                {autoContinue && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '11px', color: '#71717a' }}>s /</span>
                     <input
                       type="number"
                       min={5}
@@ -207,16 +192,37 @@ export const StartupModal: React.FC<StartupModalProps> = ({ isOpen, initialSetti
                         textAlign: 'center'
                       }}
                     />
-                    <span style={{ fontSize: '11px', color: '#71717a' }}>giây</span>
+                    <span style={{ fontSize: '11px', color: '#71717a' }}>s</span>
                   </div>
                 )}
                 <input
                   type="checkbox"
-                  checked={autoContinue}
-                  onChange={(e) => setAutoContinue(e.target.checked)}
+                  checked={enableWatchdog}
+                  onChange={(e) => setEnableWatchdog(e.target.checked)}
                   style={{ width: '18px', height: '18px', cursor: 'pointer' }}
                 />
               </div>
+            </div>
+
+            {/* Auto-continue Startup */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              background: '#27272a',
+              padding: '12px',
+              borderRadius: '12px'
+            }}>
+              <div>
+                <div style={{ fontSize: '13px', fontWeight: 600, color: '#f4f4f5' }}>Auto-Continue Khi Mở App</div>
+                <div style={{ fontSize: '11px', color: '#a1a1aa' }}>Tiếp tục lại đúng agent đang working hoặc có tin nhắn dở dang trong queue từ phiên trước</div>
+              </div>
+              <input
+                type="checkbox"
+                checked={autoContinue}
+                onChange={(e) => setAutoContinue(e.target.checked)}
+                style={{ width: '18px', height: '18px', cursor: 'pointer' }}
+              />
             </div>
 
             {/* Smart Clarify */}

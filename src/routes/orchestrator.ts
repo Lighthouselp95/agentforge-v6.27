@@ -51,18 +51,10 @@ export function createOrchestratorRouter(deps: OrchestratorRouteDeps): Router {
         }
       }
 
-      // Xoá client + session mapping + DB record
+      // Xoá client + session mapping nhưng KHÔNG xoá sessionId trong DB
       deps.clients.delete('orchestrator');
       ACPClient.unregisterSession('orchestrator');
-      deps.storage.updateAgent('orchestrator', { sessionId: null, sessionTitle: null });
-
-      // Update in-memory orchestrator agent immediately and broadcast for UI sync
-      const orchAgent = deps.agents.get('orchestrator');
-      if (orchAgent) {
-        orchAgent.sessionId = undefined;
-        orchAgent.sessionTitle = undefined;
-        deps.broadcast('agent:updated', { agent: orchAgent });
-      }
+      // deps.storage.updateAgent('orchestrator', { sessionId: null, sessionTitle: null });
 
       // Xoá hội thoại MAIN (msg từ/tới orchestrator) — giữ hội thoại riêng của agents
       const keep: any[] = [];
@@ -75,25 +67,15 @@ export function createOrchestratorRouter(deps: OrchestratorRouteDeps): Router {
       deps.storage.clearOrchestratorConversation();
       deps.broadcast('chat:message', { action: 'clear' });
       if (!sessionDeleted && deleteError) {
-        console.log(`[Clear] WARNING: Session delete failed (${deleteError}), but local state cleared. Next chat will create fresh session.`);
+        console.log(`[Clear] WARNING: Session delete failed (${deleteError}), but local chat cleared.`);
       } else {
-        console.log('[Clear] Orchestrator conversation + session cleared');
+        console.log('[Clear] Orchestrator conversation cleared');
       }
-      res.json({ ok: true, sessionDeleted, warning: !sessionDeleted ? 'Session delete failed, local state cleared' : undefined });
+      res.json({ ok: true, sessionDeleted, warning: !sessionDeleted ? 'Session delete failed, local chat cleared' : undefined });
     } catch (e: any) {
       // Vẫn force clear local state nếu có lỗi ngoài dự kiến
       deps.clients.delete('orchestrator');
       ACPClient.unregisterSession('orchestrator');
-      deps.storage.updateAgent('orchestrator', { sessionId: null, sessionTitle: null });
-
-      // Also update in-memory agent on error path
-      const orchAgent = deps.agents.get('orchestrator');
-      if (orchAgent) {
-        orchAgent.sessionId = undefined;
-        orchAgent.sessionTitle = undefined;
-        deps.broadcast('agent:updated', { agent: orchAgent });
-      }
-
       res.json({ ok: false, error: e.message });
     }
   });

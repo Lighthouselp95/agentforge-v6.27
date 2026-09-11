@@ -4,6 +4,10 @@ import './index.css';
 import './workbench.css';
 import { App } from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { initClientDiagnostics } from './utils/clientDiagnostics';
+
+// Initialize global client error trapping for AI browser debugging
+initClientDiagnostics();
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

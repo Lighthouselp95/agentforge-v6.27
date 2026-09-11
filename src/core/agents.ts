@@ -5,7 +5,7 @@ import { WORKER_FORMAT_BLOCK } from './prompts.js';
 export interface AgentTask {
   id: string;
   task: string;
-  status: 'pending' | 'working' | 'completed';
+  status: 'pending' | 'working' | 'completed' | 'cancelled';
   createdAt: number;
   completedAt?: number;
 }

@@ -1,4 +1,10 @@
 node_modules/
+node_modules_broken/
+logs/
+server.log
+query
+delete
+stop
 dist/
 dist-electron/
 release/

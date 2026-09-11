@@ -1,15 +1,50 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
+
+interface AgentItem {
+  id: string;
+  name: string;
+  role?: string;
+  type?: string;
+  teamId?: string;
+}
 
 interface FloatingBroadcastProps {
   agentsCount: number;
-  onSendBroadcast: (message: string) => Promise<boolean | void>;
+  agents?: AgentItem[];
+  onSendBroadcast: (message: string, teamId?: string) => Promise<boolean | void>;
 }
 
-export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsCount, onSendBroadcast }) => {
+export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsCount, agents = [], onSendBroadcast }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [message, setMessage] = useState('');
+  const [selectedTeam, setSelectedTeam] = useState<string>('all');
   const [isSending, setIsSending] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+
+  // Trích xuất danh sách team khả dụng từ danh sách agents
+  const teamsList = useMemo(() => {
+    const map = new Map<string, { id: string; name: string; count: number; orchName?: string }>();
+    
+    // Luôn có option All Teams
+    for (const a of agents) {
+      const tid = a.teamId || 'default';
+      if (!map.has(tid)) {
+        map.set(tid, { id: tid, name: tid === 'default' ? 'Team Default' : `Team ${tid}`, count: 0 });
+      }
+      const item = map.get(tid)!;
+      item.count++;
+      if (a.type === 'orchestrator' || a.id === 'orchestrator' || a.role === 'orchestrator') {
+        item.orchName = a.name;
+      }
+    }
+    return Array.from(map.values());
+  }, [agents]);
+
+  // Số lượng agent trong team đang được chọn
+  const currentTargetCount = useMemo(() => {
+    if (selectedTeam === 'all') return agents.length || agentsCount;
+    return agents.filter(a => (a.teamId || 'default') === selectedTeam).length;
+  }, [selectedTeam, agents, agentsCount]);
 
   const handleSend = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -19,8 +54,8 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
     setIsSending(true);
     setFeedback(null);
     try {
-      await onSendBroadcast(trimmed);
-      setFeedback('Đã phát tin thành công tới toàn bộ agents!');
+      await onSendBroadcast(trimmed, selectedTeam);
+      setFeedback(`Đã phát tin thành công tới ${selectedTeam === 'all' ? 'toàn bộ' : `Team [${selectedTeam}]`} (${currentTargetCount} agents)!`);
       setMessage('');
       setTimeout(() => {
         setFeedback(null);
@@ -36,7 +71,7 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
   return (
     <div style={{
       position: 'fixed',
-      bottom: '24px',
+      top: '64px',
       right: '24px',
       zIndex: 9999,
       fontFamily: 'system-ui, -apple-system, sans-serif'
@@ -63,11 +98,11 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
           onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
         >
           <span style={{ fontSize: '16px' }}>📢</span>
-          <span>Broadcast All ({agentsCount})</span>
+          <span>Broadcast ({agentsCount})</span>
         </button>
       ) : (
         <div style={{
-          width: '380px',
+          width: '390px',
           background: '#18181b',
           border: '1px solid #3f3f46',
           borderRadius: '16px',
@@ -78,7 +113,9 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <span style={{ fontSize: '18px' }}>📢</span>
-              <span style={{ fontWeight: 600, fontSize: '14px' }}>Gửi tin tới toàn bộ Agent ({agentsCount})</span>
+              <span style={{ fontWeight: 600, fontSize: '14px' }}>
+                Phát tin Broadcast ({currentTargetCount} agents)
+              </span>
             </div>
             <button
               onClick={() => setIsOpen(false)}
@@ -95,6 +132,35 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
             </button>
           </div>
 
+          {/* Chọn Team gửi tin */}
+          <div style={{ marginBottom: '12px' }}>
+            <label style={{ fontSize: '11.5px', fontWeight: 600, color: '#a1a1aa', display: 'block', marginBottom: '4px' }}>
+              Gửi tới đối tượng:
+            </label>
+            <select
+              value={selectedTeam}
+              onChange={(e) => setSelectedTeam(e.target.value)}
+              style={{
+                width: '100%',
+                background: '#27272a',
+                border: '1px solid #52525b',
+                borderRadius: '8px',
+                color: '#fafafa',
+                padding: '6px 10px',
+                fontSize: '12.5px',
+                outline: 'none',
+                cursor: 'pointer'
+              }}
+            >
+              <option value="all">🌐 Toàn bộ hệ thống ({agents.length || agentsCount} agents)</option>
+              {teamsList.map(t => (
+                <option key={t.id} value={t.id}>
+                  👥 {t.name} ({t.count} agents{t.orchName ? ` · Orch: ${t.orchName}` : ''})
+                </option>
+              ))}
+            </select>
+          </div>
+
           <textarea
             value={message}
             onChange={(e) => setMessage(e.target.value)}
@@ -103,7 +169,7 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
                 handleSend();
               }
             }}
-            placeholder="Nhập nội dung thông báo khẩn cấp / chỉ thị chung (Ctrl+Enter để gửi)..."
+            placeholder="Nhập nội dung thông báo / chỉ thị (Ctrl+Enter để gửi)..."
             rows={3}
             style={{
               width: '100%',
@@ -161,7 +227,7 @@ export const FloatingBroadcastBar: React.FC<FloatingBroadcastProps> = ({ agentsC
                 cursor: isSending || !message.trim() ? 'not-allowed' : 'pointer'
               }}
             >
-              {isSending ? 'Đang phát tin...' : 'Gửi đồng loạt'}
+              {isSending ? 'Đang phát tin...' : selectedTeam === 'all' ? 'Gửi toàn bộ' : 'Gửi cho Team'}
             </button>
           </div>
         </div>

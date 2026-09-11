@@ -195,6 +195,34 @@ prompt = (targetAgent?.sessionId && !shouldReinject && targetAgent)
   const result = await client.enqueue(prompt);
   sid = (result as any).sessionId || (client as any).getSessionId?.() || null;
 
+  // PERSIST SESSION NGAY LẬP TỨC: Cập nhật sessionId vào targetAgent và Storage
+  if (sid) {
+    if (targetAgent) {
+      targetAgent.sessionId = sid;
+      if ((result as any)?.tokenUsage) targetAgent.tokenUsage = (result as any).tokenUsage;
+      if ((result as any)?.contextLength) targetAgent.contextLength = (result as any).contextLength;
+      deps.storage.updateAgent(targetAgent.id, {
+        sessionId: sid,
+        tokenUsage: targetAgent.tokenUsage,
+        contextLength: targetAgent.contextLength
+      });
+      deps.broadcast('agent:updated', { agent: targetAgent });
+    } else if (isOrchTarget) {
+      const orchAgent = deps.agents.get(targetKey) || deps.agents.get('orchestrator');
+      if (orchAgent) {
+        orchAgent.sessionId = sid;
+        if ((result as any)?.tokenUsage) orchAgent.tokenUsage = (result as any).tokenUsage;
+        if ((result as any)?.contextLength) orchAgent.contextLength = (result as any).contextLength;
+        deps.storage.updateAgent(orchAgent.id, {
+          sessionId: sid,
+          tokenUsage: orchAgent.tokenUsage,
+          contextLength: orchAgent.contextLength
+        });
+        deps.broadcast('agent:updated', { agent: orchAgent });
+      }
+    }
+  }
+
   // Xử lý reply từ client (broadcast kết quả, lưu storage, error handling/retry).
   // KHÔNG để dead code: result được truyền qua handleClientReply để:
   //   - Phát nội dung phản hồi agent → user qua WS.

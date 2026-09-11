@@ -18,13 +18,25 @@ export class AgentStorage {
 
   updateAgent(id: string, updates: UpdateAgentOptions): void {
     const existing = this.engine.inMemoryAgents.get(id) || {};
+    
+    // NGUYÊN TẮC BẤT DI BẤT DỊCH (IMMUTABLE SESSION & TITLE):
+    // sessionId và sessionTitle chỉ được tạo/gán 1 lần duy nhất lúc tạo agent.
+    // Nếu agent đã có sessionId hoặc sessionTitle hợp lệ, TUYỆT ĐỐI KHÔNG ghi đè, không cập nhật lại, không xóa về null!
+    const effectiveSessionId = (existing.sessionId || existing.session_id)
+      ? (existing.sessionId || existing.session_id)
+      : ('sessionId' in updates && updates.sessionId ? updates.sessionId : null);
+
+    const effectiveSessionTitle = (existing.sessionTitle || existing.session_title)
+      ? (existing.sessionTitle || existing.session_title)
+      : ('sessionTitle' in updates && updates.sessionTitle ? updates.sessionTitle : null);
+
     const updated = {
       ...existing,
       status: 'status' in updates ? updates.status : existing.status,
-      sessionId: 'sessionId' in updates ? (updates.sessionId !== undefined ? updates.sessionId : null) : (existing.sessionId || existing.session_id),
-      session_id: 'sessionId' in updates ? (updates.sessionId !== undefined ? updates.sessionId : null) : (existing.session_id || existing.sessionId),
-      session_title: 'sessionTitle' in updates ? (updates.sessionTitle !== undefined ? updates.sessionTitle : null) : existing.session_title,
-      sessionTitle: 'sessionTitle' in updates ? (updates.sessionTitle !== undefined ? updates.sessionTitle : null) : (existing.sessionTitle || existing.session_title),
+      sessionId: effectiveSessionId,
+      session_id: effectiveSessionId,
+      session_title: effectiveSessionTitle,
+      sessionTitle: effectiveSessionTitle,
       model: 'model' in updates ? (updates.model !== undefined ? updates.model : null) : existing.model,
       working_since: 'workingSince' in updates ? (updates.workingSince !== undefined ? updates.workingSince : null) : existing.working_since,
       token_usage: 'tokenUsage' in updates ? (updates.tokenUsage !== undefined ? updates.tokenUsage : null) : existing.token_usage,
@@ -124,7 +136,7 @@ export function evictOldestCompletedTask(tasks: any[]): boolean {
 /**
  * Kiểm tra ràng buộc hoàn thành task tuần tự và hợp lệ:
  * 1. Task tại targetIndexZeroBased không được phép đóng nếu đang ở trạng thái 'pending' (bắt buộc phải chuyển sang 'working' trước).
- * 2. Task tại targetIndexZeroBased chỉ được phép đánh dấu status='completed' nếu TẤT CẢ các task trước nó (0..targetIndexZeroBased-1) đều đã có status === 'completed'.
+ * 2. Task tại targetIndexZeroBased chỉ được phép đánh dấu status='completed' nếu TẤT CẢ các task trước nó (0..targetIndexZeroBased-1) đều đã có status === 'completed' hoặc 'cancelled'.
  */
 export function checkSequentialTaskCompletion(tasks: any[], targetIndexZeroBased: number): { ok: boolean; error?: string; uncompletedTaskNum?: number } {
   if (!Array.isArray(tasks) || targetIndexZeroBased < 0 || targetIndexZeroBased >= tasks.length) return { ok: true };
@@ -137,21 +149,83 @@ export function checkSequentialTaskCompletion(tasks: any[], targetIndexZeroBased
     return {
       ok: false,
       uncompletedTaskNum: curTaskNum,
-      error: `[TASK_UPDATE_REJECTED] Không thể đóng task #${curTaskNum}: Task đang ở trạng thái 'pending' (chưa thực hiện). Hãy thực hiện task (chuyển sang 'working') trước khi đóng task này!`
+      error: `[TASK_UPDATE_REJECTED] Không thể đóng task #${curTaskNum}: Task đang ở trạng thái 'pending'. Hãy bắt đầu thực hiện task bằng cú pháp: <task_update task="${curTaskNum}" status="working" /> trước khi đóng task này! (Nếu muốn hủy bỏ task: <task_update task="${curTaskNum}" status="cancel" />)`
     };
   }
 
-  // 2. Chặn nhảy cóc thứ tự tuần tự (các task trước phải completed)
+  // 2. Chặn nhảy cóc thứ tự tuần tự (các task trước phải completed hoặc cancelled)
   for (let i = 0; i < targetIndexZeroBased; i++) {
     const prev = tasks[i];
-    if (prev && prev.status !== 'completed') {
+    if (prev && prev.status !== 'completed' && prev.status !== 'cancelled') {
       const prevTaskNum = i + 1;
       return {
         ok: false,
         uncompletedTaskNum: prevTaskNum,
-        error: `[TASK_UPDATE_REJECTED] Không thể đóng task #${curTaskNum}: Hãy hoàn thành task/job trước (#${prevTaskNum}) để có thể đóng task này! Quy định: Các task phải được hoàn thành tuần tự từ trước ra sau.`
+        error: `[TASK_UPDATE_REJECTED] Không thể đóng task #${curTaskNum}: Hãy hoàn thành hoặc hủy task trước (#${prevTaskNum}) để có thể đóng task này! Quy định: Các task phải được hoàn thành tuần tự từ trước ra sau.`
       };
     }
   }
+  return { ok: true };
+}
+
+/**
+ * Kiểm tra ràng buộc hủy task ('cancelled'):
+ * QUY TẮC:
+ * 1. Cho phép hủy trực tiếp từ 'pending' hoặc 'working'.
+ * 2. Không được phép hủy task đã hoàn thành ('completed').
+ * 3. Các task trước nó (0..targetIndexZeroBased-1) phải đã kết thúc (completed hoặc cancelled).
+ */
+export function checkSequentialTaskCancellation(tasks: any[], targetIndexZeroBased: number): { ok: boolean; error?: string; uncompletedTaskNum?: number } {
+  if (!Array.isArray(tasks) || targetIndexZeroBased < 0 || targetIndexZeroBased >= tasks.length) return { ok: true };
+
+  const curTask = tasks[targetIndexZeroBased];
+  const curTaskNum = targetIndexZeroBased + 1;
+
+  if (curTask && curTask.status === 'completed') {
+    return {
+      ok: false,
+      uncompletedTaskNum: curTaskNum,
+      error: `[TASK_UPDATE_REJECTED] Không thể hủy task #${curTaskNum}: Task này đã ở trạng thái hoàn thành ('completed').`
+    };
+  }
+
+  // Chặn nhảy cóc thứ tự tuần tự: Các task trước nó phải hoàn thành hoặc đã hủy
+  for (let i = 0; i < targetIndexZeroBased; i++) {
+    const prev = tasks[i];
+    if (prev && prev.status !== 'completed' && prev.status !== 'cancelled') {
+      const prevTaskNum = i + 1;
+      return {
+        ok: false,
+        uncompletedTaskNum: prevTaskNum,
+        error: `[TASK_UPDATE_REJECTED] Không thể hủy task #${curTaskNum}: Vui lòng xử lý task #${prevTaskNum} trước (<task_update task="${prevTaskNum}" status="working|completed|cancel" />)!`
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Kiểm tra ràng buộc bắt đầu thực hiện task ('working'):
+ * QUY TẮC: Task sau (targetIndexZeroBased) CHỈ CÓ THỂ chuyển thành 'working' khi trước nó KHÔNG CÓ task nào đang 'pending' hoặc 'working'.
+ * Nghĩa là tất cả các task trước nó (0..targetIndexZeroBased-1) đều phải đã completed hoặc cancelled.
+ */
+export function checkSequentialTaskWorking(tasks: any[], targetIndexZeroBased: number): { ok: boolean; error?: string; pendingTaskNum?: number; pendingTaskDesc?: string } {
+  if (!Array.isArray(tasks) || targetIndexZeroBased <= 0 || targetIndexZeroBased >= tasks.length) return { ok: true };
+
+  const curTaskNum = targetIndexZeroBased + 1;
+
+  for (let i = 0; i < targetIndexZeroBased; i++) {
+    const prev = tasks[i];
+    if (prev && prev.status !== 'completed' && prev.status !== 'cancelled') {
+      const pendingTaskNum = i + 1;
+      return {
+        ok: false,
+        pendingTaskNum,
+        pendingTaskDesc: prev.task || '',
+        error: `[TASK_UPDATE_REJECTED] Không thể bắt đầu task #${curTaskNum}: Task trước nó (#${pendingTaskNum}: "${prev.task || ''}") vẫn chưa kết thúc (${prev.status}). Vui lòng giải quyết hoặc hủy task #${pendingTaskNum} trước (<task_update task="${pendingTaskNum}" status="working" /> rồi status="completed", hoặc <task_update task="${pendingTaskNum}" status="cancel" />)!`
+      };
+    }
+  }
+
   return { ok: true };
 }

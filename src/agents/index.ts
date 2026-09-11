@@ -5,6 +5,8 @@ export * from './types.js';
 export * from './agent-manager.js';
 export * from './acp-client.js';
 export * from './opencode-serve-client.js';
+export * from './opencode-sse-gate.js';
+export * from './stream-event-filter.js';
 export * from './stream-controller.js';
 
 export type { AgentConfig, AgentMessage, MessagePart, TokenUsage, ToolCallInfo } from './types.js';

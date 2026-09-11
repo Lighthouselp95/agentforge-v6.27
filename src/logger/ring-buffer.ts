@@ -1,8 +1,15 @@
+import { appendFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import { storage } from '../storage.js';
 import { safeStringify, extractLogSourceTag } from './log-formatter.js';
 
 export const LOG_BUFFER_MAX = 5000;
 export const logBuffer: string[] = [];
+
+// Đường dẫn file log server trên đĩa cứng: logs/server.log
+const LOGS_DIR = join(process.cwd(), 'logs');
+const SERVER_LOG_FILE = join(LOGS_DIR, 'server.log');
+try { mkdirSync(LOGS_DIR, { recursive: true }); } catch {}
 
 export type LogListener = (entry: { level: 'info' | 'warn' | 'error' | 'debug'; message: string; line: string; timestamp: number }) => void;
 const logListeners = new Set<LogListener>();
@@ -26,10 +33,16 @@ function getStorage(): any {
 export function pushLogLine(rawArgs: any[], level: 'info' | 'warn' | 'error' | 'debug' = 'info'): string {
   const line = rawArgs.map(a => (typeof a === 'string' ? a : (a instanceof Error ? (a.stack || a.message) : safeStringify(a)))).join(' ');
   const ts = new Date().toISOString();
-  const formattedLine = `[${ts}] ${line}`;
+  // Nếu là dòng trống hoặc phân đoạn dòng kẻ đặc biệt thì giữ nguyên cấu trúc hiển thị
+  const formattedLine = line.trim().length === 0 ? '' : `[${ts}] ${line}`;
   logBuffer.push(formattedLine);
   if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_MAX);
   
+  // Ghi trực tiếp xuống file disk logs/server.log để không bao giờ mất log khi server crash/tự chết
+  try {
+    appendFileSync(SERVER_LOG_FILE, (formattedLine.length > 0 ? formattedLine : '') + '\n', 'utf8');
+  } catch {}
+
   const source = extractLogSourceTag(line);
   try {
     const stor = getStorage();

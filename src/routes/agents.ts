@@ -1,6 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { ACPClient } from '../agents/acp-client.js';
+import { OpenCodeServeClient } from '../agents/opencode-serve-client.js';
+import { getOpenCodeServerUrl } from '../process/opencode-spawner.js';
 
 // Pha 1 refactor: toàn bộ HTTP handlers /api/agents* dời verbatim từ src/server.ts.
 // Mọi closure (agents map, storage, broadcast, helpers) được inject qua deps —
@@ -48,9 +50,39 @@ export function createAgentsRouter(deps: AgentsRouteDeps): Router {
       }
       out.token_usage = out.tokenUsage ?? null;
       out.context_length = out.contextLength ?? null;
+      try {
+        out.resolvedModel = deps.resolveModelForAgent(a);
+      } catch {}
       return out;
     });
     res.json(rows);
+  });
+
+  // GET /api/agents/:id — Lấy chi tiết quy hoạch 1 agent (model, sessionId, tokenUsage...)
+  router.get('/:id', (req, res) => {
+    const { id } = req.params;
+    const a = deps.agents.get(id) || Array.from(deps.agents.values()).find(x => x.name === id || x.role === id);
+    if (!a) {
+      const stored = deps.storage.getAgent(id);
+      if (!stored) {
+        return res.status(404).json({ error: 'Agent not found' });
+      }
+      return res.json(stored);
+    }
+    const out: any = { ...a };
+    const stored = deps.storage.getAgent(a.id) as any;
+    if (out.tokenUsage === undefined && stored && stored.token_usage !== undefined && stored.token_usage !== null) {
+      out.tokenUsage = stored.token_usage;
+    }
+    if (out.contextLength === undefined && stored && stored.context_length !== undefined && stored.context_length !== null) {
+      out.contextLength = stored.context_length;
+    }
+    out.token_usage = out.tokenUsage ?? null;
+    out.context_length = out.contextLength ?? null;
+    try {
+      out.resolvedModel = deps.resolveModelForAgent(a);
+    } catch {}
+    res.json(out);
   });
 
   // POST /api/agents/sync-titles — Đồng bộ sessionTitle và tokenUsage từ opencode serve cho toàn bộ agents
@@ -263,9 +295,29 @@ Nội dung phân công nhiệm vụ mới tại đây
     // Tạm thời: mọi agent đều dùng cwd làm projectDir (tính năng prjDir sẽ thêm sau)
     const effectiveProjectDir = deps.projectRoot;
     const id = 'agent-' + uuidv4().slice(0, 8);
+    const agentName = name || (isOrch ? `Orchestrator-${id.slice(-4)}` : `Agent-${id.slice(-4)}`);
+
+    // KHỞI TẠO SESSION ID VÀ SESSION TITLE DUY NHẤT 1 LẦN KHI TẠO AGENT:
+    let initialSessionId: string | undefined = undefined;
+    let initialSessionTitle: string | undefined = agentName;
+    try {
+      const dynamicUrl = getOpenCodeServerUrl();
+      initialSessionId = await OpenCodeServeClient.createSessionHttp(dynamicUrl, {
+        title: agentName,
+        directory: effectiveProjectDir
+      });
+      OpenCodeServeClient.registerSession(id, initialSessionId);
+    } catch (e: any) {
+      console.warn(`[CreateAgent] Không thể cấp phát trước sessionId từ OpenCode Serve: ${e?.message || e}`);
+    }
+
     const agent: any = {
-      id, name: name || (isOrch ? `Orchestrator-${id.slice(-4)}` : `Agent-${id.slice(-4)}`), role,
-      type, status: 'idle', spawnedBy, projectDir: effectiveProjectDir, task, model, teamId: newTeamId, createdAt: Date.now(), sessionId: undefined,
+      id, name: agentName, role,
+      type, status: 'idle', spawnedBy, projectDir: effectiveProjectDir, task, model, teamId: newTeamId, createdAt: Date.now(), 
+      sessionId: initialSessionId,
+      session_id: initialSessionId,
+      sessionTitle: initialSessionTitle,
+      session_title: initialSessionTitle,
       tasks: task ? [{ id: '1', task, status: 'pending', createdAt: Date.now() }] : []
     };
     deps.agents.set(id, agent); deps.storage.saveAgent(agent);
@@ -735,11 +787,8 @@ Nội dung phân công nhiệm vụ mới tại đây
 
       deps.clients.delete(agentId);
       ACPClient.unregisterSession(agentId);
-      deps.storage.updateAgent(agentId, { sessionId: null, sessionTitle: null });
-
-      agent.sessionId = undefined;
-      agent.sessionTitle = undefined;
-      deps.broadcast('agent:updated', { agent });
+      // NGUYÊN TẮC: Clear chỉ xóa lịch sử chat, TUYỆT ĐỐI KHÔNG xóa/reset sessionId & sessionTitle của agent!
+      // deps.storage.updateAgent(agentId, { sessionId: null, sessionTitle: null });
 
       // Xoá hội thoại của agent này
       const keep: any[] = [];
@@ -752,16 +801,10 @@ Nội dung phân công nhiệm vụ mới tại đây
       deps.storage.clearAgentConversation(agentId);
       deps.broadcast('chat:message', { action: 'clear', agentId });
 
-      res.json({ ok: true, sessionDeleted, warning: !sessionDeleted ? 'Session delete failed, local state cleared' : undefined });
+      res.json({ ok: true, sessionDeleted, warning: !sessionDeleted ? 'Session delete failed, local chat cleared' : undefined });
     } catch (e: any) {
       deps.clients.delete(agentId);
       ACPClient.unregisterSession(agentId);
-      deps.storage.updateAgent(agentId, { sessionId: null, sessionTitle: null });
-
-      agent.sessionId = undefined;
-      agent.sessionTitle = undefined;
-      deps.broadcast('agent:updated', { agent });
-
       res.json({ ok: false, error: e.message });
     }
   });

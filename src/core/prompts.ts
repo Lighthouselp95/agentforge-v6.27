@@ -84,7 +84,10 @@ CRITICAL SYNTAX RULE: Khi phát lệnh điều phối (<spawn>, <talk>, <stop>, 
    Rules phân tách bằng dấu | (pipe). Capabilities phân tách bằng dấu , (comma).
 
 6. TASK_UPDATE — Cập nhật nhiệm vụ và trạng thái của Agent:
-   <task_update agent="<name/id>" task="<nội dung task mới>" status="pending|working|completed|idle" />
+   <task_update task="<số thứ tự 1, 2... hoặc nội dung>" status="working|completed|cancel" />
+   - Bắt đầu thực hiện: status="working"
+   - Hoàn tất nhiệm vụ: status="completed" (yêu cầu task phải ở trạng thái working trước khi hoàn tất)
+   - Hủy bỏ nhiệm vụ: status="cancel" hoặc "cancelled" (có thể hủy trực tiếp từ pending hoặc working)
 
 === RULES ===
 1. CRITICAL SYNTAX RULE: Khi phát lệnh điều phối (<spawn>, <talk>, <stop>, <resume>, <create_role>, <task_update>), BẮT BUỘC viết thẻ XML trực tiếp ngoài văn bản (Bare XML Tags). TUYỆT ĐỐI KHÔNG bọc thẻ lệnh thực thi bên trong fenced code blocks hoặc dấu backtick, vì parser sẽ coi đó là code minh họa và bỏ qua không thực thi.

@@ -1,4 +1,6 @@
 import { Router } from 'express';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
 
 // Pha 1 refactor: GET /logs + /terminal dời verbatim từ src/server.ts (HTML giữ nguyên 1:1).
 export interface TerminalRouteDeps {
@@ -9,6 +11,7 @@ export interface TerminalRouteDeps {
 
 export function createTerminalRouter(deps: TerminalRouteDeps): Router {
   const router = Router();
+  const SERVER_LOG_FILE = join(process.cwd(), 'logs', 'server.log');
 
   // Helper đảm bảo dòng log luôn có timestamp chuẩn ISO nếu chưa có
   const ensureTimestamp = (l: any): string => {
@@ -21,15 +24,31 @@ export function createTerminalRouter(deps: TerminalRouteDeps): Router {
     return `[${ts}] ${str}`;
   };
 
-  // Trả toàn bộ ring buffer kèm timestamp chuẩn
+  // Helper lấy logs kết hợp từ RAM ring-buffer và file trên đĩa cứng
+  const getCombinedLogs = (): string[] => {
+    if (deps.logBuffer.length > 0) {
+      return deps.logBuffer.map(ensureTimestamp);
+    }
+    // Nếu RAM trống (server vừa khởi động lại hoặc crash), nạp từ logs/server.log trên đĩa cứng
+    if (existsSync(SERVER_LOG_FILE)) {
+      try {
+        const content = readFileSync(SERVER_LOG_FILE, 'utf8');
+        const lines = content.split(/\r?\n/).filter(line => line.trim().length > 0);
+        return lines.slice(-deps.maxLogBuffer).map(ensureTimestamp);
+      } catch {}
+    }
+    return [];
+  };
+
+  // Trả toàn bộ log kèm timestamp chuẩn (kết hợp RAM + đĩa cứng)
   router.get('/logs', (_req, res) => {
-    const linesWithTs = deps.logBuffer.map(ensureTimestamp);
+    const linesWithTs = getCombinedLogs();
     res.json({ lines: linesWithTs, max: deps.maxLogBuffer, count: linesWithTs.length });
   });
 
   // Alias /api/terminal/logs hỗ trợ client fetch trực tiếp endpoint terminal
   router.get('/api/terminal/logs', (_req, res) => {
-    const linesWithTs = deps.logBuffer.map(ensureTimestamp);
+    const linesWithTs = getCombinedLogs();
     res.json({ lines: linesWithTs, max: deps.maxLogBuffer, count: linesWithTs.length });
   });
 
@@ -81,9 +100,19 @@ export function createTerminalRouter(deps: TerminalRouteDeps): Router {
   var wrap = document.getElementById('wrap');
 
   function appendLine(line, level, ts){
-    if (!line) return;
+    if (line === undefined || line === null) return;
     var d = document.createElement('div');
     var str = String(line);
+    
+    // Nếu là dòng trống (dòng cách giữa các phiên mở app)
+    if (!str.trim()) {
+      d.innerHTML = '&nbsp;';
+      d.style.height = '14px';
+      box.appendChild(d);
+      wrap.scrollTop = wrap.scrollHeight;
+      return;
+    }
+
     var hasLeadingTs = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(str);
 
     if (!hasLeadingTs) {
@@ -135,32 +164,38 @@ export function createTerminalRouter(deps: TerminalRouteDeps): Router {
     });
   }
 
-  // 1. Tải log lịch sử từ /api/logs (persisted database) + fallback /logs ring buffer
+  // 1. Tải log lịch sử: ưu tiên /logs (kết hợp RAM + đĩa cứng) và /api/logs
   function loadInitialLogs(){
     box.innerHTML = '';
-    fetch('/api/logs?limit=500').then(function(r){ return r.json(); }).then(function(data){
+    fetch('/logs').then(function(r){ return r.json(); }).then(function(d){
       box.innerHTML = '';
-      if (data && Array.isArray(data.logs) && data.logs.length > 0) {
-        data.logs.forEach(function(item){
-          var line = typeof item === 'string' ? item : (item.message || JSON.stringify(item));
-          appendLine(line, item.level, item.timestamp);
-        });
+      if (d && Array.isArray(d.lines) && d.lines.length > 0) {
+        d.lines.forEach(function(l){ appendLine(l); });
       } else {
-        // Fallback /logs
-        fetch('/logs').then(function(r){ return r.json(); }).then(function(d){
-          box.innerHTML = '';
-          (d.lines || []).forEach(function(l){ appendLine(l); });
-          if (box.childElementCount === 0) {
-            appendLine('[System] Terminal ready. Log stream active.');
+        // Fallback /api/logs
+        fetch('/api/logs?limit=500').then(function(r2){ return r2.json(); }).then(function(data){
+          if (data && Array.isArray(data.logs) && data.logs.length > 0) {
+            box.innerHTML = '';
+            data.logs.forEach(function(item){
+              var line = typeof item === 'string' ? item : (item.message || JSON.stringify(item));
+              appendLine(line, item.level, item.timestamp);
+            });
           }
         });
       }
+      if (box.childElementCount === 0) {
+        appendLine('[System] Terminal ready. Log stream active.');
+      }
       wrap.scrollTop = wrap.scrollHeight;
     }).catch(function(){
-      fetch('/logs').then(function(r){ return r.json(); }).then(function(d){
+      fetch('/api/logs?limit=500').then(function(r){ return r.json(); }).then(function(data){
         box.innerHTML = '';
-        (d.lines || []).forEach(function(l){ appendLine(l); });
-        if (box.childElementCount === 0) {
+        if (data && Array.isArray(data.logs) && data.logs.length > 0) {
+          data.logs.forEach(function(item){
+            var line = typeof item === 'string' ? item : (item.message || JSON.stringify(item));
+            appendLine(line, item.level, item.timestamp);
+          });
+        } else {
           appendLine('[System] Terminal ready. Log stream active.');
         }
         wrap.scrollTop = wrap.scrollHeight;
